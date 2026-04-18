@@ -48,18 +48,15 @@ USER_SETTINGS_PATH = os.path.join(_DATA_DIR, "user_settings.json")
 
 _PLACEHOLDER_KEYS = {"sk-or-...", "sk-ant-...", "AIza...", "gsk_...", ""}
 
-# Keys that are persisted to user_settings.json
+# Keys that are persisted to the legacy shared user_settings.json.
+# Per-user fields (API keys, AI model selections) are NO LONGER in this
+# list — each user has their own ``/data/auth/user_settings/{id}.json``.
+# Only genuinely instance-wide hardware / cloud-OAuth settings are kept
+# here so container restarts don't lose the admin's GPU configuration.
 _PERSISTABLE_KEYS = [
-    "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
-    "HF_AUTH_TOKEN",
-    "OPENROUTER_PRESET", "OPENROUTER_VISION_MODEL", "OPENROUTER_TEXT_MODEL",
-    "OPENROUTER_SUMMARY_MODEL", "OLLAMA_VISION_MODEL", "OLLAMA_TEXT_MODEL", "OLLAMA_TRANSLATION_MODEL",
-    "WHISPER_MODEL", "WHISPER_MODEL_USER_SET", "WHISPER_BEAM_SIZE",
-    "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE", "SUBJECT_TRACKING_ENABLED",
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
     "GPU_HWDECODE_ENABLED", "GPU_HEVC_FOR_4K", "GPU_DEVICE_INDEX",
-    "AI_FALLBACK_CHAIN",
     # Cloud storage OAuth credentials — entered via the Settings > Cloud
     # Storage UI and persisted so containers without env vars can still
     # connect to Google Drive / Box after the user pastes their credentials.
@@ -68,11 +65,10 @@ _PERSISTABLE_KEYS = [
     "BOX_CLIENT_ID", "BOX_CLIENT_SECRET", "BOX_REDIRECT_URI",
 ]
 
-# API key fields specifically (used to filter out placeholder values)
+# Remaining secret fields in the shared file (AI provider keys are now
+# strictly per-user — see auth/store.py). Only cloud-OAuth client
+# secrets stay here since they're instance-wide.
 _API_KEY_FIELDS = {
-    "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
-    "HF_AUTH_TOKEN",
-    # Cloud client secrets — same "never overwrite with blank" rule.
     "GOOGLE_DRIVE_CLIENT_SECRET", "BOX_CLIENT_SECRET",
 }
 
@@ -266,8 +262,15 @@ def _restore_user_settings():
         logger.warning(f"Failed to restore user settings from {USER_SETTINGS_PATH}: {e}")
 
 
-# Restore saved settings on module load
-_restore_user_settings()
+# Per-user isolation: the legacy shared ``user_settings.json`` is no
+# longer the source of truth. Each user now has their own settings file
+# under ``/data/auth/user_settings/{user_id}.json`` via ``read_user_settings``
+# /``write_user_settings``. Loading the shared file into the global
+# ``settings`` singleton would cause a brand-new user to see another
+# user's API keys and model picks prepopulated, so the restore is
+# intentionally NOT called at module load anymore. Env-var defaults
+# and config.py values are the only instance-wide state.
+# _restore_user_settings()  # disabled — see comment above
 
 
 def _backfill_api_keys():
@@ -301,7 +304,7 @@ def _backfill_api_keys():
         logger.warning("API key backfill failed (non-fatal): %s", e)
 
 
-_backfill_api_keys()
+# _backfill_api_keys()  # disabled — legacy shared file is no longer used
 
 
 # ── One-time migration: add WHISPER_MODEL_USER_SET flag if missing ──
@@ -333,7 +336,7 @@ def _migrate_stale_whisper():
     except Exception as e:
         logger.warning("Migration check failed (non-fatal): %s", e)
 
-_migrate_stale_whisper()
+# _migrate_stale_whisper()  # disabled — legacy shared file is no longer used
 
 # Short-lived cache for /api/providers/status (avoid hammering Ollama on rapid re-renders)
 _status_cache: dict = {}
@@ -471,28 +474,23 @@ def _key_is_set(key: str) -> bool:
 
 @router.get("/providers/status")
 async def provider_status(user: User = Depends(get_current_user)):
-    # Per-user: read from user's settings file.  API keys are STRICT
-    # per-user (no fallback) so one user can never see another's key
-    # as "configured".  Model/preset selections fall back to env-var
-    # defaults from backend.config so an empty user gets sensible values.
+    # STRICT per-user: API keys, model selections, preset, fallback
+    # chain, and Whisper config are all read from this user's own file
+    # only. No fallback to the global ``settings`` singleton or any
+    # legacy shared state — a brand-new account sees blank everything
+    # until the user fills it in on the AI Providers page.
     us = await read_user_settings(user.id)
 
-    # Strict: returns the user's value or "" (never leaks another user's key).
-    def _user_key(key: str) -> str:
-        val = us.get(key, "")
-        return val if isinstance(val, str) else ""
-
-    # Lenient: per-user override, else instance default from env-backed config.
-    def _user_pref(key: str):
-        if key in us:
-            return us[key]
-        return getattr(settings, key, "")
-
-    from backend.services.providers.openrouter_provider import PRESETS
+    def _uval(key: str, default=""):
+        """Strict per-user lookup. Returns the user's saved value or
+        ``default`` — never another user's value."""
+        return us.get(key, default)
 
     statuses = {}
 
-    # Ollama (shared resource — status is instance-wide)
+    # Ollama (shared resource — connectivity status is instance-wide,
+    # so this stays global; the loaded-model list describes the
+    # host, not any single user).
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{settings.OLLAMA_HOST}/api/tags")
@@ -507,51 +505,47 @@ async def provider_status(user: User = Depends(get_current_user)):
     except Exception as e:
         statuses["ollama"] = {"status": "offline", "error": str(e)}
 
-    # OpenRouter — STRICT per-user API key
-    or_key = _user_key("OPENROUTER_API_KEY")
+    # OpenRouter — strict per-user
+    or_key = _uval("OPENROUTER_API_KEY")
     if _key_is_set(or_key):
-        preset_name = _user_pref("OPENROUTER_PRESET") or "free"
-        preset = PRESETS.get(preset_name, PRESETS["free"])
-        vision_model = _user_pref("OPENROUTER_VISION_MODEL") or preset["vision"]
-        text_model = _user_pref("OPENROUTER_TEXT_MODEL") or preset["text"]
-        summary_model = _user_pref("OPENROUTER_SUMMARY_MODEL") or text_model
+        # Show the user's saved selections as-is. Blank until they pick.
+        preset_name = _uval("OPENROUTER_PRESET", "")
         statuses["openrouter"] = {
             "status": "configured",
             "preset": preset_name,
-            "vision_model": vision_model,
-            "summary_model": summary_model,
-            "text_model": text_model,
+            "vision_model": _uval("OPENROUTER_VISION_MODEL", ""),
+            "summary_model": _uval("OPENROUTER_SUMMARY_MODEL", ""),
+            "text_model": _uval("OPENROUTER_TEXT_MODEL", ""),
         }
     else:
         statuses["openrouter"] = {"status": "not_configured"}
 
-    # Anthropic / Gemini / Groq / HuggingFace — all STRICT per-user
+    # Anthropic / Gemini / Groq / HuggingFace — all strict per-user
     statuses["anthropic"] = {
-        "status": "configured" if _key_is_set(_user_key("ANTHROPIC_API_KEY")) else "not_configured"
+        "status": "configured" if _key_is_set(_uval("ANTHROPIC_API_KEY")) else "not_configured"
     }
     statuses["gemini"] = {
-        "status": "configured" if _key_is_set(_user_key("GEMINI_API_KEY")) else "not_configured"
+        "status": "configured" if _key_is_set(_uval("GEMINI_API_KEY")) else "not_configured"
     }
     statuses["groq"] = {
-        "status": "configured" if _key_is_set(_user_key("GROQ_API_KEY")) else "not_configured"
+        "status": "configured" if _key_is_set(_uval("GROQ_API_KEY")) else "not_configured"
     }
-    hf_token = _user_key("HF_AUTH_TOKEN")
-    if hf_token and hf_token.strip():
+    hf_token = _uval("HF_AUTH_TOKEN")
+    if hf_token and str(hf_token).strip():
         statuses["huggingface"] = {"status": "configured", "message": "Token set"}
     else:
         statuses["huggingface"] = {"status": "not_configured", "message": "No HF token"}
 
-    # Determine the active provider and models based on fallback chain.
-    # Chain is per-user preference; default still comes from env config.
-    chain_raw = us.get("AI_FALLBACK_CHAIN")
-    if chain_raw and isinstance(chain_raw, str):
-        chain = [p.strip() for p in chain_raw.split(",") if p.strip()]
-    else:
-        chain = settings.active_provider_chain
+    # Fallback chain — strict per-user (empty list if the user hasn't
+    # saved a chain yet; the AIOrchestrator will surface that clearly
+    # instead of silently using another user's chain).
+    chain_raw = _uval("AI_FALLBACK_CHAIN", "")
+    chain = [p.strip() for p in chain_raw.split(",") if p.strip()] if chain_raw else []
+
     active_provider = None
-    active_vision_model = None
-    active_text_model = None
-    active_summary_model = None
+    active_vision_model = ""
+    active_text_model = ""
+    active_summary_model = ""
     for name in chain:
         info = statuses.get(name, {})
         st = info.get("status", "not_configured")
@@ -562,8 +556,8 @@ async def provider_status(user: User = Depends(get_current_user)):
                 active_summary_model = info.get("summary_model", "")
                 active_text_model = info.get("text_model", "")
             elif name == "ollama":
-                active_vision_model = _user_pref("OLLAMA_VISION_MODEL") or settings.OLLAMA_VISION_MODEL
-                active_text_model = _user_pref("OLLAMA_TEXT_MODEL") or settings.OLLAMA_TEXT_MODEL
+                active_vision_model = _uval("OLLAMA_VISION_MODEL", "")
+                active_text_model = _uval("OLLAMA_TEXT_MODEL", "")
                 active_summary_model = active_text_model
             elif name == "gemini":
                 active_vision_model = "gemini-2.5-flash"
@@ -579,19 +573,15 @@ async def provider_status(user: User = Depends(get_current_user)):
                 active_summary_model = "llama-3.1-8b-instant"
             break
 
-    whisper_model = _user_pref("WHISPER_MODEL") or settings.WHISPER_MODEL
-    whisper_beam = us.get("WHISPER_BEAM_SIZE", settings.WHISPER_BEAM_SIZE)
-    whisper_vad = us.get("WHISPER_VAD_FILTER", settings.WHISPER_VAD_FILTER)
-
     statuses["_active"] = {
         "provider": active_provider or "none",
-        "transcript_model": whisper_model,
-        "whisper_beam_size": whisper_beam,
-        "whisper_vad_filter": whisper_vad,
-        "vision_model": active_vision_model or "",
-        "summary_model": active_summary_model or "",
-        "text_model": active_text_model or "",
-        "preset": (_user_pref("OPENROUTER_PRESET") or "") if active_provider == "openrouter" else "",
+        "transcript_model": _uval("WHISPER_MODEL", ""),
+        "whisper_beam_size": _uval("WHISPER_BEAM_SIZE", ""),
+        "whisper_vad_filter": _uval("WHISPER_VAD_FILTER", ""),
+        "vision_model": active_vision_model,
+        "summary_model": active_summary_model,
+        "text_model": active_text_model,
+        "preset": _uval("OPENROUTER_PRESET", "") if active_provider == "openrouter" else "",
         "fallback_chain": chain,
         "ollama_enabled": "ollama" in chain,
     }
@@ -1004,7 +994,7 @@ def _pull_ollama_models_background(models: list[str] | None = None):
 async def toggle_ollama(req: ToggleOllamaRequest, user: User = Depends(get_current_user)):
     """Add or remove Ollama from the user's fallback chain."""
     us = await read_user_settings(user.id)
-    chain_raw = us.get("AI_FALLBACK_CHAIN") or settings.AI_FALLBACK_CHAIN
+    chain_raw = us.get("AI_FALLBACK_CHAIN") or ""
     chain = [p.strip() for p in chain_raw.split(",") if p.strip()]
     if req.enabled:
         if "ollama" not in chain:
@@ -1763,16 +1753,19 @@ async def available_models(user: User = Depends(get_current_user)):
         if isinstance(chain_raw, str) and chain_raw
         else settings.active_provider_chain
     )
-    ollama_vision = us.get("OLLAMA_VISION_MODEL") or settings.OLLAMA_VISION_MODEL
-    ollama_text = us.get("OLLAMA_TEXT_MODEL") or settings.OLLAMA_TEXT_MODEL
-    or_vision = us.get("OPENROUTER_VISION_MODEL") or settings.OPENROUTER_VISION_MODEL
-    or_text = us.get("OPENROUTER_TEXT_MODEL") or settings.OPENROUTER_TEXT_MODEL
+    # STRICT per-user — no fallback to global. A brand-new account sees
+    # blank "current" so the UI shows placeholder text in the dropdowns
+    # instead of prepopulating another user's saved pick.
+    ollama_vision = us.get("OLLAMA_VISION_MODEL", "")
+    ollama_text = us.get("OLLAMA_TEXT_MODEL", "")
+    or_vision = us.get("OPENROUTER_VISION_MODEL", "")
+    or_text = us.get("OPENROUTER_TEXT_MODEL", "")
 
-    ollama_is_primary = chain and chain[0] == "ollama"
+    ollama_is_primary = bool(chain and chain[0] == "ollama")
     ollama_models_set = "ollama" in chain and ollama_vision and ollama_text
     if ollama_is_primary or (ollama_models_set and not has_or_key):
-        current_vision = f"ollama/{ollama_vision}"
-        current_text = f"ollama/{ollama_text}"
+        current_vision = f"ollama/{ollama_vision}" if ollama_vision else ""
+        current_text = f"ollama/{ollama_text}" if ollama_text else ""
     else:
         current_vision = or_vision
         current_text = or_text
@@ -1782,7 +1775,7 @@ async def available_models(user: User = Depends(get_current_user)):
         "vision": vision[:100],
         "text": text[:100],
         "current": {
-            "transcript_model": us.get("WHISPER_MODEL") or settings.WHISPER_MODEL,
+            "transcript_model": us.get("WHISPER_MODEL", ""),
             "vision_model": current_vision,
             "text_model": current_text,
         },
@@ -1830,7 +1823,7 @@ async def save_models(req: SaveModelsRequest, user: User = Depends(get_current_u
         or (req.text_model and not req.text_model.startswith("ollama/") and req.text_model)
     )
     us = await read_user_settings(user.id)
-    chain_raw = us.get("AI_FALLBACK_CHAIN") or settings.AI_FALLBACK_CHAIN
+    chain_raw = us.get("AI_FALLBACK_CHAIN") or ""
     chain = [p.strip() for p in chain_raw.split(",") if p.strip()]
 
     if has_ollama:
@@ -1887,13 +1880,17 @@ class SaveTranscriptionSettingsRequest(BaseModel):
 
 @router.get("/transcription/settings")
 async def get_transcription_settings(user: User = Depends(get_current_user)):
-    """Return per-user transcription speed/quality settings."""
+    """Return strict per-user transcription speed/quality settings.
+
+    A brand-new account (no per-user file) sees blank model + null
+    numeric fields so the UI doesn't prepopulate another user's choice.
+    """
     us = await read_user_settings(user.id)
     return {
-        "whisper_model": us.get("WHISPER_MODEL", settings.WHISPER_MODEL),
-        "beam_size": us.get("WHISPER_BEAM_SIZE", settings.WHISPER_BEAM_SIZE),
-        "vad_filter": us.get("WHISPER_VAD_FILTER", settings.WHISPER_VAD_FILTER),
-        "frame_sample_rate": us.get("FRAME_SAMPLE_RATE", settings.FRAME_SAMPLE_RATE),
+        "whisper_model": us.get("WHISPER_MODEL", ""),
+        "beam_size": us.get("WHISPER_BEAM_SIZE"),
+        "vad_filter": us.get("WHISPER_VAD_FILTER"),
+        "frame_sample_rate": us.get("FRAME_SAMPLE_RATE"),
     }
 
 
