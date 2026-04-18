@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend import database
-from backend.app.auth.deps import get_current_user
+from backend.app.auth.deps import get_current_user, require_job_access
 from backend.app.auth.models import User
 from backend.config import settings
 from backend.models import ExportRequest, FullVideoExportRequest, GenerateClipsRequest, TranslateRequest, TranscriptSegment, UpdateClipTimesRequest, UpdateClipTitleRequest
@@ -100,9 +100,7 @@ async def export_clip_endpoint(
     req: ExportRequest,
     user: User = Depends(get_current_user),
 ):
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
 
     # Populate hook_text from stored clip data if not already set
     if not req.hook_text and job.clips:
@@ -436,7 +434,7 @@ async def export_clip_endpoint(
 
 
 @router.post("/jobs/{job_id}/cancel-export/{clip_id}")
-async def cancel_export_endpoint(job_id: str, clip_id: int):
+async def cancel_export_endpoint(job_id: str, clip_id: int, user: User = Depends(get_current_user)):
     """Cancel an in-progress clip export."""
     export_key = f"{job_id}_{clip_id}"
 
@@ -464,9 +462,7 @@ async def export_full_video_endpoint(
     user: User = Depends(get_current_user),
 ):
     """Export the entire video with clip settings (aspect ratio, subtitles, subject tracking) applied."""
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
     if not job.file_path or not job.duration:
         raise HTTPException(status_code=400, detail="Video file or duration not available")
 
@@ -627,15 +623,27 @@ async def export_full_video_endpoint(
 
 
 @router.get("/active-exports")
-async def list_active_exports():
-    """List all currently active export tasks."""
+async def list_active_exports(user: User = Depends(get_current_user)):
+    """List active export tasks owned by the calling user."""
+    owned_jobs: set[str] | None = None
     active = []
     for key, task in _active_export_tasks.items():
         if not task.done():
             parts = key.split("_", 1)
+            jid = parts[0] if len(parts) > 1 else key
+            if owned_jobs is None:
+                owned_jobs = {
+                    j.job_id
+                    for j in await database.list_jobs(
+                        owner_user_id=user.id,
+                        owner_username=user.username,
+                    )
+                }
+            if jid not in owned_jobs:
+                continue
             active.append({
                 "export_id": key,
-                "job_id": parts[0] if len(parts) > 1 else key,
+                "job_id": jid,
                 "clip_id": parts[1] if len(parts) > 1 else None,
                 "status": "encoding",
             })
@@ -643,11 +651,9 @@ async def list_active_exports():
 
 
 @router.put("/jobs/{job_id}/clips/{clip_id}/title")
-async def update_clip_title(job_id: str, clip_id: int, req: UpdateClipTitleRequest):
+async def update_clip_title(job_id: str, clip_id: int, req: UpdateClipTitleRequest, user: User = Depends(get_current_user)):
     """Update the title of a clip candidate."""
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
 
     clip = next((c for c in job.clips if c.id == clip_id), None)
     if not clip:
@@ -659,11 +665,9 @@ async def update_clip_title(job_id: str, clip_id: int, req: UpdateClipTitleReque
 
 
 @router.put("/jobs/{job_id}/clips/{clip_id}/times")
-async def update_clip_times(job_id: str, clip_id: int, req: UpdateClipTimesRequest):
+async def update_clip_times(job_id: str, clip_id: int, req: UpdateClipTimesRequest, user: User = Depends(get_current_user)):
     """Update the start/end times of a clip candidate."""
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
 
     clip = next((c for c in job.clips if c.id == clip_id), None)
     if not clip:
@@ -686,11 +690,9 @@ async def update_clip_times(job_id: str, clip_id: int, req: UpdateClipTimesReque
 
 
 @router.delete("/jobs/{job_id}/clips/{clip_id}")
-async def delete_clip(job_id: str, clip_id: int):
+async def delete_clip(job_id: str, clip_id: int, user: User = Depends(get_current_user)):
     """Delete a single clip candidate and any exported files for it."""
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
 
     clip = next((c for c in job.clips if c.id == clip_id), None)
     if not clip:
@@ -723,11 +725,9 @@ class DeleteClipsRequest(BaseModel):
 
 
 @router.post("/jobs/{job_id}/delete-clips")
-async def delete_clips_bulk(job_id: str, req: DeleteClipsRequest):
+async def delete_clips_bulk(job_id: str, req: DeleteClipsRequest, user: User = Depends(get_current_user)):
     """Delete multiple clip candidates and their exported files."""
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
 
     ids_to_delete = set(req.clip_ids)
     deleted_count = 0
@@ -763,11 +763,10 @@ async def delete_clips_bulk(job_id: str, req: DeleteClipsRequest):
 async def generate_clips_endpoint(
     job_id: str,
     req: GenerateClipsRequest,
+    user: User = Depends(get_current_user),
 ):
     """Re-run viral clip detection using existing transcript and scenes."""
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
 
     if not job.transcript or not job.scenes:
         raise HTTPException(
@@ -1176,7 +1175,7 @@ async def _cancel_existing_generation(job_id: str):
 
 
 @router.post("/jobs/{job_id}/cancel-generate")
-async def cancel_generate_clips(job_id: str):
+async def cancel_generate_clips(job_id: str, user: User = Depends(get_current_user)):
     """Cancel an in-progress clip generation for this job.
 
     Invoked by the Analysis page Cancel button (Enhancement 9 in the
@@ -1199,7 +1198,7 @@ async def cancel_generate_clips(job_id: str):
 
 
 @router.get("/jobs/{job_id}/clip-diagnostics")
-async def clip_diagnostics(job_id: str):
+async def clip_diagnostics(job_id: str, user: User = Depends(get_current_user)):
     """Return every piece of context + per-clip scoring used by the
     most recent clip detection. Powers the "Why these clips?" drawer
     on the Analysis page (Enhancement 6 in the clip-focus audit) and
@@ -1208,9 +1207,7 @@ async def clip_diagnostics(job_id: str):
     Safe to call on any job — fields default to empty when the job is
     older than the persistence changes.
     """
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
 
     clips_info = []
     for c in (job.clips or []):
@@ -1260,14 +1257,14 @@ async def clip_diagnostics(job_id: str):
 
 
 @router.post("/jobs/{job_id}/translate-subtitles")
-async def translate_subtitles(job_id: str, req: TranslateRequest):
+async def translate_subtitles(job_id: str, req: TranslateRequest, user: User = Depends(get_current_user)):
     """Translate the transcript for a job into a target language."""
     from backend.services.translator import translate_segments_with_fallback, SUPPORTED_LANGUAGES
     from backend.services.ai_orchestrator import AIOrchestrator
 
-    job = await database.load_job(job_id)
-    if not job or not job.transcript:
-        raise HTTPException(404, "Job not found or has no transcript")
+    job = await require_job_access(job_id, user)
+    if not job.transcript:
+        raise HTTPException(404, "Job has no transcript")
 
     if req.target_language not in SUPPORTED_LANGUAGES:
         raise HTTPException(400, f"Unsupported language: {req.target_language}")
@@ -1297,10 +1294,8 @@ async def translate_subtitles(job_id: str, req: TranslateRequest):
 
 
 @router.get("/jobs/{job_id}/clips")
-async def list_clips(job_id: str):
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+async def list_clips(job_id: str, user: User = Depends(get_current_user)):
+    job = await require_job_access(job_id, user)
     return [
         {
             "clip_id": c.get("clip_id"),
@@ -1314,13 +1309,11 @@ async def list_clips(job_id: str):
 
 
 @router.get("/jobs/{job_id}/retention")
-async def get_retention_predictions(job_id: str):
+async def get_retention_predictions(job_id: str, user: User = Depends(get_current_user)):
     """Get audience retention predictions for all clips in a job."""
     from backend.services.retention_predictor import predict_retention_for_clips
 
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
     if not job.clips:
         return {"predictions": {}}
 
@@ -1329,11 +1322,9 @@ async def get_retention_predictions(job_id: str):
 
 
 @router.post("/jobs/{job_id}/seo/{clip_id}")
-async def generate_seo_endpoint(job_id: str, clip_id: int):
+async def generate_seo_endpoint(job_id: str, clip_id: int, user: User = Depends(get_current_user)):
     """Generate SEO-optimized title, description, and tags for a clip."""
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
 
     clip = next((c for c in job.clips if c.id == clip_id), None)
     if not clip:
@@ -1469,14 +1460,13 @@ class GenerateDescriptionRequest(BaseModel):
 @router.post("/jobs/{job_id}/generate-description/{clip_id}")
 async def generate_description_endpoint(
     job_id: str, clip_id: int, req: GenerateDescriptionRequest,
+    user: User = Depends(get_current_user),
 ):
     """Generate a YouTube Shorts or long-form description for a clip."""
     if req.description_type not in ("shorts", "long_form"):
         raise HTTPException(status_code=400, detail="description_type must be 'shorts' or 'long_form'")
 
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
 
     clip = next((c for c in job.clips if c.id == clip_id), None)
     if not clip:
@@ -1602,11 +1592,9 @@ class UpdateClipSEORequest(BaseModel):
 
 
 @router.put("/jobs/{job_id}/clips/{clip_id}/seo")
-async def update_clip_seo(job_id: str, clip_id: int, req: UpdateClipSEORequest):
+async def update_clip_seo(job_id: str, clip_id: int, req: UpdateClipSEORequest, user: User = Depends(get_current_user)):
     """Persist user-edited SEO data on a clip."""
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = await require_job_access(job_id, user)
 
     clip = next((c for c in job.clips if c.id == clip_id), None)
     if not clip:
@@ -1646,7 +1634,7 @@ EDITOR_STATE_DIR = "/data/uploads"
 
 
 @router.put("/jobs/{job_id}/clips/{clip_id}/editor-state")
-async def save_editor_state(job_id: str, clip_id: int, state: dict):
+async def save_editor_state(job_id: str, clip_id: int, state: dict, user: User = Depends(get_current_user)):
     """Persist editor timeline state for cross-session recovery."""
     import json
     state_dir = os.path.join(EDITOR_STATE_DIR, job_id, "editor-state")
@@ -1659,7 +1647,7 @@ async def save_editor_state(job_id: str, clip_id: int, state: dict):
 
 
 @router.get("/jobs/{job_id}/clips/{clip_id}/editor-state")
-async def get_editor_state(job_id: str, clip_id: int):
+async def get_editor_state(job_id: str, clip_id: int, user: User = Depends(get_current_user)):
     """Retrieve saved editor state."""
     import json
     state_file = os.path.join(EDITOR_STATE_DIR, job_id, "editor-state", f"clip_{clip_id}.json")
@@ -1674,7 +1662,7 @@ async def get_editor_state(job_id: str, clip_id: int):
 
 
 @router.post("/jobs/{job_id}/clips/{clip_id}/export-timeline", deprecated=True)
-async def export_timeline(job_id: str, clip_id: int, timeline: dict):
+async def export_timeline(job_id: str, clip_id: int, timeline: dict, user: User = Depends(get_current_user)):
     """Deprecated: use POST /jobs/{job_id}/export-clip instead.
 
     The standard export-clip endpoint now supports all multi-track editor
@@ -1691,7 +1679,7 @@ async def export_timeline(job_id: str, clip_id: int, timeline: dict):
 # ── Export Parity Validation ──────────────────────────────────────────
 
 @router.post("/jobs/{job_id}/validate-export-parity")
-async def validate_export_parity(job_id: str, req: ExportRequest):
+async def validate_export_parity(job_id: str, req: ExportRequest, user: User = Depends(get_current_user)):
     """Validate that an export request will produce output matching the preview.
 
     Returns a detailed report of which effects, overlays, and settings will be
@@ -1785,22 +1773,9 @@ async def validate_export_parity(job_id: str, req: ExportRequest):
 # ── QA / Validation Endpoint ─────────────────────────────────────────
 
 @router.get("/jobs/{job_id}/qa-validate")
-async def qa_validate_job(job_id: str):
-    """Run QA validation checks on a completed analysis job.
-
-    Validates that:
-    - Transcript was generated with segments
-    - Scenes were analyzed with importance scores
-    - Clips were detected with proper viral scores
-    - Clip boundaries are within video duration
-    - Clip durations are within valid ranges
-    - ClipFocus clips have focus metadata
-    - Subject tracking data is present (when enabled)
-    - All AI providers responded correctly
-    """
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+async def qa_validate_job(job_id: str, user: User = Depends(get_current_user)):
+    """Run QA validation checks on a completed analysis job."""
+    job = await require_job_access(job_id, user)
 
     checks = []
     warnings = []

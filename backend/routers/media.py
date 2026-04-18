@@ -7,16 +7,28 @@ import logging
 from pathlib import Path
 
 import aiofiles
-from fastapi import APIRouter, File, UploadFile, Query, HTTPException
+from fastapi import APIRouter, Depends, File, UploadFile, Query, HTTPException
 from fastapi.responses import JSONResponse
+
+from backend.app.auth.deps import get_current_user, require_job_access
+from backend.app.auth.models import User
 
 logger = logging.getLogger("clipai.media")
 
 router = APIRouter()
 
 UPLOAD_DIR = "/data/uploads"
-# Special job_id used for the global media library (not tied to any job)
+# Special prefix for the per-user global media library (not tied to any job).
+# Actual directory becomes ``_library_{user_id}`` so each user's uploads are
+# private even from admins.
 GLOBAL_LIBRARY_ID = "_library"
+
+
+def _resolve_media_job_id(job_id: str, user: User) -> str:
+    """Turn the default ``_library`` sentinel into a per-user directory."""
+    if job_id == GLOBAL_LIBRARY_ID:
+        return f"{GLOBAL_LIBRARY_ID}_{user.id}"
+    return job_id
 ALLOWED_EXTENSIONS = {
     "video": {".mp4", ".mov", ".webm", ".mkv"},
     "audio": {".mp3", ".wav", ".aac", ".ogg", ".flac"},
@@ -76,12 +88,16 @@ def detect_media_type(filename: str) -> str | None:
 async def upload_media(
     file: UploadFile = File(...),
     job_id: str = Query(default=GLOBAL_LIBRARY_ID),
+    user: User = Depends(get_current_user),
 ):
     """Accept media upload for the multi-track editor, store to data/uploads/{job_id}/media/.
 
-    When job_id is omitted it defaults to the global media library (_library).
+    When job_id is omitted it defaults to the per-user media library.
     Streams file to disk in chunks to avoid loading large files into memory.
     """
+    if job_id != GLOBAL_LIBRARY_ID:
+        await require_job_access(job_id, user)
+    job_id = _resolve_media_job_id(job_id, user)
     media_type = detect_media_type(file.filename or "")
     if not media_type:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}")
@@ -153,12 +169,12 @@ async def register_media(
     filename: str = Query(...),
     media_type: str = Query(...),
     job_id: str = Query(default=GLOBAL_LIBRARY_ID),
+    user: User = Depends(get_current_user),
 ):
-    """Register an already-assembled file (from chunked upload) in the media library.
-
-    Moves/links the file from the upload directory into the media directory
-    so it appears in the media library alongside directly uploaded files.
-    """
+    """Register an already-assembled file (from chunked upload) in the media library."""
+    if job_id != GLOBAL_LIBRARY_ID:
+        await require_job_access(job_id, user)
+    job_id = _resolve_media_job_id(job_id, user)
     # Security: ensure file_path is under /data/uploads/
     real_path = os.path.realpath(file_path)
     if not real_path.startswith("/data/uploads/"):
@@ -205,8 +221,11 @@ async def register_media(
 
 
 @router.get("/api/media/list")
-async def list_media(job_id: str = Query(default=GLOBAL_LIBRARY_ID)):
-    """List all uploaded media files for a job (defaults to global library)."""
+async def list_media(job_id: str = Query(default=GLOBAL_LIBRARY_ID), user: User = Depends(get_current_user)):
+    """List all uploaded media files for a job (defaults to per-user library)."""
+    if job_id != GLOBAL_LIBRARY_ID:
+        await require_job_access(job_id, user)
+    job_id = _resolve_media_job_id(job_id, user)
     media_dir = os.path.join(UPLOAD_DIR, job_id, "media")
     if not os.path.isdir(media_dir):
         return JSONResponse({"items": []})
@@ -236,8 +255,11 @@ async def list_media(job_id: str = Query(default=GLOBAL_LIBRARY_ID)):
 
 
 @router.delete("/api/media/{media_id}")
-async def delete_media(media_id: str, job_id: str = Query(default=GLOBAL_LIBRARY_ID)):
+async def delete_media(media_id: str, job_id: str = Query(default=GLOBAL_LIBRARY_ID), user: User = Depends(get_current_user)):
     """Delete an uploaded media file."""
+    if job_id != GLOBAL_LIBRARY_ID:
+        await require_job_access(job_id, user)
+    job_id = _resolve_media_job_id(job_id, user)
     media_dir = os.path.join(UPLOAD_DIR, job_id, "media")
     if not os.path.isdir(media_dir):
         raise HTTPException(status_code=404, detail="Media not found")

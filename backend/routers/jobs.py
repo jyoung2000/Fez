@@ -9,7 +9,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from backend import database
-from backend.app.auth.deps import get_current_user
+from backend.app.auth.deps import get_current_user, require_job_access
 from backend.app.auth.models import Role, User
 from backend.models import FrameData, JobStatus, SceneDescription, TranscriptSegment, WordTimestamp
 from backend.services.pipeline import run_analysis, request_cancel, is_cancel_requested
@@ -20,34 +20,8 @@ logger = logging.getLogger(__name__)
 
 
 async def _require_job_access(job_id: str, user: User):
-    """Load a job and verify the caller owns it (or is admin).
-
-    Admins see every job (including legacy jobs with no owner recorded).
-    Regular users only see their own jobs — either by matching the
-    stored ``owner_user_id`` UUID, or (fallback) by matching the
-    stored ``owner_username`` when the UUID no longer resolves. The
-    username fallback recovers access to jobs generated before
-    ``/data/auth`` was persisted as a docker volume; without it a
-    restart that regenerated the admin's UUID would hide every job
-    they owned from them even though the job files survive on disk.
-    Anything else → 404 so we don't leak the existence of other
-    users' jobs.
-    """
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    owner = getattr(job, "owner_user_id", "") or ""
-    owner_name = (getattr(job, "owner_username", "") or "").strip().lower()
-    if user.role == Role.ADMIN:
-        return job
-    if owner and owner == user.id:
-        return job
-    if owner_name and owner_name == (user.username or "").strip().lower():
-        return job
-    if not owner:
-        # Legacy pre-auth job: leave invisible to regular users.
-        raise HTTPException(status_code=404, detail="Job not found")
-    raise HTTPException(status_code=404, detail="Job not found")
+    """Thin wrapper kept for backward compatibility within this module."""
+    return await require_job_access(job_id, user)
 
 
 class SpeakerRenameRequest(BaseModel):
@@ -58,15 +32,13 @@ router = APIRouter(prefix="/api", tags=["jobs"])
 
 @router.get("/jobs")
 async def list_jobs(user: User = Depends(get_current_user)):
-    # Admin sees all jobs (including legacy unowned ones).
-    # Regular users only see their own.
-    if user.role == Role.ADMIN:
-        jobs = await database.list_jobs()
-    else:
-        jobs = await database.list_jobs(
-            owner_user_id=user.id,
-            owner_username=user.username,
-        )
+    # Every user — including admins — only sees their own jobs.
+    # Head admin also picks up legacy unowned jobs so they aren't lost.
+    jobs = await database.list_jobs(
+        owner_user_id=user.id,
+        owner_username=user.username,
+        include_unowned=getattr(user, "head_admin", False),
+    )
     return [
         {
             "job_id": j.job_id,

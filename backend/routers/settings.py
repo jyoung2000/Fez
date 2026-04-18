@@ -9,11 +9,14 @@ import time
 import uuid
 
 import httpx
-from fastapi import APIRouter, File, Request, UploadFile, Form
+from fastapi import APIRouter, Depends, File, Request, UploadFile, Form
 from pydantic import BaseModel
 
 from typing import Optional
 
+from backend.app.auth.deps import get_current_user
+from backend.app.auth.models import User
+from backend.app.auth.store import read_user_settings, write_user_settings
 from backend.config import Settings, settings, get_settings
 from backend.services.prompts import (
     PromptSet, load_prompts, save_prompts, get_defaults, MAX_PROMPT_LENGTH,
@@ -81,6 +84,14 @@ def _is_real_value(key: str, val: str) -> bool:
     if val in _PLACEHOLDER_KEYS:
         return False
     return True
+
+
+async def _user_setting(user_id: str, key: str) -> str | bool | int | None:
+    """Read a single setting for ``user_id``, falling back to global."""
+    us = await read_user_settings(user_id)
+    if key in us:
+        return us[key]
+    return getattr(settings, key, "")
 
 
 def _persist_user_settings() -> bool:
@@ -459,17 +470,20 @@ def _key_is_set(key: str) -> bool:
 
 
 @router.get("/providers/status")
-async def provider_status():
-    global _status_cache, _status_cache_ts
-    now = time.time()
-    if _status_cache and now - _status_cache_ts < _STATUS_CACHE_TTL:
-        return _status_cache
+async def provider_status(user: User = Depends(get_current_user)):
+    # Per-user: read from user's settings file, fall back to global.
+    us = await read_user_settings(user.id)
+
+    def _us(key: str) -> str | bool | int:
+        if key in us:
+            return us[key]
+        return getattr(settings, key, "")
 
     from backend.services.providers.openrouter_provider import PRESETS
 
     statuses = {}
 
-    # Ollama
+    # Ollama (shared resource — status is instance-wide)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{settings.OLLAMA_HOST}/api/tags")
@@ -484,14 +498,14 @@ async def provider_status():
     except Exception as e:
         statuses["ollama"] = {"status": "offline", "error": str(e)}
 
-    # OpenRouter — always read model IDs from settings (the provider does
-    # the same), falling back to preset defaults if settings are empty.
-    if _key_is_set(settings.OPENROUTER_API_KEY):
-        preset_name = settings.OPENROUTER_PRESET
+    # OpenRouter — per-user API key + model selections
+    or_key = _us("OPENROUTER_API_KEY")
+    if _key_is_set(or_key):
+        preset_name = _us("OPENROUTER_PRESET") or "free"
         preset = PRESETS.get(preset_name, PRESETS["free"])
-        vision_model = settings.OPENROUTER_VISION_MODEL or preset["vision"]
-        text_model = settings.OPENROUTER_TEXT_MODEL or preset["text"]
-        summary_model = settings.OPENROUTER_SUMMARY_MODEL or text_model
+        vision_model = _us("OPENROUTER_VISION_MODEL") or preset["vision"]
+        text_model = _us("OPENROUTER_TEXT_MODEL") or preset["text"]
+        summary_model = _us("OPENROUTER_SUMMARY_MODEL") or text_model
         statuses["openrouter"] = {
             "status": "configured",
             "preset": preset_name,
@@ -502,33 +516,36 @@ async def provider_status():
     else:
         statuses["openrouter"] = {"status": "not_configured"}
 
-    # Anthropic
-    if _key_is_set(settings.ANTHROPIC_API_KEY):
+    # Anthropic — per-user key
+    if _key_is_set(_us("ANTHROPIC_API_KEY")):
         statuses["anthropic"] = {"status": "configured"}
     else:
         statuses["anthropic"] = {"status": "not_configured"}
 
-    # Gemini
-    if _key_is_set(settings.GEMINI_API_KEY):
+    # Gemini — per-user key
+    if _key_is_set(_us("GEMINI_API_KEY")):
         statuses["gemini"] = {"status": "configured"}
     else:
         statuses["gemini"] = {"status": "not_configured"}
 
-    # Groq
-    if _key_is_set(settings.GROQ_API_KEY):
+    # Groq — per-user key
+    if _key_is_set(_us("GROQ_API_KEY")):
         statuses["groq"] = {"status": "configured"}
     else:
         statuses["groq"] = {"status": "not_configured"}
 
-    # HuggingFace (speaker diarization)
-    hf_token = settings.HF_AUTH_TOKEN
-    if hf_token and hf_token.strip():
+    # HuggingFace — per-user token
+    hf_token = _us("HF_AUTH_TOKEN")
+    if hf_token and str(hf_token).strip():
         statuses["huggingface"] = {"status": "configured", "message": "Token set"}
     else:
         statuses["huggingface"] = {"status": "not_configured", "message": "No HF token"}
 
     # Determine the active provider and models based on fallback chain
-    chain = settings.active_provider_chain
+    chain_raw = _us("AI_FALLBACK_CHAIN")
+    chain = settings.active_provider_chain  # default
+    if chain_raw and isinstance(chain_raw, str):
+        chain = [p.strip() for p in chain_raw.split(",") if p.strip()]
     active_provider = None
     active_vision_model = None
     active_text_model = None
@@ -543,9 +560,9 @@ async def provider_status():
                 active_summary_model = info.get("summary_model", "")
                 active_text_model = info.get("text_model", "")
             elif name == "ollama":
-                active_vision_model = settings.OLLAMA_VISION_MODEL
-                active_text_model = settings.OLLAMA_TEXT_MODEL
-                active_summary_model = settings.OLLAMA_TEXT_MODEL
+                active_vision_model = _us("OLLAMA_VISION_MODEL") or settings.OLLAMA_VISION_MODEL
+                active_text_model = _us("OLLAMA_TEXT_MODEL") or settings.OLLAMA_TEXT_MODEL
+                active_summary_model = active_text_model
             elif name == "gemini":
                 active_vision_model = "gemini-2.5-flash"
                 active_text_model = "gemini-2.5-flash"
@@ -560,26 +577,32 @@ async def provider_status():
                 active_summary_model = "llama-3.1-8b-instant"
             break
 
+    whisper_model = _us("WHISPER_MODEL") or settings.WHISPER_MODEL
+    whisper_beam = _us("WHISPER_BEAM_SIZE")
+    if not isinstance(whisper_beam, int):
+        whisper_beam = settings.WHISPER_BEAM_SIZE
+    whisper_vad = _us("WHISPER_VAD_FILTER")
+    if not isinstance(whisper_vad, bool):
+        whisper_vad = settings.WHISPER_VAD_FILTER
+
     statuses["_active"] = {
         "provider": active_provider or "none",
-        "transcript_model": settings.WHISPER_MODEL,
-        "whisper_beam_size": settings.WHISPER_BEAM_SIZE,
-        "whisper_vad_filter": settings.WHISPER_VAD_FILTER,
+        "transcript_model": whisper_model,
+        "whisper_beam_size": whisper_beam,
+        "whisper_vad_filter": whisper_vad,
         "vision_model": active_vision_model or "",
         "summary_model": active_summary_model or "",
         "text_model": active_text_model or "",
-        "preset": settings.OPENROUTER_PRESET if active_provider == "openrouter" else "",
+        "preset": (_us("OPENROUTER_PRESET") or settings.OPENROUTER_PRESET) if active_provider == "openrouter" else "",
         "fallback_chain": chain,
         "ollama_enabled": "ollama" in chain,
     }
 
-    _status_cache = statuses
-    _status_cache_ts = time.time()
     return statuses
 
 
 @router.post("/providers/test/{provider_name}")
-async def test_provider(provider_name: str):
+async def test_provider(provider_name: str, user: User = Depends(get_current_user)):
     """Live-test a provider by making a real API call and returning detailed status."""
 
     if provider_name == "openrouter":
@@ -860,13 +883,8 @@ def _invalidate_status_cache():
 
 
 @router.post("/providers/key")
-async def save_provider_key(req: SaveKeyRequest):
-    """Save an API key to .env and hot-reload settings.
-
-    Keys are persisted to two locations for redundancy:
-    1. user_settings.json on the Docker volume mount (survives container recreate)
-    2. .env file inside the container (survives container restart)
-    """
+async def save_provider_key(req: SaveKeyRequest, user: User = Depends(get_current_user)):
+    """Save an API key to the calling user's private settings file."""
     env_var = _PROVIDER_KEY_ENV.get(req.provider)
     if not env_var:
         return {"status": "error", "message": f"Unknown provider: {req.provider}"}
@@ -875,33 +893,15 @@ async def save_provider_key(req: SaveKeyRequest):
     if not key_val:
         return {"status": "error", "message": "Key cannot be empty"}
 
-    # Update the settings object in memory
-    setattr(settings, env_var, key_val)
+    # Persist to per-user settings file
+    await write_user_settings(user.id, {env_var: key_val})
     _invalidate_status_cache()
+    logger.info(
+        "User %s saved %s key (%d chars)",
+        user.username, req.provider, len(key_val),
+    )
 
-    # If the HuggingFace token changed, reload the diarization pipeline
-    if env_var == "HF_AUTH_TOKEN":
-        try:
-            from backend.services.transcription import reload_diarization
-            reload_diarization()
-            logger.info("Reloading pyannote diarization pipeline with new HF token")
-        except Exception as e:
-            logger.warning("Failed to reload diarization pipeline: %s", e)
-
-    # Persist to .env file (backup)
-    env_path = _find_env_file()
-    if env_path:
-        _upsert_env_var(env_path, env_var, key_val)
-
-    # Persist to user_settings.json (primary — on volume mount)
-    persisted = _persist_user_settings()
-    result = {"status": "saved", "provider": req.provider}
-    if not persisted:
-        result["warning"] = (
-            "Key is active in memory but could not be saved to disk. "
-            "It may not survive a container restart."
-        )
-    return result
+    return {"status": "saved", "provider": req.provider}
 
 
 class SavePresetRequest(BaseModel):
@@ -912,43 +912,25 @@ class SavePresetRequest(BaseModel):
 
 
 @router.post("/providers/preset")
-async def save_preset(req: SavePresetRequest):
-    """Save the active preset (and optional custom models) to settings.
-
-    When a known preset is selected (free/efficient/balanced/premium),
-    the model IDs in settings are updated to match the preset's defaults.
-    This ensures OpenRouterProvider always reads the correct models from
-    settings without needing to re-resolve the preset dict at init time.
-
-    When custom models are provided (req.vision_model, req.text_model),
-    those override the preset defaults.
-    """
+async def save_preset(req: SavePresetRequest, user: User = Depends(get_current_user)):
+    """Save the active preset (and optional custom models) to the user's settings."""
     from backend.services.providers.openrouter_provider import PRESETS as _PRESETS
 
-    settings.OPENROUTER_PRESET = req.preset
-
-    # Resolve effective model IDs: explicit overrides > preset defaults
     preset_dict = _PRESETS.get(req.preset, _PRESETS["free"])
     vision_model = req.vision_model or preset_dict["vision"]
     text_model = req.text_model or preset_dict["text"]
     summary_model = req.summary_model or preset_dict.get("summary", text_model)
 
-    settings.OPENROUTER_VISION_MODEL = vision_model
-    settings.OPENROUTER_TEXT_MODEL = text_model
-    settings.OPENROUTER_SUMMARY_MODEL = summary_model
+    await write_user_settings(user.id, {
+        "OPENROUTER_PRESET": req.preset,
+        "OPENROUTER_VISION_MODEL": vision_model,
+        "OPENROUTER_TEXT_MODEL": text_model,
+        "OPENROUTER_SUMMARY_MODEL": summary_model,
+    })
     _invalidate_status_cache()
-
-    env_path = _find_env_file()
-    if env_path:
-        _upsert_env_var(env_path, "OPENROUTER_PRESET", req.preset)
-        _upsert_env_var(env_path, "OPENROUTER_VISION_MODEL", vision_model)
-        _upsert_env_var(env_path, "OPENROUTER_TEXT_MODEL", text_model)
-        _upsert_env_var(env_path, "OPENROUTER_SUMMARY_MODEL", summary_model)
-
-    _persist_user_settings()
     logger.info(
-        "Preset saved: %s (vision=%s, text=%s, summary=%s)",
-        req.preset, vision_model, text_model, summary_model,
+        "User %s saved preset: %s (vision=%s, text=%s, summary=%s)",
+        user.username, req.preset, vision_model, text_model, summary_model,
     )
     return {"status": "saved", "preset": req.preset}
 
@@ -1025,22 +1007,18 @@ def _pull_ollama_models_background(models: list[str] | None = None):
 
 
 @router.post("/providers/ollama/toggle")
-async def toggle_ollama(req: ToggleOllamaRequest):
-    """Add or remove Ollama from the fallback chain."""
-    chain = [p.strip() for p in settings.AI_FALLBACK_CHAIN.split(",") if p.strip()]
+async def toggle_ollama(req: ToggleOllamaRequest, user: User = Depends(get_current_user)):
+    """Add or remove Ollama from the user's fallback chain."""
+    us = await read_user_settings(user.id)
+    chain_raw = us.get("AI_FALLBACK_CHAIN") or settings.AI_FALLBACK_CHAIN
+    chain = [p.strip() for p in chain_raw.split(",") if p.strip()]
     if req.enabled:
         if "ollama" not in chain:
-            chain.insert(0, "ollama")  # Ollama goes FIRST — user wants to use local models
+            chain.insert(0, "ollama")
     else:
         chain = [p for p in chain if p != "ollama"]
-    settings.AI_FALLBACK_CHAIN = ",".join(chain)
+    await write_user_settings(user.id, {"AI_FALLBACK_CHAIN": ",".join(chain)})
     _invalidate_status_cache()
-
-    env_path = _find_env_file()
-    if env_path:
-        _upsert_env_var(env_path, "AI_FALLBACK_CHAIN", settings.AI_FALLBACK_CHAIN)
-
-    _persist_user_settings()
 
     # When Ollama is enabled, pull configured models in the background
     # so they're ready when the user needs them.  The startup pull only
@@ -1108,9 +1086,11 @@ def _upsert_env_var(env_path: str, var_name: str, value: str):
 
 
 @router.get("/providers/models/recommended")
-async def recommended_models():
+async def recommended_models(user: User = Depends(get_current_user)):
     """Dynamically discover vision-capable models from OpenRouter and build recommendations."""
-    if not _key_is_set(settings.OPENROUTER_API_KEY):
+    us = await read_user_settings(user.id)
+    or_key = us.get("OPENROUTER_API_KEY") or settings.OPENROUTER_API_KEY
+    if not _key_is_set(or_key):
         return {"models": [], "error": "OpenRouter API key not configured"}
 
     all_models = await _fetch_openrouter_models()
@@ -1368,7 +1348,7 @@ def _estimate_cost(model_data: dict, role: str) -> float:
 
 
 @router.get("/providers/models")
-async def list_models():
+async def list_models(user: User = Depends(get_current_user)):
     """Fetch OpenRouter model list, cached for 24h."""
     # Check cache
     if os.path.exists(MODEL_CACHE_PATH):
@@ -1400,7 +1380,7 @@ async def list_models():
 
 
 @router.post("/providers/models/refresh")
-async def refresh_models():
+async def refresh_models(user: User = Depends(get_current_user)):
     """Force-refresh the model list from OpenRouter (clears cache)."""
     # Delete cache to force re-fetch
     if os.path.exists(MODEL_CACHE_PATH):
@@ -1580,7 +1560,7 @@ def _vision_tracking_compat(model_id: str, context_length: int) -> tuple[bool, i
 
 
 @router.get("/providers/models/available")
-async def available_models():
+async def available_models(user: User = Depends(get_current_user)):
     """Return all available models grouped by task (transcript, vision, text).
     Each list is sorted: free/cheapest first. Filtered by capability."""
 
@@ -1802,109 +1782,60 @@ class SaveModelsRequest(BaseModel):
 
 
 @router.post("/providers/models/save")
-async def save_models(req: SaveModelsRequest):
-    """Save per-task model selections to settings and .env."""
-    env_path = _find_env_file()
+async def save_models(req: SaveModelsRequest, user: User = Depends(get_current_user)):
+    """Save per-task model selections to the user's settings."""
+    patch: dict = {}
 
     if req.transcript_model:
-        old_model = settings.WHISPER_MODEL
-        settings.WHISPER_MODEL = req.transcript_model
-        settings.WHISPER_MODEL_USER_SET = True  # Mark as explicitly chosen by user
-        if env_path:
-            _upsert_env_var(env_path, "WHISPER_MODEL", req.transcript_model)
-            _upsert_env_var(env_path, "WHISPER_MODEL_USER_SET", "true")
-        # Force reload if model changed — without this, the _whisper_model
-        # singleton holds the old model and _get_whisper_model() returns it.
-        if req.transcript_model != old_model:
-            from backend.services.transcription import reload_model as reload_whisper
-            reload_whisper()
-            logger.info(
-                "Whisper model changed: '%s' → '%s' — triggering background download",
-                old_model, req.transcript_model,
-            )
-            # Pre-download the new model in background so it's cached before
-            # the user starts a video analysis. Without this, the first
-            # transcription attempt downloads the model inside the subprocess,
-            # which can timeout and fail.
-            _pre_download_whisper_model(req.transcript_model)
+        patch["WHISPER_MODEL"] = req.transcript_model
+        patch["WHISPER_MODEL_USER_SET"] = True
+        _pre_download_whisper_model(req.transcript_model)
 
     if req.vision_model:
         if req.vision_model.startswith("ollama/"):
-            # Strip the "ollama/" prefix to get the raw model name
-            ollama_model = req.vision_model[len("ollama/"):]
-            settings.OLLAMA_VISION_MODEL = ollama_model
-            if env_path:
-                _upsert_env_var(env_path, "OLLAMA_VISION_MODEL", ollama_model)
+            patch["OLLAMA_VISION_MODEL"] = req.vision_model[len("ollama/"):]
         else:
-            settings.OPENROUTER_VISION_MODEL = req.vision_model
-            settings.OPENROUTER_PRESET = "custom"
-            if env_path:
-                _upsert_env_var(env_path, "OPENROUTER_VISION_MODEL", req.vision_model)
-                _upsert_env_var(env_path, "OPENROUTER_PRESET", "custom")
+            patch["OPENROUTER_VISION_MODEL"] = req.vision_model
+            patch["OPENROUTER_PRESET"] = "custom"
 
     if req.text_model:
         if req.text_model.startswith("ollama/"):
-            ollama_model = req.text_model[len("ollama/"):]
-            settings.OLLAMA_TEXT_MODEL = ollama_model
-            if env_path:
-                _upsert_env_var(env_path, "OLLAMA_TEXT_MODEL", ollama_model)
+            patch["OLLAMA_TEXT_MODEL"] = req.text_model[len("ollama/"):]
         else:
-            settings.OPENROUTER_TEXT_MODEL = req.text_model
-            settings.OPENROUTER_SUMMARY_MODEL = req.text_model
-            settings.OPENROUTER_PRESET = "custom"
-            if env_path:
-                _upsert_env_var(env_path, "OPENROUTER_TEXT_MODEL", req.text_model)
-                _upsert_env_var(env_path, "OPENROUTER_SUMMARY_MODEL", req.text_model)
-                _upsert_env_var(env_path, "OPENROUTER_PRESET", "custom")
+            patch["OPENROUTER_TEXT_MODEL"] = req.text_model
+            patch["OPENROUTER_SUMMARY_MODEL"] = req.text_model
+            patch["OPENROUTER_PRESET"] = "custom"
 
-    # If the user selected Ollama models, ensure Ollama is in the fallback chain
-    # so it actually gets used for analysis. Put it first since that's the user's intent.
-    has_ollama_models = (
+    # Auto-adjust fallback chain for the user based on model provider
+    has_ollama = (
         (req.vision_model and req.vision_model.startswith("ollama/"))
         or (req.text_model and req.text_model.startswith("ollama/"))
     )
-    has_openrouter_models = (
+    has_openrouter = (
         (req.vision_model and not req.vision_model.startswith("ollama/") and req.vision_model)
         or (req.text_model and not req.text_model.startswith("ollama/") and req.text_model)
     )
+    us = await read_user_settings(user.id)
+    chain_raw = us.get("AI_FALLBACK_CHAIN") or settings.AI_FALLBACK_CHAIN
+    chain = [p.strip() for p in chain_raw.split(",") if p.strip()]
 
-    if has_ollama_models:
-        chain = [p.strip() for p in settings.AI_FALLBACK_CHAIN.split(",") if p.strip()]
+    if has_ollama:
         if "ollama" not in chain:
             chain.insert(0, "ollama")
-            settings.AI_FALLBACK_CHAIN = ",".join(chain)
-            if env_path:
-                _upsert_env_var(env_path, "AI_FALLBACK_CHAIN", settings.AI_FALLBACK_CHAIN)
-            logger.info("Auto-enabled Ollama in fallback chain (user selected Ollama models)")
         elif chain[0] != "ollama":
-            # Move Ollama to front — user clearly wants local models as primary
             chain = ["ollama"] + [p for p in chain if p != "ollama"]
-            settings.AI_FALLBACK_CHAIN = ",".join(chain)
-            if env_path:
-                _upsert_env_var(env_path, "AI_FALLBACK_CHAIN", settings.AI_FALLBACK_CHAIN)
-            logger.info("Moved Ollama to front of fallback chain (user selected Ollama models)")
-    elif has_openrouter_models:
-        # User selected OpenRouter models — ensure OpenRouter is in the chain
-        # and move it to the front so it's the primary provider
-        chain = [p.strip() for p in settings.AI_FALLBACK_CHAIN.split(",") if p.strip()]
+        patch["AI_FALLBACK_CHAIN"] = ",".join(chain)
+    elif has_openrouter:
         if "openrouter" not in chain:
             chain.insert(0, "openrouter")
-            settings.AI_FALLBACK_CHAIN = ",".join(chain)
-            if env_path:
-                _upsert_env_var(env_path, "AI_FALLBACK_CHAIN", settings.AI_FALLBACK_CHAIN)
-            logger.info("Auto-enabled OpenRouter in fallback chain (user selected OpenRouter models)")
         elif chain[0] != "openrouter":
             chain = ["openrouter"] + [p for p in chain if p != "openrouter"]
-            settings.AI_FALLBACK_CHAIN = ",".join(chain)
-            if env_path:
-                _upsert_env_var(env_path, "AI_FALLBACK_CHAIN", settings.AI_FALLBACK_CHAIN)
-            logger.info("Moved OpenRouter to front of fallback chain (user selected OpenRouter models)")
+        patch["AI_FALLBACK_CHAIN"] = ",".join(chain)
 
+    await write_user_settings(user.id, patch)
     _invalidate_status_cache()
-    _persist_user_settings()
 
-    # Pull any newly selected Ollama models in the background
-    if has_ollama_models:
+    if has_ollama:
         pull_models = []
         if req.vision_model and req.vision_model.startswith("ollama/"):
             pull_models.append(req.vision_model[len("ollama/"):])
@@ -1913,28 +1844,21 @@ async def save_models(req: SaveModelsRequest):
         if pull_models:
             _pull_ollama_models_background(pull_models)
 
-    # Return the currently active models.
-    # If the user just saved Ollama models, reflect those regardless of chain order.
-    # This prevents the UI from reverting to OpenRouter models when Ollama is enabled
-    # but not the first provider in the chain.
-    chain = settings.active_provider_chain
-    has_ollama_models = (
-        (req.vision_model and req.vision_model.startswith("ollama/"))
-        or (req.text_model and req.text_model.startswith("ollama/"))
-    )
-    use_ollama = has_ollama_models or (chain and chain[0] == "ollama")
+    # Reflect the user's saved models in the response.
+    merged = {**us, **patch}
+    use_ollama = has_ollama or (chain and chain[0] == "ollama")
     if use_ollama:
         return {
             "status": "saved",
-            "transcript_model": settings.WHISPER_MODEL,
-            "vision_model": f"ollama/{settings.OLLAMA_VISION_MODEL}",
-            "text_model": f"ollama/{settings.OLLAMA_TEXT_MODEL}",
+            "transcript_model": merged.get("WHISPER_MODEL", settings.WHISPER_MODEL),
+            "vision_model": f"ollama/{merged.get('OLLAMA_VISION_MODEL', settings.OLLAMA_VISION_MODEL)}",
+            "text_model": f"ollama/{merged.get('OLLAMA_TEXT_MODEL', settings.OLLAMA_TEXT_MODEL)}",
         }
     return {
         "status": "saved",
-        "transcript_model": settings.WHISPER_MODEL,
-        "vision_model": settings.OPENROUTER_VISION_MODEL,
-        "text_model": settings.OPENROUTER_TEXT_MODEL,
+        "transcript_model": merged.get("WHISPER_MODEL", settings.WHISPER_MODEL),
+        "vision_model": merged.get("OPENROUTER_VISION_MODEL", settings.OPENROUTER_VISION_MODEL),
+        "text_model": merged.get("OPENROUTER_TEXT_MODEL", settings.OPENROUTER_TEXT_MODEL),
     }
 
 
@@ -1948,45 +1872,37 @@ class SaveTranscriptionSettingsRequest(BaseModel):
 
 
 @router.get("/transcription/settings")
-async def get_transcription_settings():
-    """Return current transcription speed/quality settings."""
+async def get_transcription_settings(user: User = Depends(get_current_user)):
+    """Return per-user transcription speed/quality settings."""
+    us = await read_user_settings(user.id)
     return {
-        "whisper_model": settings.WHISPER_MODEL,
-        "beam_size": settings.WHISPER_BEAM_SIZE,
-        "vad_filter": settings.WHISPER_VAD_FILTER,
-        "frame_sample_rate": settings.FRAME_SAMPLE_RATE,
+        "whisper_model": us.get("WHISPER_MODEL", settings.WHISPER_MODEL),
+        "beam_size": us.get("WHISPER_BEAM_SIZE", settings.WHISPER_BEAM_SIZE),
+        "vad_filter": us.get("WHISPER_VAD_FILTER", settings.WHISPER_VAD_FILTER),
+        "frame_sample_rate": us.get("FRAME_SAMPLE_RATE", settings.FRAME_SAMPLE_RATE),
     }
 
 
 @router.post("/transcription/settings")
-async def save_transcription_settings(req: SaveTranscriptionSettingsRequest):
-    """Save transcription speed/quality settings."""
-    env_path = _find_env_file()
-
+async def save_transcription_settings(req: SaveTranscriptionSettingsRequest, user: User = Depends(get_current_user)):
+    """Save per-user transcription speed/quality settings."""
+    patch: dict = {}
     if req.beam_size is not None:
-        clamped = max(1, min(5, req.beam_size))
-        settings.WHISPER_BEAM_SIZE = clamped
-        if env_path:
-            _upsert_env_var(env_path, "WHISPER_BEAM_SIZE", str(clamped))
-
+        patch["WHISPER_BEAM_SIZE"] = max(1, min(5, req.beam_size))
     if req.vad_filter is not None:
-        settings.WHISPER_VAD_FILTER = req.vad_filter
-        if env_path:
-            _upsert_env_var(env_path, "WHISPER_VAD_FILTER", str(req.vad_filter))
-
+        patch["WHISPER_VAD_FILTER"] = req.vad_filter
     if req.frame_sample_rate is not None:
-        clamped = max(5, min(30, req.frame_sample_rate))
-        settings.FRAME_SAMPLE_RATE = clamped
-        if env_path:
-            _upsert_env_var(env_path, "FRAME_SAMPLE_RATE", str(clamped))
+        patch["FRAME_SAMPLE_RATE"] = max(5, min(30, req.frame_sample_rate))
+    if patch:
+        await write_user_settings(user.id, patch)
+        _invalidate_status_cache()
 
-    _invalidate_status_cache()
-    _persist_user_settings()
+    us = await read_user_settings(user.id)
     return {
         "status": "saved",
-        "beam_size": settings.WHISPER_BEAM_SIZE,
-        "vad_filter": settings.WHISPER_VAD_FILTER,
-        "frame_sample_rate": settings.FRAME_SAMPLE_RATE,
+        "beam_size": us.get("WHISPER_BEAM_SIZE", settings.WHISPER_BEAM_SIZE),
+        "vad_filter": us.get("WHISPER_VAD_FILTER", settings.WHISPER_VAD_FILTER),
+        "frame_sample_rate": us.get("FRAME_SAMPLE_RATE", settings.FRAME_SAMPLE_RATE),
     }
 
 
@@ -2003,50 +1919,39 @@ class SaveEncodingSettingsRequest(BaseModel):
 
 
 @router.get("/encoding/settings")
-async def get_encoding_settings():
-    """Return current FFmpeg encoding settings."""
+async def get_encoding_settings(user: User = Depends(get_current_user)):
+    """Return per-user FFmpeg encoding settings."""
+    us = await read_user_settings(user.id)
     return {
-        "preset": settings.FFMPEG_PRESET,
-        "crf": settings.FFMPEG_CRF,
-        "threads": settings.FFMPEG_THREADS,
-        "faststart": settings.FFMPEG_FASTSTART,
+        "preset": us.get("FFMPEG_PRESET", settings.FFMPEG_PRESET),
+        "crf": us.get("FFMPEG_CRF", settings.FFMPEG_CRF),
+        "threads": us.get("FFMPEG_THREADS", settings.FFMPEG_THREADS),
+        "faststart": us.get("FFMPEG_FASTSTART", settings.FFMPEG_FASTSTART),
     }
 
 
 @router.post("/encoding/settings")
-async def save_encoding_settings(req: SaveEncodingSettingsRequest):
-    """Save FFmpeg encoding settings."""
-    env_path = _find_env_file()
-
+async def save_encoding_settings(req: SaveEncodingSettingsRequest, user: User = Depends(get_current_user)):
+    """Save per-user FFmpeg encoding settings."""
+    patch: dict = {}
     if req.preset is not None and req.preset in _VALID_PRESETS:
-        settings.FFMPEG_PRESET = req.preset
-        if env_path:
-            _upsert_env_var(env_path, "FFMPEG_PRESET", req.preset)
-
+        patch["FFMPEG_PRESET"] = req.preset
     if req.crf is not None:
-        clamped = max(0, min(51, req.crf))
-        settings.FFMPEG_CRF = clamped
-        if env_path:
-            _upsert_env_var(env_path, "FFMPEG_CRF", str(clamped))
-
+        patch["FFMPEG_CRF"] = max(0, min(51, req.crf))
     if req.threads is not None:
-        clamped = max(0, min(32, req.threads))
-        settings.FFMPEG_THREADS = clamped
-        if env_path:
-            _upsert_env_var(env_path, "FFMPEG_THREADS", str(clamped))
-
+        patch["FFMPEG_THREADS"] = max(0, min(32, req.threads))
     if req.faststart is not None:
-        settings.FFMPEG_FASTSTART = req.faststart
-        if env_path:
-            _upsert_env_var(env_path, "FFMPEG_FASTSTART", str(req.faststart))
+        patch["FFMPEG_FASTSTART"] = req.faststart
+    if patch:
+        await write_user_settings(user.id, patch)
 
-    _persist_user_settings()
+    us = await read_user_settings(user.id)
     return {
         "status": "saved",
-        "preset": settings.FFMPEG_PRESET,
-        "crf": settings.FFMPEG_CRF,
-        "threads": settings.FFMPEG_THREADS,
-        "faststart": settings.FFMPEG_FASTSTART,
+        "preset": us.get("FFMPEG_PRESET", settings.FFMPEG_PRESET),
+        "crf": us.get("FFMPEG_CRF", settings.FFMPEG_CRF),
+        "threads": us.get("FFMPEG_THREADS", settings.FFMPEG_THREADS),
+        "faststart": us.get("FFMPEG_FASTSTART", settings.FFMPEG_FASTSTART),
     }
 
 
@@ -2054,9 +1959,10 @@ async def save_encoding_settings(req: SaveEncodingSettingsRequest):
 
 
 @router.get("/subject-tracking")
-async def get_subject_tracking():
-    """Return current subject tracking enabled state."""
-    return {"enabled": settings.SUBJECT_TRACKING_ENABLED}
+async def get_subject_tracking(user: User = Depends(get_current_user)):
+    """Return per-user subject tracking enabled state."""
+    us = await read_user_settings(user.id)
+    return {"enabled": us.get("SUBJECT_TRACKING_ENABLED", settings.SUBJECT_TRACKING_ENABLED)}
 
 
 class SubjectTrackingRequest(BaseModel):
@@ -2064,18 +1970,17 @@ class SubjectTrackingRequest(BaseModel):
 
 
 @router.post("/subject-tracking")
-async def set_subject_tracking(req: SubjectTrackingRequest):
-    """Toggle subject tracking on/off."""
-    settings.SUBJECT_TRACKING_ENABLED = req.enabled
-    _persist_user_settings()
-    return {"status": "saved", "enabled": settings.SUBJECT_TRACKING_ENABLED}
+async def set_subject_tracking(req: SubjectTrackingRequest, user: User = Depends(get_current_user)):
+    """Toggle per-user subject tracking on/off."""
+    await write_user_settings(user.id, {"SUBJECT_TRACKING_ENABLED": req.enabled})
+    return {"status": "saved", "enabled": req.enabled}
 
 
 # ── GPU Hardware Acceleration ────────────────────────────────────
 
 
 @router.get("/gpu-acceleration")
-async def get_gpu_acceleration():
+async def get_gpu_acceleration(user: User = Depends(get_current_user)):
     """Return current GPU acceleration toggle state and detected GPU info.
 
     When enabled, runs GPU detection and returns full hardware details.
@@ -2118,7 +2023,7 @@ class GpuAccelerationRequest(BaseModel):
 
 
 @router.post("/gpu-acceleration")
-async def set_gpu_acceleration(req: GpuAccelerationRequest):
+async def set_gpu_acceleration(req: GpuAccelerationRequest, user: User = Depends(get_current_user)):
     """Toggle GPU acceleration on/off and optionally set vendor override.
 
     When toggled ON: clears cached GPU info, re-scans for available GPUs,
@@ -2183,7 +2088,7 @@ class ClientGpuReport(BaseModel):
 
 
 @router.post("/client-gpu-report")
-async def report_client_gpu(req: ClientGpuReport):
+async def report_client_gpu(req: ClientGpuReport, user: User = Depends(get_current_user)):
     """Store client GPU capabilities so the pipeline can decide where to process.
 
     The server uses this to skip server-side transcription if the client will
@@ -2231,7 +2136,7 @@ async def report_client_gpu(req: ClientGpuReport):
 
 
 @router.get("/gpu-qa")
-async def gpu_qa_validation():
+async def gpu_qa_validation(user: User = Depends(get_current_user)):
     """Run comprehensive GPU QA validation.
 
     Checks that GPU acceleration is properly configured and actually
@@ -2554,7 +2459,7 @@ class SavePromptsRequest(BaseModel):
 
 
 @router.get("/prompts")
-async def get_prompts():
+async def get_prompts(user: User = Depends(get_current_user)):
     """Return current custom prompts and defaults."""
     current = load_prompts()
     defaults = get_defaults()
@@ -2565,7 +2470,7 @@ async def get_prompts():
 
 
 @router.post("/prompts")
-async def update_prompts(req: SavePromptsRequest):
+async def update_prompts(req: SavePromptsRequest, user: User = Depends(get_current_user)):
     """Save custom prompts. Pass null/empty to reset a prompt to default."""
     current = load_prompts()
     defaults = get_defaults()
@@ -2620,7 +2525,7 @@ async def update_prompts(req: SavePromptsRequest):
 
 
 @router.post("/prompts/reset")
-async def reset_prompts():
+async def reset_prompts(user: User = Depends(get_current_user)):
     """Reset all prompts to defaults."""
     defaults = get_defaults()
     save_prompts(defaults)
@@ -2652,7 +2557,7 @@ def _save_site_config(cfg: dict):
 
 
 @router.get("/site-config")
-async def get_site_config():
+async def get_site_config(user: User = Depends(get_current_user)):
     """Return site customisation (title, favicon URL, logo URL)."""
     return _load_site_config()
 
@@ -2664,6 +2569,7 @@ async def update_site_config(
     logo: Optional[UploadFile] = File(None),
     remove_favicon: Optional[str] = Form(None),
     remove_logo: Optional[str] = Form(None),
+    user: User = Depends(get_current_user),
 ):
     """Update site title, favicon, and/or logo."""
     cfg = _load_site_config()
@@ -2743,13 +2649,13 @@ def _save_ui_state(state: dict):
 
 
 @router.get("/ui-state")
-async def get_ui_state():
+async def get_ui_state(user: User = Depends(get_current_user)):
     """Return all persisted frontend UI state (settings, segments, etc.)."""
     return _load_ui_state()
 
 
 @router.put("/ui-state")
-async def put_ui_state(request: Request):
+async def put_ui_state(request: Request, user: User = Depends(get_current_user)):
     """Merge incoming UI state into the persisted file.
 
     Accepts a JSON object of localStorage key→value pairs.  Values that
