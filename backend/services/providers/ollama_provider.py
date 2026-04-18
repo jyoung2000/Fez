@@ -1264,30 +1264,27 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 )
 
                 if elapsed > 60:
-                    # Impractically slow — cap to 20 evenly-spaced frames
-                    max_frames = 20
+                    # Extremely slow — user explicitly chose local vision for
+                    # privacy / cost, so keep coverage high even if runtime is
+                    # long. 150 frames is the minimum that produces decent clip
+                    # detection on anything longer than a few minutes.
+                    max_frames = max(150, total // 2)
                     logger.warning(
-                        "Ollama vision too slow (%.0fs/frame) — reducing %d→%d frames "
-                        "(est. %.0f min vs %.0f hours full set)",
-                        elapsed, total, max_frames,
-                        (max_frames * elapsed) / 60, (total * elapsed) / 3600,
+                        "Ollama vision slow (%.0fs/frame) — sampling %d/%d frames "
+                        "(est. %.0f min). Pick a smaller vision model or use a "
+                        "cloud provider for faster completion.",
+                        elapsed, max_frames, total,
+                        (max_frames * elapsed) / 60,
                     )
                 elif elapsed > 15:
-                    # Moderate speed — cap to 80 frames (~7.5 min at 5.6s/frame)
-                    max_frames = 80
+                    # Moderately slow — keep most frames.
+                    max_frames = max(250, int(total * 0.8))
                     logger.info(
-                        "Ollama vision moderate speed (%.0fs/frame) — reducing %d→%d frames",
-                        elapsed, total, max_frames,
-                    )
-                elif elapsed > 5 and total > 200:
-                    # Normal speed but too many frames — cap to 150
-                    # 150 frames × 5.6s ≈ 14 min (vs 29 min for 472)
-                    max_frames = 150
-                    logger.info(
-                        "Vision OK (%.1fs/frame) but %d frames is excessive — reducing to %d",
-                        elapsed, total, max_frames,
+                        "Ollama vision moderate speed (%.0fs/frame) — sampling %d/%d frames",
+                        elapsed, max_frames, total,
                     )
                 else:
+                    # Fast enough — analyze everything.
                     max_frames = None
 
                 if max_frames is not None and total > max_frames:
@@ -1420,28 +1417,32 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         consecutive_failures = 0
         MAX_CONSECUTIVE_FAILURES = 5  # bail out if Ollama fails this many times in a row
 
-        # Hot-zone frame triage: skip expensive vision on cold-zone frames
-        if total > 20 and _current_hot_zones:
+        # Hot-zone triage used to SKIP cold-zone frames entirely, which meant
+        # silent sections with real visual action (b-roll, on-screen text,
+        # demos) got no scene data and never became clips. Now every frame is
+        # analyzed by default; hot-zone scoring still runs later to bias clip
+        # detection toward transcript peaks, but the vision pass no longer
+        # drops coverage. Users who need the old behavior back can set
+        # OLLAMA_HOT_ZONE_TRIAGE=1 in config.
+        if (
+            total > 20
+            and _current_hot_zones
+            and os.getenv("OLLAMA_HOT_ZONE_TRIAGE") == "1"
+        ):
             hot_frame_indices = {0, total - 1}
-            # Structural frames: at least 20 evenly-spaced
             structural_step = max(1, total // 20)
             for i in range(0, total, structural_step):
                 hot_frame_indices.add(i)
-            # Top 60% of hot zones get frame analysis
             top_zones = sorted(_current_hot_zones, key=lambda z: z.composite_score, reverse=True)
             cutoff = max(1, int(len(top_zones) * 0.6))
             for zone in top_zones[:cutoff]:
                 for fi, frame in enumerate(frames):
                     if zone.start - 5 <= frame.timestamp <= zone.end + 5:
                         hot_frame_indices.add(fi)
-            # ALSO include frames that were extracted via scene detection (not just interval).
-            # These frames exist because FFmpeg detected a visual change — they're worth analyzing
-            # even if the transcript is quiet at that moment.
             if len(frames) > 1:
                 avg_interval = (frames[-1].timestamp - frames[0].timestamp) / max(len(frames) - 1, 1)
                 for fi in range(1, len(frames)):
                     gap = frames[fi].timestamp - frames[fi - 1].timestamp
-                    # If gap is significantly shorter than average, it was triggered by scene change
                     if gap < avg_interval * 0.5:
                         hot_frame_indices.add(fi)
                         hot_frame_indices.add(fi - 1)
@@ -1449,7 +1450,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             cold_count = total - len(hot_frame_indices)
             if cold_count > 0:
                 logger.info(
-                    "Ollama frame triage: %d/%d frames in hot zones (skipping %d cold-zone frames)",
+                    "Ollama hot-zone triage (opt-in): %d/%d frames in hot zones, skipping %d cold",
                     len(hot_frame_indices), total, cold_count,
                 )
                 interesting_indices = hot_frame_indices
