@@ -3071,29 +3071,40 @@ export default function Analysis() {
                   >
                     &#x2B07; SRT (no speakers)
                   </a>
-                  <button
-                    onClick={handleRetranscribe}
-                    disabled={retranscribing || job?.status === 'transcribing' || job?.status === 'processing'}
-                    title={
-                      retranscribing
-                        ? 'Running Whisper on the full audio…'
-                        : 'Re-run Whisper on the full audio using the language and subtitle settings you picked at upload'
-                    }
-                    style={{
-                      padding: '6px 14px',
-                      marginLeft: 'auto',
-                      background: retranscribing ? 'var(--bg-elevated)' : 'var(--bg-elevated)',
-                      color: retranscribing ? 'var(--text-secondary)' : 'var(--accent-amber)',
-                      border: `1px solid ${retranscribing ? 'var(--border)' : 'var(--accent-amber)'}`,
-                      borderRadius: 'var(--radius-sm)',
-                      fontSize: 12,
-                      fontWeight: 600,
-                      cursor: retranscribing ? 'progress' : 'pointer',
-                      opacity: retranscribing ? 0.7 : 1,
-                    }}
-                  >
-                    {retranscribing ? 'Retranscribing…' : 'Retranscribe video'}
-                  </button>
+                  {(() => {
+                    const retranscribeRunning = retranscribing || job?.status === 'transcribing';
+                    const pct = Math.max(0, Math.min(100, Number(job?.progress || 0)));
+                    return (
+                      <button
+                        onClick={handleRetranscribe}
+                        disabled={retranscribeRunning || job?.status === 'processing'}
+                        title={
+                          retranscribeRunning
+                            ? (job?.progress_message || 'Running Whisper on the full audio…')
+                            : 'Re-run Whisper on the full audio using the language and subtitle settings you picked at upload'
+                        }
+                        style={{
+                          padding: '6px 14px',
+                          marginLeft: 'auto',
+                          background: retranscribeRunning
+                            ? `linear-gradient(90deg, var(--amber-dim) 0%, var(--amber-dim) ${pct}%, var(--bg-elevated) ${pct}%, var(--bg-elevated) 100%)`
+                            : 'var(--bg-elevated)',
+                          color: 'var(--accent-amber)',
+                          border: '1px solid var(--accent-amber)',
+                          borderRadius: 'var(--radius-sm)',
+                          fontSize: 12,
+                          fontWeight: 600,
+                          cursor: retranscribeRunning ? 'progress' : 'pointer',
+                          opacity: retranscribeRunning ? 0.85 : 1,
+                          minWidth: 160,
+                        }}
+                      >
+                        {retranscribeRunning
+                          ? `Retranscribing… ${pct}%`
+                          : 'Retranscribe video'}
+                      </button>
+                    );
+                  })()}
                 </div>
                 {/* Speaker Detection (post-processing diarization) */}
                 <div style={{

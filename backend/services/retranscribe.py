@@ -185,7 +185,8 @@ async def retranscribe_job(job_id: str) -> dict:
     if not job:
         raise ValueError(f"Job not found: {job_id}")
 
-    if job.status in (JobStatus.QUEUED, JobStatus.PROCESSING, JobStatus.TRANSCRIBING):
+    terminal_statuses = {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.CANCELLED}
+    if job.status not in terminal_statuses:
         raise ValueError(
             f"Retranscribe requires a finished analysis (status={job.status})"
         )
@@ -209,11 +210,69 @@ async def retranscribe_job(job_id: str) -> dict:
 
     previous = list(job.transcript or [])
 
+    from backend.services.pipeline import broadcast_ws
+
+    def _fmt_time(sec: float) -> str:
+        m, s = divmod(max(0, int(sec)), 60)
+        return f"{m}:{s:02d}"
+
+    def _fmt_eta(sec: float) -> str:
+        sec = max(0, int(sec))
+        if sec < 60:
+            return f"~{sec}s remaining"
+        m, s = divmod(sec, 60)
+        return f"~{m}m {s}s remaining"
+
+    phase_label = "Retranslating" if whisper_task == "translate" else "Retranscribing"
+
+    async def _progress(info: dict):
+        phase = info.get("phase")
+        if phase in ("model_loading", "model_loaded", "vad_start"):
+            msg = info.get("message") or f"Whisper: {phase}…"
+            await database.update_job_status(
+                job_id, status=JobStatus.TRANSCRIBING,
+                progress=1, progress_message=msg,
+            )
+            await broadcast_ws(job_id, {
+                "type": "status", "status": JobStatus.TRANSCRIBING.value,
+                "progress": 1, "message": msg,
+            })
+            return
+
+        pct = int(info.get("pct") or 0)
+        segments = int(info.get("segments") or 0)
+        lang = (info.get("lang") or "").strip()
+        position = float(info.get("position_sec") or 0.0)
+        eta_sec = float(info.get("eta_sec") or 0.0)
+
+        lang_info = f" [{lang}]" if lang else ""
+        total = _fmt_time(audio_duration) if audio_duration > 0 else "?"
+        parts = [f"{phase_label}{lang_info}: {_fmt_time(position)} / {total}",
+                 f"{segments} segments"]
+        if eta_sec > 0 and pct > 0:
+            parts.append(_fmt_eta(eta_sec))
+        msg = " \u2014 ".join(parts)
+
+        await database.update_job_status(
+            job_id, status=JobStatus.TRANSCRIBING,
+            progress=max(1, pct), progress_message=msg,
+        )
+        await broadcast_ws(job_id, {
+            "type": "status", "status": JobStatus.TRANSCRIBING.value,
+            "progress": max(1, pct), "message": msg,
+        })
+
+    _start_msg = f"{phase_label} — warming up Whisper…"
     await database.update_job_status(
         job_id,
         status=JobStatus.TRANSCRIBING,
-        progress_message="Re-running Whisper with your upload settings…",
+        progress=1,
+        progress_message=_start_msg,
     )
+    await broadcast_ws(job_id, {
+        "type": "status", "status": JobStatus.TRANSCRIBING.value,
+        "progress": 1, "message": _start_msg,
+    })
 
     try:
         if settings.GPU_ACCELERATION_ENABLED:
@@ -229,6 +288,7 @@ async def retranscribe_job(job_id: str) -> dict:
                     task=whisper_task,
                     initial_prompt=initial_prompt,
                     audio_duration=audio_duration,
+                    progress_callback=_progress,
                 ),
                 timeout=_whisper_timeout,
             )
@@ -241,28 +301,47 @@ async def retranscribe_job(job_id: str) -> dict:
                 task=whisper_task,
                 initial_prompt=initial_prompt,
                 audio_duration=audio_duration,
+                progress_callback=_progress,
             )
     except asyncio.TimeoutError:
+        _fail_msg = "Retranscribe timed out — previous transcript kept."
         await database.update_job_status(
             job_id,
             status=JobStatus.COMPLETE,
-            progress_message="Retranscribe timed out — previous transcript kept.",
+            progress=100,
+            progress_message=_fail_msg,
         )
+        await broadcast_ws(job_id, {
+            "type": "status", "status": JobStatus.COMPLETE.value,
+            "progress": 100, "message": _fail_msg,
+        })
         raise ValueError("Whisper timed out — kept the previous transcript.")
     except Exception:
+        _fail_msg = "Retranscribe failed — previous transcript kept."
         await database.update_job_status(
             job_id,
             status=JobStatus.COMPLETE,
-            progress_message="Retranscribe failed — previous transcript kept.",
+            progress=100,
+            progress_message=_fail_msg,
         )
+        await broadcast_ws(job_id, {
+            "type": "status", "status": JobStatus.COMPLETE.value,
+            "progress": 100, "message": _fail_msg,
+        })
         raise
 
     if not result:
+        _empty_msg = "Retranscribe returned no segments — previous transcript kept."
         await database.update_job_status(
             job_id,
             status=JobStatus.COMPLETE,
-            progress_message="Retranscribe returned no segments — previous transcript kept.",
+            progress=100,
+            progress_message=_empty_msg,
         )
+        await broadcast_ws(job_id, {
+            "type": "status", "status": JobStatus.COMPLETE.value,
+            "progress": 100, "message": _empty_msg,
+        })
         raise ValueError(
             "Whisper returned 0 segments. Kept the previous transcript. "
             "Try running the full analysis again if this video's audio has changed."
@@ -273,14 +352,20 @@ async def retranscribe_job(job_id: str) -> dict:
     speaker_set = sorted(set(s.speaker for s in result))
     speaker_names = {sp: sp for sp in speaker_set} if len(speaker_set) >= 2 else None
 
+    _done_msg = f"Retranscribed — {len(result)} segments"
     update_kwargs: dict = {
         "transcript": list(result),
         "status": JobStatus.COMPLETE,
-        "progress_message": f"Retranscribed — {len(result)} segments",
+        "progress": 100,
+        "progress_message": _done_msg,
     }
     if speaker_names:
         update_kwargs["speaker_names"] = speaker_names
     await database.update_job_status(job_id, **update_kwargs)
+    await broadcast_ws(job_id, {
+        "type": "status", "status": JobStatus.COMPLETE.value,
+        "progress": 100, "message": _done_msg,
+    })
 
     logger.info(
         "[%s] Retranscribe done: %d → %d segments (task=%s, language=%r)",

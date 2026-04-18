@@ -238,15 +238,29 @@ async def retranscribe_job_endpoint(
 
     # Mark the job as transcribing immediately so the UI button stays
     # disabled and the polling status reflects the new phase before the
-    # first Whisper second has even elapsed.
+    # first Whisper second has even elapsed. Reset progress to 1% so the
+    # bar starts fresh — the job's prior COMPLETE state left it at 100.
+    _kick_msg = "Retranscribe queued — Whisper warming up…"
     try:
         await database.update_job_status(
             job_id,
             status=JobStatus.TRANSCRIBING,
-            progress_message="Retranscribe queued — Whisper warming up…",
+            progress=1,
+            progress_message=_kick_msg,
         )
     except Exception:
         logger.exception("[%s] Failed to mark job as transcribing", job_id)
+
+    try:
+        from backend.services.pipeline import broadcast_ws
+        await broadcast_ws(job_id, {
+            "type": "status",
+            "status": JobStatus.TRANSCRIBING.value,
+            "progress": 1,
+            "message": _kick_msg,
+        })
+    except Exception:
+        logger.exception("[%s] Failed to broadcast retranscribe kickoff", job_id)
 
     task = asyncio.create_task(
         _run_retranscribe_in_background(job_id),
