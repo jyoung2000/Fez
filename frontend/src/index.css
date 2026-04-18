@@ -1,0 +1,633 @@
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600;700;800&family=Lato:wght@300;400;700;900&family=Montserrat:wght@300;400;500;600;700;800&family=Nunito:wght@300;400;500;600;700;800&family=Open+Sans:wght@300;400;500;600;700;800&family=Oswald:wght@300;400;500;600;700&family=Playfair+Display:wght@400;500;600;700;800&family=Poppins:wght@300;400;500;600;700;800&family=Roboto:wght@300;400;500;700;900&family=Space+Mono:wght@400;700&display=swap');
+
+/* ═══════════════════════════════════════════════════════
+   LIGHT THEME (DEFAULT)
+   Apple iOS-inspired light palette
+   ═══════════════════════════════════════════════════════ */
+:root {
+  /* Backgrounds */
+  --bg-base: #FFFFFF;
+  --bg-panel: rgba(249, 249, 251, 0.92);
+  --bg-elevated: rgba(239, 239, 244, 0.72);
+
+  /* Borders */
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.15);
+
+  /* Accent colors — work on both light and dark */
+  --accent-cyan: #0A84FF;
+  --accent-cyan-dim: rgba(10, 132, 255, 0.10);
+  --accent-amber: #FF9F0A;
+  --accent-amber-dim: rgba(255, 159, 10, 0.10);
+
+  /* Text hierarchy */
+  --text-primary: #1D1D1F;
+  --text-secondary: rgba(60, 60, 67, 0.78);
+  --text-muted: rgba(60, 60, 67, 0.55);
+
+  /* Status */
+  --success: #34C759;
+  --danger: #FF3B30;
+
+  /* Status dim backgrounds */
+  --success-dim: rgba(52, 199, 89, 0.10);
+  --danger-dim: rgba(255, 59, 48, 0.10);
+  --amber-dim: rgba(255, 159, 10, 0.10);
+  --success-border: rgba(52, 199, 89, 0.35);
+
+  /* Typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'DM Sans', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'SF Mono', 'Space Mono', ui-monospace, monospace;
+
+  /* Design tokens */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+
+  /* Shadows — lighter for light mode */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.12);
+
+  /* Overlay & video (always dark for video content) */
+  --overlay-light: rgba(0, 0, 0, 0.04);
+  --overlay-heavy: rgba(0, 0, 0, 0.55);
+  --video-bg: #1C1C1E;
+  --video-controls-text: #FFFFFF;
+  --video-gradient: linear-gradient(transparent, rgba(0, 0, 0, 0.85));
+  --badge-overlay-bg: rgba(0, 0, 0, 0.65);
+  --lightbox-bg: rgba(0, 0, 0, 0.5);
+
+  /* Navigation */
+  --nav-active-icon-text: #FFFFFF;
+
+  /* Scrollbar */
+  --scrollbar-thumb: rgba(0, 0, 0, 0.12);
+
+  /* Glow hover effect */
+  --glow-color: rgba(10, 132, 255, 0.35);
+  --glow-color-strong: rgba(10, 132, 255, 0.55);
+
+  /* Spacing */
+  --page-pad: 24px;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --bottom-nav-h: 0px;
+}
+
+/* ═══════════════════════════════════════════════════════
+   DARK THEME
+   Apple-inspired dark palette (activated via data-theme)
+   ═══════════════════════════════════════════════════════ */
+[data-theme="dark"] {
+  --bg-base: #000000;
+  --bg-panel: rgba(28, 28, 30, 0.80);
+  --bg-elevated: rgba(44, 44, 46, 0.65);
+
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+
+  --accent-cyan: #0A84FF;
+  --accent-cyan-dim: rgba(10, 132, 255, 0.12);
+  --accent-amber: #FF9F0A;
+  --accent-amber-dim: rgba(255, 159, 10, 0.12);
+
+  --text-primary: #F5F5F7;
+  --text-secondary: rgba(235, 235, 245, 0.7);
+  --text-muted: rgba(235, 235, 245, 0.5);
+
+  --success: #30D158;
+  --danger: #FF453A;
+
+  --success-dim: rgba(48, 209, 88, 0.15);
+  --danger-dim: rgba(255, 69, 58, 0.15);
+  --amber-dim: rgba(255, 159, 10, 0.15);
+  --success-border: rgba(48, 209, 88, 0.40);
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.24);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.32);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.48);
+
+  --overlay-light: rgba(0, 0, 0, 0.30);
+  --overlay-heavy: rgba(0, 0, 0, 0.65);
+  --video-bg: #000000;
+  --video-controls-text: #FFFFFF;
+  --video-gradient: linear-gradient(transparent, rgba(0, 0, 0, 0.9));
+  --badge-overlay-bg: rgba(0, 0, 0, 0.75);
+  --lightbox-bg: rgba(0, 0, 0, 0.85);
+
+  --nav-active-icon-text: #FFFFFF;
+
+  --scrollbar-thumb: rgba(255, 255, 255, 0.12);
+
+  --glow-color: rgba(10, 132, 255, 0.30);
+  --glow-color-strong: rgba(10, 132, 255, 0.65);
+}
+
+/* ═══════════════════════════════════════════════════════
+   BASE STYLES
+   ═══════════════════════════════════════════════════════ */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html {
+  /* Mobile viewport: use dvh to handle browser chrome */
+  height: 100%;
+  height: -webkit-fill-available;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+  transition: background 0.3s ease, color 0.3s ease;
+  min-height: 100vh;
+  min-height: 100dvh;
+  /* Prevent pull-to-refresh on mobile for app-like feel */
+  overscroll-behavior-y: contain;
+}
+
+/* Ensure #root fills viewport for proper flexbox layout */
+#root {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+a {
+  color: var(--accent-cyan);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+button {
+  cursor: pointer;
+  font-family: var(--font-sans);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+button:active {
+  transform: scale(0.97);
+  opacity: 0.85;
+}
+
+input, select, textarea {
+  font-family: var(--font-sans);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+  outline: none;
+  border-radius: var(--radius-sm);
+  transition: border-color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 0 3px var(--accent-cyan-dim);
+}
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238E8E93' d='M2.5 4.5L6 8l3.5-3.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+}
+
+/* Refined scrollbar — Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+/* Refined scrollbar — WebKit */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 2px; }
+
+/* ═══════════════════════════════════════════════════════
+   UTILITY BADGES
+   ═══════════════════════════════════════════════════════ */
+.badge {
+  display: inline-block;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: var(--radius-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  /* Keep badges within their parent card. Without the max-width +
+     truncation rules a long badge label (e.g. "Focus: some long user-
+     supplied topic") can extend past the card's right edge inside a
+     grid column that only sizes to its min content — users reported
+     tags overflowing the clip-card box on /clips. The trailing
+     ellipsis preserves the badge shape while still communicating
+     there's more text; hovering the element shows the full string
+     via the native title tooltip wherever we set one. */
+  max-width: 100%;
+  vertical-align: middle;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.badge-cyan { background: var(--accent-cyan-dim); color: var(--accent-cyan); }
+.badge-amber { background: var(--accent-amber-dim); color: var(--accent-amber); }
+.badge-green { background: var(--success-dim); color: var(--success); }
+.badge-red { background: var(--danger-dim); color: var(--danger); }
+.badge-gray { background: rgba(142, 142, 147, 0.12); color: var(--text-secondary); }
+
+/* ═══════════════════════════════════════════════════════
+   ANIMATIONS
+   ═══════════════════════════════════════════════════════ */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--accent-cyan-dim) 25%,
+    rgba(10, 132, 255, 0.25) 50%,
+    var(--accent-cyan-dim) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.pulse { animation: pulse 2s ease-in-out infinite; }
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.slide-in { animation: slideIn 0.3s ease forwards; }
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* ═══════════════════════════════════════════════════════
+   FUTURISTIC HOVER BORDER EFFECT
+   Animated conic-gradient that sweeps around the card edge
+   ═══════════════════════════════════════════════════════ */
+@property --border-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes borderGlow {
+  0%   { --border-angle: 0deg; }
+  100% { --border-angle: 360deg; }
+}
+
+.card-hover {
+  position: relative;
+  overflow: visible;
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+              border-color 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Rotating gradient border overlay */
+.card-hover::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: conic-gradient(
+    from var(--border-angle),
+    transparent 20%,
+    var(--glow-color-strong) 50%,
+    transparent 80%
+  );
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.card-hover:hover::before {
+  opacity: 1;
+  animation: borderGlow 3s linear infinite;
+}
+
+.card-hover:hover {
+  border-color: var(--glow-color);
+  transform: translateY(-2px);
+  box-shadow:
+    var(--shadow-md),
+    0 0 20px var(--glow-color),
+    0 0 40px rgba(10, 132, 255, 0.06);
+}
+
+/* Clip settings sidebar scrollbar */
+.clip-settings-sidebar {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+.clip-settings-sidebar::-webkit-scrollbar { width: 4px; }
+.clip-settings-sidebar::-webkit-scrollbar-track { background: transparent; }
+.clip-settings-sidebar::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 2px; }
+
+/* ═══════════════════════════════════════════════════════
+   RANGE SLIDER FIX
+   Ensure slider thumb can reach min/max without clipping
+   ═══════════════════════════════════════════════════════ */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  background: var(--bg-elevated);
+  border-radius: 2px;
+  outline: none;
+  border: none;
+  padding: 0;
+  margin: 8px 0;
+  cursor: pointer;
+  overflow: visible;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent-cyan);
+  cursor: pointer;
+  border: none;
+  box-shadow: 0 0.5px 1px rgba(0, 0, 0, 0.15), 0 1px 3px rgba(0, 0, 0, 0.12);
+  margin-top: -5px;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent-cyan);
+  cursor: pointer;
+  border: none;
+  box-shadow: 0 0.5px 1px rgba(0, 0, 0, 0.15), 0 1px 3px rgba(0, 0, 0, 0.12);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-elevated);
+}
+
+input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-elevated);
+}
+
+input[type="range"]:hover::-webkit-slider-thumb {
+  transform: scale(1.1);
+  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.2), 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+input[type="range"]:hover::-moz-range-thumb {
+  transform: scale(1.1);
+  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.2), 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+input[type="range"]:active::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+
+input[type="range"]:active::-moz-range-thumb {
+  transform: scale(1.15);
+}
+
+input[type="range"]:focus::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px var(--accent-cyan-dim), 0 0.5px 1px rgba(0, 0, 0, 0.15);
+}
+
+[data-theme="dark"] input[type="range"]::-webkit-slider-thumb {
+  background: var(--accent-cyan);
+  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.3), 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+
+[data-theme="dark"] input[type="range"]::-moz-range-thumb {
+  background: var(--accent-cyan);
+  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.3), 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+
+/* ═══════════════════════════════════════════════════════
+   RESPONSIVE LAYOUT
+   ═══════════════════════════════════════════════════════ */
+
+/* Mobile: < 768px */
+@media (max-width: 767px) {
+  :root {
+    --page-pad: 12px;
+    --bottom-nav-h: calc(56px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .main-content {
+    padding-bottom: var(--bottom-nav-h) !important;
+  }
+
+  .desktop-sidebar { display: none !important; }
+  .desktop-header { display: none !important; }
+  .mobile-bottom-nav { display: flex !important; }
+  .mobile-header { display: flex !important; }
+
+  .responsive-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .responsive-tabs {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+    flex-wrap: nowrap !important;
+    scrollbar-width: none;
+  }
+  .responsive-tabs::-webkit-scrollbar { display: none; }
+
+  /* Stack clip panel */
+  .clip-panel-layout {
+    flex-direction: column !important;
+  }
+  .clip-panel-layout > .clip-settings-sidebar {
+    width: 100% !important;
+    position: static !important;
+    max-height: none !important;
+  }
+
+  /* Mobile-specific: tighter spacing on cards/rows */
+  .mobile-compact-row {
+    padding: 10px 12px !important;
+    gap: 8px !important;
+  }
+
+  /* Disable hover effects on touch - they feel laggy */
+  .card-hover:hover {
+    transform: none;
+  }
+  .card-hover:hover::before {
+    opacity: 0;
+  }
+
+  /* Mobile: make log entries more readable */
+  .log-entry-row {
+    flex-direction: column !important;
+    gap: 2px !important;
+    align-items: flex-start !important;
+  }
+}
+
+/* Small phones: < 380px */
+@media (max-width: 379px) {
+  :root {
+    --page-pad: 10px;
+  }
+
+  .badge {
+    padding: 2px 6px;
+    font-size: 10px;
+  }
+}
+
+/* Desktop: >= 768px */
+@media (min-width: 768px) {
+  .mobile-bottom-nav { display: none !important; }
+  .mobile-header { display: none !important; }
+  .desktop-sidebar { display: flex !important; }
+  .desktop-header { display: flex !important; }
+}
+
+/* Tablet: 768-1023 */
+@media (min-width: 768px) and (max-width: 1023px) {
+  :root { --page-pad: 20px; }
+
+  .clip-panel-layout {
+    flex-direction: column !important;
+  }
+  .clip-panel-layout > .clip-settings-sidebar {
+    width: 100% !important;
+    position: static !important;
+    max-height: none !important;
+  }
+}
+
+/* Desktop: >= 1024px — panels side-by-side */
+@media (min-width: 1024px) {
+  .clip-panel-layout {
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+  }
+  .clip-panel-layout > * {
+    min-width: 0;
+  }
+}
+
+/* Touch-friendly sizing */
+@media (pointer: coarse) {
+  input:not([type="range"]):not([type="color"]):not([type="number"]), select, textarea {
+    min-height: 40px;
+    font-size: 16px !important;
+  }
+
+  /* Number inputs and color pickers stay compact */
+  input[type="number"], input[type="color"] {
+    min-height: 32px;
+  }
+
+  /* Larger tap targets for links in nav */
+  .mobile-bottom-nav a {
+    min-width: 48px;
+    min-height: 48px;
+  }
+}
+
+/* Landscape mobile - reduce vertical waste */
+@media (max-height: 500px) and (orientation: landscape) {
+  .mobile-bottom-nav {
+    height: auto !important;
+    padding-top: 4px !important;
+    padding-bottom: 4px !important;
+  }
+  .mobile-bottom-nav a {
+    gap: 1px !important;
+    padding: 2px 12px !important;
+  }
+  .mobile-bottom-nav span[style*="fontSize: 22"] {
+    font-size: 16px !important;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   STANDALONE / PWA DISPLAY
+   When added to homescreen, use full height
+   ═══════════════════════════════════════════════════════ */
+@media (display-mode: standalone) {
+  body {
+    /* Use full viewport when running as PWA */
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   THEME TRANSITION
+   Smooth transition when toggling themes
+   ═══════════════════════════════════════════════════════ */
+.theme-transition,
+.theme-transition *,
+.theme-transition *::before,
+.theme-transition *::after {
+  transition: background 0.3s ease, background-color 0.3s ease,
+              color 0.3s ease, border-color 0.3s ease,
+              box-shadow 0.3s ease !important;
+}
+
+/* ═══════════════════════════════════════════════════════
+   TRANSCRIPT INSERT DIVIDER
+   Shows "+ Add line" button when hovering the border between lines
+   ═══════════════════════════════════════════════════════ */
+.transcript-insert-divider:hover {
+  background: var(--accent-cyan) !important;
+  background-clip: content-box !important;
+}
+.transcript-insert-divider:hover .transcript-insert-divider-btn {
+  opacity: 1 !important;
+}
+
+/* ═══════════════════════════════════════════════════════
+   CLIP CARD DELETE BUTTON
+   Only visible when hovering the clip card
+   ═══════════════════════════════════════════════════════ */
+.card-hover:hover .clip-delete-btn {
+  opacity: 0.6 !important;
+  border-color: var(--danger, #ff3b30) !important;
+}
+.card-hover .clip-delete-btn:hover {
+  opacity: 1 !important;
+}

@@ -1,0 +1,185 @@
+# Dockerfile.gpu — GPU-accelerated ClipAI build
+# Supports: NVIDIA (NVENC/NVDEC/CUDA), Intel (VAAPI/QSV), AMD (VAAPI)
+
+## Stage 1: Build frontend with Node
+FROM node:20-slim AS frontend-build
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build
+
+## Stage 2: GPU Runtime
+# NVIDIA driver 580+ supports CUDA 13.x. Use CUDA 12.3 runtime which is
+# well within the supported range. If CTranslate2 still reports CUDA errors,
+# the issue is the NVIDIA Container Toolkit version on the host (Unraid).
+FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+# Ensure CUDA libraries are on the library path for ctranslate2/faster-whisper
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+# Auto-enable GPU acceleration at startup
+ENV GPU_ACCELERATION_ENABLED=true
+# Force pure-Python protobuf so MediaPipe 0.10.8 graph configs parse correctly
+# with protobuf>=4 (required by torch/pyannote). The C++ implementation
+# rejects 3.x-format graph definitions under protobuf 4.x.
+ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+
+# Install system dependencies + VA-API support for Intel/AMD
+RUN apt-get update && apt-get install -y \
+    python3.11 python3.11-dev python3-pip python3.11-venv \
+    curl git build-essential pkg-config ca-certificates \
+    fontconfig fonts-dejavu-core fonts-freefont-ttf fonts-liberation2 \
+    unzip wget software-properties-common \
+    # VA-API libraries for Intel/AMD GPU support
+    libva-dev libva-drm2 libva-x11-2 vainfo \
+    libdrm-dev mesa-va-drivers \
+    # FFmpeg build dependencies
+    nasm yasm \
+    libass-dev libfreetype6-dev libfontconfig1-dev libfribidi-dev \
+    libmp3lame-dev libopus-dev libvorbis-dev libx264-dev libx265-dev \
+    libnuma-dev libvpx-dev libfdk-aac-dev \
+    # MediaPipe face detection dependencies
+    libgl1-mesa-glx libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install nv-codec-headers for NVENC/NVDEC support
+RUN cd /tmp && \
+    git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
+    cd nv-codec-headers && \
+    make install && \
+    cd / && rm -rf /tmp/nv-codec-headers
+
+# Build FFmpeg with full hardware acceleration
+RUN cd /tmp && \
+    wget -q https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz && \
+    tar xf ffmpeg-7.1.tar.xz && \
+    cd ffmpeg-7.1 && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-gpl \
+        --enable-nonfree \
+        --enable-libass \
+        --enable-libfreetype \
+        --enable-libfontconfig \
+        --enable-libfribidi \
+        --enable-libmp3lame \
+        --enable-libopus \
+        --enable-libvorbis \
+        --enable-libvpx \
+        --enable-libx264 \
+        --enable-libx265 \
+        --enable-libfdk-aac \
+        --enable-cuda \
+        --enable-cuvid \
+        --enable-nvenc \
+        --enable-nvdec \
+        --enable-vaapi \
+    && make -j$(nproc) && make install && \
+    ldconfig && \
+    cd / && rm -rf /tmp/ffmpeg*
+
+# Install DM Sans font (default subtitle font)
+RUN mkdir -p /usr/share/fonts/truetype/dmsans && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o /usr/share/fonts/truetype/dmsans/DMSans.ttf \
+      "https://github.com/google/fonts/raw/main/ofl/dmsans/DMSans%5Bopsz%2Cwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o /usr/share/fonts/truetype/dmsans/DMSans-Italic.ttf \
+      "https://github.com/google/fonts/raw/main/ofl/dmsans/DMSans-Italic%5Bopsz%2Cwght%5D.ttf" && \
+    fc-cache -f -v
+
+# Install popular Google Fonts for subtitle use
+# Use --retry with backoff to handle GitHub rate limiting (429)
+RUN mkdir -p /usr/share/fonts/truetype/google-fonts && \
+    cd /usr/share/fonts/truetype/google-fonts && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Montserrat.ttf "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o OpenSans.ttf "https://github.com/google/fonts/raw/main/ofl/opensans/OpenSans%5Bwdth%2Cwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Roboto.ttf "https://github.com/google/fonts/raw/main/ofl/roboto/Roboto%5Bwdth%2Cwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Poppins-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Regular.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Poppins-Bold.ttf "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Bold.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Inter.ttf "https://github.com/google/fonts/raw/main/ofl/inter/Inter%5Bopsz%2Cwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Nunito.ttf "https://github.com/google/fonts/raw/main/ofl/nunito/Nunito%5Bwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Lato-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/lato/Lato-Regular.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Lato-Bold.ttf "https://github.com/google/fonts/raw/main/ofl/lato/Lato-Bold.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Oswald.ttf "https://github.com/google/fonts/raw/main/ofl/oswald/Oswald%5Bwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o PlayfairDisplay.ttf "https://github.com/google/fonts/raw/main/ofl/playfairdisplay/PlayfairDisplay%5Bwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o BebasNeue-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/bebasneue/BebasNeue-Regular.ttf" && \
+    fc-cache -f -v
+
+# Register /data/fonts with fontconfig so libass picks up custom fonts
+RUN mkdir -p /data/fonts && \
+    echo '<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n<fontconfig><dir>/data/fonts</dir></fontconfig>' \
+    > /etc/fonts/conf.d/99-custom-fonts.conf
+
+WORKDIR /app
+
+# Install Python dependencies (including CUDA-enabled faster-whisper)
+COPY backend/requirements.txt .
+RUN pip3 install --upgrade pip && \
+    pip3 install --no-cache-dir -r requirements.txt && \
+    pip3 install --no-cache-dir nvidia-cublas-cu12 nvidia-cudnn-cu12==9.* && \
+    pip3 install --no-cache-dir pyannote.audio>=3.1.0 torch>=2.0.0 && \
+    # MediaPipe runtime deps (installed separately to avoid protobuf conflict)
+    pip3 install --no-cache-dir \
+        flatbuffers>=23.1.4 \
+        attrs>=23.1.0 \
+        sounddevice>=0.4.6 \
+        absl-py>=1.0.0 && \
+    # MediaPipe itself — skip deps to avoid protobuf<4 constraint
+    pip3 install --no-cache-dir --no-deps mediapipe==0.10.8 && \
+    # Verify MediaPipe can actually load (fail build early if broken)
+    python3 -c "import mediapipe; print(f'MediaPipe {mediapipe.__version__} installed')" && \
+    python3 -c "import mediapipe.python.solutions.face_mesh; print('FaceMesh available')" && \
+    # Register pip-installed NVIDIA libs so ctranslate2/torch can find them at runtime
+    python3 -c "import nvidia.cublas; print(nvidia.cublas.__path__[0] + '/lib')" >> /etc/ld.so.conf.d/nvidia-pip.conf && \
+    python3 -c "import nvidia.cudnn; print(nvidia.cudnn.__path__[0] + '/lib')" >> /etc/ld.so.conf.d/nvidia-pip.conf && \
+    ldconfig
+
+# Download YuNet model for face detection fallback (~350KB, one-time)
+# Download SFace recognition model for identity embeddings (~2MB, one-time)
+# Download lbpcascade_animeface for v2 Phase 6 anime face detection (~110KB)
+RUN mkdir -p /app/backend/models && \
+    curl -sL -o /app/backend/models/face_detection_yunet_2023mar.onnx \
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" && \
+    curl -sL -o /app/backend/models/face_recognition_sface_2021dec.onnx \
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
+    -o /app/backend/models/lbpcascade_animeface.xml \
+    "https://github.com/nagadomi/lbpcascade_animeface/raw/master/lbpcascade_animeface.xml"
+
+# v4.1: pre-download YOLOv8n weights for PersonDetector / ObjectDetector
+# (~5.5MB). object_detector.py looks at /data/models/yolov8n.pt first,
+# so stash the weights there at build time. Without this step the first
+# analysis run would stall for 10-30s while ultralytics downloads the
+# model from GitHub — or fail silently if the container has no internet.
+# Also verify the model can actually load so a broken build fails early.
+RUN mkdir -p /data/models && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
+      -o /data/models/yolov8n.pt \
+      "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt" && \
+    python3 -c "from ultralytics import YOLO; m = YOLO('/data/models/yolov8n.pt'); print(f'YOLOv8n loaded: {len(m.names)} classes')"
+
+# Pre-download InsightFace buffalo_s ArcFace pack so the first run with
+# CLIPAI_FACE_EMBEDDING=arcface doesn't stall. CPU-only via onnxruntime —
+# never touches the GPU. The "|| echo" keeps the build green if the CDN
+# is unreachable; the lazy loader will retry at runtime.
+RUN mkdir -p /app/backend/models/insightface && \
+    python3 -c "from insightface.app import FaceAnalysis; \
+                FaceAnalysis(name='buffalo_s', root='/app/backend/models/insightface', \
+                             providers=['CPUExecutionProvider']).prepare(ctx_id=-1, det_size=(320,320))" \
+    || echo "WARN: buffalo_s pre-download failed — will download at runtime"
+
+# Copy backend source
+COPY backend/ ./backend/
+
+# Copy the markdown docs so the cloud storage setup guide (and friends)
+# can be rendered at /docs/cloud-storage/SETUP.md by backend/main.py.
+COPY docs/ ./docs/
+
+# Copy pre-built frontend from stage 1
+COPY --from=frontend-build /app/frontend/dist ./static
+
+EXPOSE 1353
+
+CMD ["python3", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "1353", "--workers", "1"]

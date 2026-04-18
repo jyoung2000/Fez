@@ -1,0 +1,2502 @@
+{
+  "schema": "autoflip_parity_v2_rollup/1",
+  "generated_at": "2026-04-13T16:54:21.927045+00:00",
+  "fixture_count": 7,
+  "combos": [
+    {
+      "schema": "autoflip_parity_v2_results/1",
+      "generated_at": "2026-04-13T16:54:08.564606+00:00",
+      "dry_run": false,
+      "fixture_count": 7,
+      "results": [
+        {
+          "name": "2speaker_alternating",
+          "description": "Two speakers alternating every 2s for 20s (legacy fixture)",
+          "content_type_override": "podcast",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 20.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 9,
+            "beat_grid_size": 0,
+            "required_region_frames": 200,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 10,
+          "actual_switches": 9,
+          "actual_boundaries": 9,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 50.0,
+            "max_jerk": 100.0,
+            "required_region_miss_rate": 0.4
+          }
+        },
+        {
+          "name": "3speaker_panel",
+          "description": "3-seat panel rotating every 1.5s for 18s \u2014 debate routing",
+          "content_type_override": "debate",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 18.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 11,
+            "beat_grid_size": 0,
+            "required_region_frames": 180,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 12,
+          "actual_switches": 11,
+          "actual_boundaries": 11,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 60.0,
+            "max_jerk": 120.0,
+            "required_region_miss_rate": 0.75
+          }
+        },
+        {
+          "name": "vlog_walk_and_talk",
+          "description": "Single subject walks 35\u219265 % over 10s \u2014 vlog + thirds bias",
+          "content_type_override": "vlog",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "face_centroid_in_thirds_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 7.105427357601002e-15,
+            "required_region_miss_rate": 0.6,
+            "face_centroid_in_thirds_rate": 0.0
+          }
+        },
+        {
+          "name": "music_video_beat",
+          "description": "120 BPM, 4 alternating speakers across 12s \u2014 beat snap",
+          "content_type_override": "music_video",
+          "anime_subtype": "",
+          "music_subtype": "performance",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "downbeat_snap_error",
+            "max_acceleration",
+            "max_jerk"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 25,
+            "required_region_frames": 0,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "downbeat_snap_error": {
+              "mean_error_ms": 200.0,
+              "max_error_ms": 200.0,
+              "snap_rate": 0.4,
+              "count": 5,
+              "snapped": 2
+            },
+            "max_acceleration": 47.149064830245656,
+            "max_jerk": 94.2981296604913
+          }
+        },
+        {
+          "name": "anime_hard_cuts",
+          "description": "6 hard cuts \u00d7 2s, alternating characters \u2014 anime + sub bar",
+          "content_type_override": "anime",
+          "anime_subtype": "dialogue",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 0,
+            "required_region_frames": 120,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 40.0,
+            "max_jerk": 80.0,
+            "required_region_miss_rate": 0.3333333333333333
+          }
+        },
+        {
+          "name": "tps_character_offset",
+          "description": "TPS character at x=40 %, HUD in corners \u2014 gameplay_tps",
+          "content_type_override": "gameplay_tps",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "gta_v",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 3,
+            "game_key": "gta_v"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 1.0,
+            "hud_preservation_rate": 0.0
+          }
+        },
+        {
+          "name": "stream_corner_facecam",
+          "description": "Facecam at x=85 corner + center gameplay \u2014 stream",
+          "content_type_override": "stream",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "generic_fps",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 2,
+            "game_key": "generic_fps"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.0,
+            "hud_preservation_rate": 0.0
+          }
+        }
+      ],
+      "combo": "baseline",
+      "env_overrides": {
+        "USE_CONTENT_AWARE_REFRAME": "false",
+        "CLIPAI_MULTI_REGION_LP": "false",
+        "CLIPAI_GAZE_LEAD_ROOM_V2": "false",
+        "CLIPAI_THIRDS_BIAS": "false",
+        "CLIPAI_MUSIC_BEAT_SNAP": "false",
+        "CLIPAI_ANIME_SHOT_DETECTOR": "false",
+        "CLIPAI_ANIME_FACE_DETECTOR": "false",
+        "CLIPAI_ANIME_ANCHOR": "false",
+        "CLIPAI_ANIME_CHARACTER_CLUSTERING": "false",
+        "CLIPAI_GAMEPLAY_TRACKER": "false",
+        "CLIPAI_EDITORIAL_PRIOR": "false"
+      },
+      "status": "ok",
+      "safety_violations": [],
+      "deltas": {}
+    },
+    {
+      "schema": "autoflip_parity_v2_results/1",
+      "generated_at": "2026-04-13T16:54:10.497452+00:00",
+      "dry_run": false,
+      "fixture_count": 7,
+      "results": [
+        {
+          "name": "2speaker_alternating",
+          "description": "Two speakers alternating every 2s for 20s (legacy fixture)",
+          "content_type_override": "podcast",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 20.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 9,
+            "beat_grid_size": 0,
+            "required_region_frames": 200,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 10,
+          "actual_switches": 9,
+          "actual_boundaries": 9,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 50.0,
+            "max_jerk": 100.0,
+            "required_region_miss_rate": 0.4
+          }
+        },
+        {
+          "name": "3speaker_panel",
+          "description": "3-seat panel rotating every 1.5s for 18s \u2014 debate routing",
+          "content_type_override": "debate",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 18.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 11,
+            "beat_grid_size": 0,
+            "required_region_frames": 180,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "sub_second_switch_recall": 0.0,
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.6666666666666666
+          }
+        },
+        {
+          "name": "vlog_walk_and_talk",
+          "description": "Single subject walks 35\u219265 % over 10s \u2014 vlog + thirds bias",
+          "content_type_override": "vlog",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "face_centroid_in_thirds_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 7.105427357601002e-15,
+            "required_region_miss_rate": 0.6,
+            "face_centroid_in_thirds_rate": 0.0
+          }
+        },
+        {
+          "name": "music_video_beat",
+          "description": "120 BPM, 4 alternating speakers across 12s \u2014 beat snap",
+          "content_type_override": "music_video",
+          "anime_subtype": "",
+          "music_subtype": "performance",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "downbeat_snap_error",
+            "max_acceleration",
+            "max_jerk"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 25,
+            "required_region_frames": 0,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "downbeat_snap_error": {
+              "mean_error_ms": 200.0,
+              "max_error_ms": 200.0,
+              "snap_rate": 0.4,
+              "count": 5,
+              "snapped": 2
+            },
+            "max_acceleration": 47.149064830245656,
+            "max_jerk": 94.2981296604913
+          }
+        },
+        {
+          "name": "anime_hard_cuts",
+          "description": "6 hard cuts \u00d7 2s, alternating characters \u2014 anime + sub bar",
+          "content_type_override": "anime",
+          "anime_subtype": "dialogue",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 0,
+            "required_region_frames": 120,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 40.0,
+            "max_jerk": 80.0,
+            "required_region_miss_rate": 0.3333333333333333
+          }
+        },
+        {
+          "name": "tps_character_offset",
+          "description": "TPS character at x=40 %, HUD in corners \u2014 gameplay_tps",
+          "content_type_override": "gameplay_tps",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "gta_v",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 3,
+            "game_key": "gta_v"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 1.0,
+            "hud_preservation_rate": 0.0
+          }
+        },
+        {
+          "name": "stream_corner_facecam",
+          "description": "Facecam at x=85 corner + center gameplay \u2014 stream",
+          "content_type_override": "stream",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "generic_fps",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 2,
+            "game_key": "generic_fps"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.0,
+            "hud_preservation_rate": 0.0
+          }
+        }
+      ],
+      "combo": "phase3_multi_region_lp",
+      "env_overrides": {
+        "USE_CONTENT_AWARE_REFRAME": "true",
+        "CLIPAI_MULTI_REGION_LP": "true",
+        "CLIPAI_GAZE_LEAD_ROOM_V2": "false",
+        "CLIPAI_THIRDS_BIAS": "false",
+        "CLIPAI_MUSIC_BEAT_SNAP": "false",
+        "CLIPAI_ANIME_SHOT_DETECTOR": "false",
+        "CLIPAI_ANIME_FACE_DETECTOR": "false",
+        "CLIPAI_ANIME_ANCHOR": "false",
+        "CLIPAI_ANIME_CHARACTER_CLUSTERING": "false",
+        "CLIPAI_GAMEPLAY_TRACKER": "false",
+        "CLIPAI_EDITORIAL_PRIOR": "false"
+      },
+      "status": "ok",
+      "safety_violations": [],
+      "deltas": {
+        "2speaker_alternating": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "3speaker_panel": {
+          "sub_second_switch_recall": -1.0,
+          "overlap_count": 0.0,
+          "max_acceleration": -60.0,
+          "max_jerk": -120.0,
+          "required_region_miss_rate": -0.08333333333333337
+        },
+        "vlog_walk_and_talk": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "face_centroid_in_thirds_rate": 0.0
+        },
+        "music_video_beat": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0
+        },
+        "anime_hard_cuts": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "tps_character_offset": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        },
+        "stream_corner_facecam": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        }
+      }
+    },
+    {
+      "schema": "autoflip_parity_v2_results/1",
+      "generated_at": "2026-04-13T16:54:12.434941+00:00",
+      "dry_run": false,
+      "fixture_count": 7,
+      "results": [
+        {
+          "name": "2speaker_alternating",
+          "description": "Two speakers alternating every 2s for 20s (legacy fixture)",
+          "content_type_override": "podcast",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 20.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 9,
+            "beat_grid_size": 0,
+            "required_region_frames": 200,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 10,
+          "actual_switches": 9,
+          "actual_boundaries": 9,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 50.0,
+            "max_jerk": 100.0,
+            "required_region_miss_rate": 0.4
+          }
+        },
+        {
+          "name": "3speaker_panel",
+          "description": "3-seat panel rotating every 1.5s for 18s \u2014 debate routing",
+          "content_type_override": "debate",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 18.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 11,
+            "beat_grid_size": 0,
+            "required_region_frames": 180,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "sub_second_switch_recall": 0.0,
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.6666666666666666
+          }
+        },
+        {
+          "name": "vlog_walk_and_talk",
+          "description": "Single subject walks 35\u219265 % over 10s \u2014 vlog + thirds bias",
+          "content_type_override": "vlog",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "face_centroid_in_thirds_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 7.105427357601002e-15,
+            "required_region_miss_rate": 0.43,
+            "face_centroid_in_thirds_rate": 0.0
+          }
+        },
+        {
+          "name": "music_video_beat",
+          "description": "120 BPM, 4 alternating speakers across 12s \u2014 beat snap",
+          "content_type_override": "music_video",
+          "anime_subtype": "",
+          "music_subtype": "performance",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "downbeat_snap_error",
+            "max_acceleration",
+            "max_jerk"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 25,
+            "required_region_frames": 0,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "downbeat_snap_error": {
+              "mean_error_ms": 200.0,
+              "max_error_ms": 200.0,
+              "snap_rate": 0.4,
+              "count": 5,
+              "snapped": 2
+            },
+            "max_acceleration": 47.149064830245656,
+            "max_jerk": 94.2981296604913
+          }
+        },
+        {
+          "name": "anime_hard_cuts",
+          "description": "6 hard cuts \u00d7 2s, alternating characters \u2014 anime + sub bar",
+          "content_type_override": "anime",
+          "anime_subtype": "dialogue",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 0,
+            "required_region_frames": 120,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 40.0,
+            "max_jerk": 80.0,
+            "required_region_miss_rate": 0.3333333333333333
+          }
+        },
+        {
+          "name": "tps_character_offset",
+          "description": "TPS character at x=40 %, HUD in corners \u2014 gameplay_tps",
+          "content_type_override": "gameplay_tps",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "gta_v",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 3,
+            "game_key": "gta_v"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 1.0,
+            "hud_preservation_rate": 0.0
+          }
+        },
+        {
+          "name": "stream_corner_facecam",
+          "description": "Facecam at x=85 corner + center gameplay \u2014 stream",
+          "content_type_override": "stream",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "generic_fps",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 2,
+            "game_key": "generic_fps"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.0,
+            "hud_preservation_rate": 0.0
+          }
+        }
+      ],
+      "combo": "phase4_lead_room_thirds",
+      "env_overrides": {
+        "USE_CONTENT_AWARE_REFRAME": "true",
+        "CLIPAI_MULTI_REGION_LP": "false",
+        "CLIPAI_GAZE_LEAD_ROOM_V2": "true",
+        "CLIPAI_THIRDS_BIAS": "true",
+        "CLIPAI_MUSIC_BEAT_SNAP": "false",
+        "CLIPAI_ANIME_SHOT_DETECTOR": "false",
+        "CLIPAI_ANIME_FACE_DETECTOR": "false",
+        "CLIPAI_ANIME_ANCHOR": "false",
+        "CLIPAI_ANIME_CHARACTER_CLUSTERING": "false",
+        "CLIPAI_GAMEPLAY_TRACKER": "false",
+        "CLIPAI_EDITORIAL_PRIOR": "false"
+      },
+      "status": "ok",
+      "safety_violations": [],
+      "deltas": {
+        "2speaker_alternating": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "3speaker_panel": {
+          "sub_second_switch_recall": -1.0,
+          "overlap_count": 0.0,
+          "max_acceleration": -60.0,
+          "max_jerk": -120.0,
+          "required_region_miss_rate": -0.08333333333333337
+        },
+        "vlog_walk_and_talk": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": -0.16999999999999998,
+          "face_centroid_in_thirds_rate": 0.0
+        },
+        "music_video_beat": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0
+        },
+        "anime_hard_cuts": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "tps_character_offset": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        },
+        "stream_corner_facecam": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        }
+      }
+    },
+    {
+      "schema": "autoflip_parity_v2_results/1",
+      "generated_at": "2026-04-13T16:54:14.282605+00:00",
+      "dry_run": false,
+      "fixture_count": 7,
+      "results": [
+        {
+          "name": "2speaker_alternating",
+          "description": "Two speakers alternating every 2s for 20s (legacy fixture)",
+          "content_type_override": "podcast",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 20.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 9,
+            "beat_grid_size": 0,
+            "required_region_frames": 200,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 10,
+          "actual_switches": 9,
+          "actual_boundaries": 9,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 50.0,
+            "max_jerk": 100.0,
+            "required_region_miss_rate": 0.4
+          }
+        },
+        {
+          "name": "3speaker_panel",
+          "description": "3-seat panel rotating every 1.5s for 18s \u2014 debate routing",
+          "content_type_override": "debate",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 18.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 11,
+            "beat_grid_size": 0,
+            "required_region_frames": 180,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "sub_second_switch_recall": 0.0,
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.6666666666666666
+          }
+        },
+        {
+          "name": "vlog_walk_and_talk",
+          "description": "Single subject walks 35\u219265 % over 10s \u2014 vlog + thirds bias",
+          "content_type_override": "vlog",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "face_centroid_in_thirds_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 7.105427357601002e-15,
+            "required_region_miss_rate": 0.6,
+            "face_centroid_in_thirds_rate": 0.0
+          }
+        },
+        {
+          "name": "music_video_beat",
+          "description": "120 BPM, 4 alternating speakers across 12s \u2014 beat snap",
+          "content_type_override": "music_video",
+          "anime_subtype": "",
+          "music_subtype": "performance",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "downbeat_snap_error",
+            "max_acceleration",
+            "max_jerk"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 25,
+            "required_region_frames": 0,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "downbeat_snap_error": {
+              "mean_error_ms": 0.0,
+              "max_error_ms": 0.0,
+              "snap_rate": 1.0,
+              "count": 5,
+              "snapped": 5
+            },
+            "max_acceleration": 47.149064830245656,
+            "max_jerk": 94.2981296604913
+          }
+        },
+        {
+          "name": "anime_hard_cuts",
+          "description": "6 hard cuts \u00d7 2s, alternating characters \u2014 anime + sub bar",
+          "content_type_override": "anime",
+          "anime_subtype": "dialogue",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 0,
+            "required_region_frames": 120,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 40.0,
+            "max_jerk": 80.0,
+            "required_region_miss_rate": 0.3333333333333333
+          }
+        },
+        {
+          "name": "tps_character_offset",
+          "description": "TPS character at x=40 %, HUD in corners \u2014 gameplay_tps",
+          "content_type_override": "gameplay_tps",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "gta_v",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 3,
+            "game_key": "gta_v"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 1.0,
+            "hud_preservation_rate": 0.0
+          }
+        },
+        {
+          "name": "stream_corner_facecam",
+          "description": "Facecam at x=85 corner + center gameplay \u2014 stream",
+          "content_type_override": "stream",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "generic_fps",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 2,
+            "game_key": "generic_fps"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.0,
+            "hud_preservation_rate": 0.0
+          }
+        }
+      ],
+      "combo": "phase5_music_beat_snap",
+      "env_overrides": {
+        "USE_CONTENT_AWARE_REFRAME": "true",
+        "CLIPAI_MULTI_REGION_LP": "false",
+        "CLIPAI_GAZE_LEAD_ROOM_V2": "false",
+        "CLIPAI_THIRDS_BIAS": "false",
+        "CLIPAI_MUSIC_BEAT_SNAP": "true",
+        "CLIPAI_ANIME_SHOT_DETECTOR": "false",
+        "CLIPAI_ANIME_FACE_DETECTOR": "false",
+        "CLIPAI_ANIME_ANCHOR": "false",
+        "CLIPAI_ANIME_CHARACTER_CLUSTERING": "false",
+        "CLIPAI_GAMEPLAY_TRACKER": "false",
+        "CLIPAI_EDITORIAL_PRIOR": "false"
+      },
+      "status": "ok",
+      "safety_violations": [],
+      "deltas": {
+        "2speaker_alternating": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "3speaker_panel": {
+          "sub_second_switch_recall": -1.0,
+          "overlap_count": 0.0,
+          "max_acceleration": -60.0,
+          "max_jerk": -120.0,
+          "required_region_miss_rate": -0.08333333333333337
+        },
+        "vlog_walk_and_talk": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "face_centroid_in_thirds_rate": 0.0
+        },
+        "music_video_beat": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0
+        },
+        "anime_hard_cuts": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "tps_character_offset": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        },
+        "stream_corner_facecam": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        }
+      }
+    },
+    {
+      "schema": "autoflip_parity_v2_results/1",
+      "generated_at": "2026-04-13T16:54:16.152989+00:00",
+      "dry_run": false,
+      "fixture_count": 7,
+      "results": [
+        {
+          "name": "2speaker_alternating",
+          "description": "Two speakers alternating every 2s for 20s (legacy fixture)",
+          "content_type_override": "podcast",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 20.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 9,
+            "beat_grid_size": 0,
+            "required_region_frames": 200,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 10,
+          "actual_switches": 9,
+          "actual_boundaries": 9,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 50.0,
+            "max_jerk": 100.0,
+            "required_region_miss_rate": 0.4
+          }
+        },
+        {
+          "name": "3speaker_panel",
+          "description": "3-seat panel rotating every 1.5s for 18s \u2014 debate routing",
+          "content_type_override": "debate",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 18.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 11,
+            "beat_grid_size": 0,
+            "required_region_frames": 180,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "sub_second_switch_recall": 0.0,
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.6666666666666666
+          }
+        },
+        {
+          "name": "vlog_walk_and_talk",
+          "description": "Single subject walks 35\u219265 % over 10s \u2014 vlog + thirds bias",
+          "content_type_override": "vlog",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "face_centroid_in_thirds_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 7.105427357601002e-15,
+            "required_region_miss_rate": 0.6,
+            "face_centroid_in_thirds_rate": 0.0
+          }
+        },
+        {
+          "name": "music_video_beat",
+          "description": "120 BPM, 4 alternating speakers across 12s \u2014 beat snap",
+          "content_type_override": "music_video",
+          "anime_subtype": "",
+          "music_subtype": "performance",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "downbeat_snap_error",
+            "max_acceleration",
+            "max_jerk"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 25,
+            "required_region_frames": 0,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "downbeat_snap_error": {
+              "mean_error_ms": 200.0,
+              "max_error_ms": 200.0,
+              "snap_rate": 0.4,
+              "count": 5,
+              "snapped": 2
+            },
+            "max_acceleration": 47.149064830245656,
+            "max_jerk": 94.2981296604913
+          }
+        },
+        {
+          "name": "anime_hard_cuts",
+          "description": "6 hard cuts \u00d7 2s, alternating characters \u2014 anime + sub bar",
+          "content_type_override": "anime",
+          "anime_subtype": "dialogue",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 0,
+            "required_region_frames": 120,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 40.0,
+            "max_jerk": 80.0,
+            "required_region_miss_rate": 0.3333333333333333
+          }
+        },
+        {
+          "name": "tps_character_offset",
+          "description": "TPS character at x=40 %, HUD in corners \u2014 gameplay_tps",
+          "content_type_override": "gameplay_tps",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "gta_v",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 3,
+            "game_key": "gta_v"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 1.0,
+            "hud_preservation_rate": 0.0
+          }
+        },
+        {
+          "name": "stream_corner_facecam",
+          "description": "Facecam at x=85 corner + center gameplay \u2014 stream",
+          "content_type_override": "stream",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "generic_fps",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 2,
+            "game_key": "generic_fps"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.0,
+            "hud_preservation_rate": 0.0
+          }
+        }
+      ],
+      "combo": "phase6_anime",
+      "env_overrides": {
+        "USE_CONTENT_AWARE_REFRAME": "true",
+        "CLIPAI_MULTI_REGION_LP": "false",
+        "CLIPAI_GAZE_LEAD_ROOM_V2": "false",
+        "CLIPAI_THIRDS_BIAS": "false",
+        "CLIPAI_MUSIC_BEAT_SNAP": "false",
+        "CLIPAI_ANIME_SHOT_DETECTOR": "true",
+        "CLIPAI_ANIME_FACE_DETECTOR": "true",
+        "CLIPAI_ANIME_ANCHOR": "true",
+        "CLIPAI_ANIME_CHARACTER_CLUSTERING": "true",
+        "CLIPAI_GAMEPLAY_TRACKER": "false",
+        "CLIPAI_EDITORIAL_PRIOR": "false"
+      },
+      "status": "ok",
+      "safety_violations": [],
+      "deltas": {
+        "2speaker_alternating": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "3speaker_panel": {
+          "sub_second_switch_recall": -1.0,
+          "overlap_count": 0.0,
+          "max_acceleration": -60.0,
+          "max_jerk": -120.0,
+          "required_region_miss_rate": -0.08333333333333337
+        },
+        "vlog_walk_and_talk": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "face_centroid_in_thirds_rate": 0.0
+        },
+        "music_video_beat": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0
+        },
+        "anime_hard_cuts": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "tps_character_offset": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        },
+        "stream_corner_facecam": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        }
+      }
+    },
+    {
+      "schema": "autoflip_parity_v2_results/1",
+      "generated_at": "2026-04-13T16:54:18.115950+00:00",
+      "dry_run": false,
+      "fixture_count": 7,
+      "results": [
+        {
+          "name": "2speaker_alternating",
+          "description": "Two speakers alternating every 2s for 20s (legacy fixture)",
+          "content_type_override": "podcast",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 20.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 9,
+            "beat_grid_size": 0,
+            "required_region_frames": 200,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 10,
+          "actual_switches": 9,
+          "actual_boundaries": 9,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 50.0,
+            "max_jerk": 100.0,
+            "required_region_miss_rate": 0.4
+          }
+        },
+        {
+          "name": "3speaker_panel",
+          "description": "3-seat panel rotating every 1.5s for 18s \u2014 debate routing",
+          "content_type_override": "debate",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 18.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 11,
+            "beat_grid_size": 0,
+            "required_region_frames": 180,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "sub_second_switch_recall": 0.0,
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.6666666666666666
+          }
+        },
+        {
+          "name": "vlog_walk_and_talk",
+          "description": "Single subject walks 35\u219265 % over 10s \u2014 vlog + thirds bias",
+          "content_type_override": "vlog",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "face_centroid_in_thirds_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 7.105427357601002e-15,
+            "required_region_miss_rate": 0.6,
+            "face_centroid_in_thirds_rate": 0.0
+          }
+        },
+        {
+          "name": "music_video_beat",
+          "description": "120 BPM, 4 alternating speakers across 12s \u2014 beat snap",
+          "content_type_override": "music_video",
+          "anime_subtype": "",
+          "music_subtype": "performance",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "downbeat_snap_error",
+            "max_acceleration",
+            "max_jerk"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 25,
+            "required_region_frames": 0,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "downbeat_snap_error": {
+              "mean_error_ms": 200.0,
+              "max_error_ms": 200.0,
+              "snap_rate": 0.4,
+              "count": 5,
+              "snapped": 2
+            },
+            "max_acceleration": 47.149064830245656,
+            "max_jerk": 94.2981296604913
+          }
+        },
+        {
+          "name": "anime_hard_cuts",
+          "description": "6 hard cuts \u00d7 2s, alternating characters \u2014 anime + sub bar",
+          "content_type_override": "anime",
+          "anime_subtype": "dialogue",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 0,
+            "required_region_frames": 120,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 40.0,
+            "max_jerk": 80.0,
+            "required_region_miss_rate": 0.3333333333333333
+          }
+        },
+        {
+          "name": "tps_character_offset",
+          "description": "TPS character at x=40 %, HUD in corners \u2014 gameplay_tps",
+          "content_type_override": "gameplay_tps",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "gta_v",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 3,
+            "game_key": "gta_v"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 1.0,
+            "hud_preservation_rate": 0.0
+          }
+        },
+        {
+          "name": "stream_corner_facecam",
+          "description": "Facecam at x=85 corner + center gameplay \u2014 stream",
+          "content_type_override": "stream",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "generic_fps",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 2,
+            "game_key": "generic_fps"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.0,
+            "hud_preservation_rate": 0.0
+          }
+        }
+      ],
+      "combo": "phase7_gameplay_tracker",
+      "env_overrides": {
+        "USE_CONTENT_AWARE_REFRAME": "true",
+        "CLIPAI_MULTI_REGION_LP": "false",
+        "CLIPAI_GAZE_LEAD_ROOM_V2": "false",
+        "CLIPAI_THIRDS_BIAS": "false",
+        "CLIPAI_MUSIC_BEAT_SNAP": "false",
+        "CLIPAI_ANIME_SHOT_DETECTOR": "false",
+        "CLIPAI_ANIME_FACE_DETECTOR": "false",
+        "CLIPAI_ANIME_ANCHOR": "false",
+        "CLIPAI_ANIME_CHARACTER_CLUSTERING": "false",
+        "CLIPAI_GAMEPLAY_TRACKER": "true",
+        "CLIPAI_EDITORIAL_PRIOR": "false"
+      },
+      "status": "ok",
+      "safety_violations": [],
+      "deltas": {
+        "2speaker_alternating": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "3speaker_panel": {
+          "sub_second_switch_recall": -1.0,
+          "overlap_count": 0.0,
+          "max_acceleration": -60.0,
+          "max_jerk": -120.0,
+          "required_region_miss_rate": -0.08333333333333337
+        },
+        "vlog_walk_and_talk": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "face_centroid_in_thirds_rate": 0.0
+        },
+        "music_video_beat": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0
+        },
+        "anime_hard_cuts": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "tps_character_offset": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        },
+        "stream_corner_facecam": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        }
+      }
+    },
+    {
+      "schema": "autoflip_parity_v2_results/1",
+      "generated_at": "2026-04-13T16:54:20.004741+00:00",
+      "dry_run": false,
+      "fixture_count": 7,
+      "results": [
+        {
+          "name": "2speaker_alternating",
+          "description": "Two speakers alternating every 2s for 20s (legacy fixture)",
+          "content_type_override": "podcast",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 20.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 9,
+            "beat_grid_size": 0,
+            "required_region_frames": 200,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 10,
+          "actual_switches": 9,
+          "actual_boundaries": 9,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 50.0,
+            "max_jerk": 100.0,
+            "required_region_miss_rate": 0.39
+          }
+        },
+        {
+          "name": "3speaker_panel",
+          "description": "3-seat panel rotating every 1.5s for 18s \u2014 debate routing",
+          "content_type_override": "debate",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 18.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 11,
+            "beat_grid_size": 0,
+            "required_region_frames": 180,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "sub_second_switch_recall": 0.0,
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.6666666666666666
+          }
+        },
+        {
+          "name": "vlog_walk_and_talk",
+          "description": "Single subject walks 35\u219265 % over 10s \u2014 vlog + thirds bias",
+          "content_type_override": "vlog",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "face_centroid_in_thirds_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 7.105427357601002e-15,
+            "required_region_miss_rate": 0.6,
+            "face_centroid_in_thirds_rate": 0.0
+          }
+        },
+        {
+          "name": "music_video_beat",
+          "description": "120 BPM, 4 alternating speakers across 12s \u2014 beat snap",
+          "content_type_override": "music_video",
+          "anime_subtype": "",
+          "music_subtype": "performance",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "downbeat_snap_error",
+            "max_acceleration",
+            "max_jerk"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 25,
+            "required_region_frames": 0,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "downbeat_snap_error": {
+              "mean_error_ms": 200.0,
+              "max_error_ms": 200.0,
+              "snap_rate": 0.4,
+              "count": 5,
+              "snapped": 2
+            },
+            "max_acceleration": 47.149064830245656,
+            "max_jerk": 94.2981296604913
+          }
+        },
+        {
+          "name": "anime_hard_cuts",
+          "description": "6 hard cuts \u00d7 2s, alternating characters \u2014 anime + sub bar",
+          "content_type_override": "anime",
+          "anime_subtype": "dialogue",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 0,
+            "required_region_frames": 120,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 40.0,
+            "max_jerk": 80.0,
+            "required_region_miss_rate": 0.3333333333333333
+          }
+        },
+        {
+          "name": "tps_character_offset",
+          "description": "TPS character at x=40 %, HUD in corners \u2014 gameplay_tps",
+          "content_type_override": "gameplay_tps",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "gta_v",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 3,
+            "game_key": "gta_v"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 1.0,
+            "hud_preservation_rate": 0.0
+          }
+        },
+        {
+          "name": "stream_corner_facecam",
+          "description": "Facecam at x=85 corner + center gameplay \u2014 stream",
+          "content_type_override": "stream",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "generic_fps",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 2,
+            "game_key": "generic_fps"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.0,
+            "hud_preservation_rate": 0.0
+          }
+        }
+      ],
+      "combo": "phase8_editorial_prior",
+      "env_overrides": {
+        "USE_CONTENT_AWARE_REFRAME": "true",
+        "CLIPAI_MULTI_REGION_LP": "false",
+        "CLIPAI_GAZE_LEAD_ROOM_V2": "false",
+        "CLIPAI_THIRDS_BIAS": "false",
+        "CLIPAI_MUSIC_BEAT_SNAP": "false",
+        "CLIPAI_ANIME_SHOT_DETECTOR": "false",
+        "CLIPAI_ANIME_FACE_DETECTOR": "false",
+        "CLIPAI_ANIME_ANCHOR": "false",
+        "CLIPAI_ANIME_CHARACTER_CLUSTERING": "false",
+        "CLIPAI_GAMEPLAY_TRACKER": "false",
+        "CLIPAI_EDITORIAL_PRIOR": "true"
+      },
+      "status": "ok",
+      "safety_violations": [],
+      "deltas": {
+        "2speaker_alternating": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": -0.010000000000000009
+        },
+        "3speaker_panel": {
+          "sub_second_switch_recall": -1.0,
+          "overlap_count": 0.0,
+          "max_acceleration": -60.0,
+          "max_jerk": -120.0,
+          "required_region_miss_rate": -0.08333333333333337
+        },
+        "vlog_walk_and_talk": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "face_centroid_in_thirds_rate": 0.0
+        },
+        "music_video_beat": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0
+        },
+        "anime_hard_cuts": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "tps_character_offset": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        },
+        "stream_corner_facecam": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        }
+      }
+    },
+    {
+      "schema": "autoflip_parity_v2_results/1",
+      "generated_at": "2026-04-13T16:54:21.856275+00:00",
+      "dry_run": false,
+      "fixture_count": 7,
+      "results": [
+        {
+          "name": "2speaker_alternating",
+          "description": "Two speakers alternating every 2s for 20s (legacy fixture)",
+          "content_type_override": "podcast",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 20.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 9,
+            "beat_grid_size": 0,
+            "required_region_frames": 200,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 10,
+          "actual_switches": 9,
+          "actual_boundaries": 9,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 50.0,
+            "max_jerk": 100.0,
+            "required_region_miss_rate": 0.39
+          }
+        },
+        {
+          "name": "3speaker_panel",
+          "description": "3-seat panel rotating every 1.5s for 18s \u2014 debate routing",
+          "content_type_override": "debate",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 18.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 11,
+            "beat_grid_size": 0,
+            "required_region_frames": 180,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "sub_second_switch_recall": 0.0,
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.6666666666666666
+          }
+        },
+        {
+          "name": "vlog_walk_and_talk",
+          "description": "Single subject walks 35\u219265 % over 10s \u2014 vlog + thirds bias",
+          "content_type_override": "vlog",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "face_centroid_in_thirds_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 7.105427357601002e-15,
+            "required_region_miss_rate": 0.43,
+            "face_centroid_in_thirds_rate": 0.0
+          }
+        },
+        {
+          "name": "music_video_beat",
+          "description": "120 BPM, 4 alternating speakers across 12s \u2014 beat snap",
+          "content_type_override": "music_video",
+          "anime_subtype": "",
+          "music_subtype": "performance",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "downbeat_snap_error",
+            "max_acceleration",
+            "max_jerk"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 25,
+            "required_region_frames": 0,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "downbeat_snap_error": {
+              "mean_error_ms": 0.0,
+              "max_error_ms": 0.0,
+              "snap_rate": 1.0,
+              "count": 5,
+              "snapped": 5
+            },
+            "max_acceleration": 47.149064830245656,
+            "max_jerk": 94.2981296604913
+          }
+        },
+        {
+          "name": "anime_hard_cuts",
+          "description": "6 hard cuts \u00d7 2s, alternating characters \u2014 anime + sub bar",
+          "content_type_override": "anime",
+          "anime_subtype": "dialogue",
+          "music_subtype": "",
+          "game_type": "",
+          "video_duration": 12.0,
+          "metrics_requested": [
+            "sub_second_switch_recall",
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 5,
+            "beat_grid_size": 0,
+            "required_region_frames": 120,
+            "hud_zones": 0,
+            "game_key": ""
+          },
+          "status": "ok",
+          "segments": 6,
+          "actual_switches": 5,
+          "actual_boundaries": 5,
+          "metrics": {
+            "sub_second_switch_recall": 1.0,
+            "overlap_count": 0,
+            "max_acceleration": 40.0,
+            "max_jerk": 80.0,
+            "required_region_miss_rate": 0.3333333333333333
+          }
+        },
+        {
+          "name": "tps_character_offset",
+          "description": "TPS character at x=40 %, HUD in corners \u2014 gameplay_tps",
+          "content_type_override": "gameplay_tps",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "gta_v",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 3,
+            "game_key": "gta_v"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 1.0,
+            "hud_preservation_rate": 0.0
+          }
+        },
+        {
+          "name": "stream_corner_facecam",
+          "description": "Facecam at x=85 corner + center gameplay \u2014 stream",
+          "content_type_override": "stream",
+          "anime_subtype": "",
+          "music_subtype": "",
+          "game_type": "generic_fps",
+          "video_duration": 10.0,
+          "metrics_requested": [
+            "overlap_count",
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+            "hud_preservation_rate"
+          ],
+          "ground_truth_summary": {
+            "expected_switches": 0,
+            "beat_grid_size": 0,
+            "required_region_frames": 100,
+            "hud_zones": 2,
+            "game_key": "generic_fps"
+          },
+          "status": "ok",
+          "segments": 1,
+          "actual_switches": 0,
+          "actual_boundaries": 0,
+          "metrics": {
+            "overlap_count": 0,
+            "max_acceleration": 0.0,
+            "max_jerk": 0.0,
+            "required_region_miss_rate": 0.0,
+            "hud_preservation_rate": 0.0
+          }
+        }
+      ],
+      "combo": "all_on",
+      "env_overrides": {
+        "USE_CONTENT_AWARE_REFRAME": "true",
+        "CLIPAI_MULTI_REGION_LP": "true",
+        "CLIPAI_GAZE_LEAD_ROOM_V2": "true",
+        "CLIPAI_THIRDS_BIAS": "true",
+        "CLIPAI_MUSIC_BEAT_SNAP": "true",
+        "CLIPAI_ANIME_SHOT_DETECTOR": "true",
+        "CLIPAI_ANIME_FACE_DETECTOR": "true",
+        "CLIPAI_ANIME_ANCHOR": "true",
+        "CLIPAI_ANIME_CHARACTER_CLUSTERING": "true",
+        "CLIPAI_GAMEPLAY_TRACKER": "true",
+        "CLIPAI_EDITORIAL_PRIOR": "true"
+      },
+      "status": "ok",
+      "safety_violations": [],
+      "deltas": {
+        "2speaker_alternating": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": -0.010000000000000009
+        },
+        "3speaker_panel": {
+          "sub_second_switch_recall": -1.0,
+          "overlap_count": 0.0,
+          "max_acceleration": -60.0,
+          "max_jerk": -120.0,
+          "required_region_miss_rate": -0.08333333333333337
+        },
+        "vlog_walk_and_talk": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": -0.16999999999999998,
+          "face_centroid_in_thirds_rate": 0.0
+        },
+        "music_video_beat": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0
+        },
+        "anime_hard_cuts": {
+          "sub_second_switch_recall": 0.0,
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0
+        },
+        "tps_character_offset": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        },
+        "stream_corner_facecam": {
+          "overlap_count": 0.0,
+          "max_acceleration": 0.0,
+          "max_jerk": 0.0,
+          "required_region_miss_rate": 0.0,
+          "hud_preservation_rate": 0.0
+        }
+      }
+    }
+  ]
+}

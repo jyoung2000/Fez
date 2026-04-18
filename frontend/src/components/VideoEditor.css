@@ -1,0 +1,2876 @@
+/* ═══════════════════════════════════════════════════════
+   VideoEditor — Professional NLE-style clip preview
+   Apple FCP × Adobe Premiere Pro design hybrid
+   BEM naming with ve- prefix
+   ═══════════════════════════════════════════════════════ */
+
+.ve-container {
+  --ve-chrome-bg: var(--bg-panel, rgba(249, 249, 251, 0.92));
+  --ve-chrome-border: var(--border, rgba(0, 0, 0, 0.08));
+  --ve-accent: var(--accent-cyan, #0A84FF);
+  --ve-accent-hover: #409CFF;
+  --ve-trim-color: var(--accent-cyan, #0A84FF);
+  --ve-trim-dimmed: rgba(0, 0, 0, 0.40);
+  --ve-text: var(--text-primary, #1D1D1F);
+  --ve-text-muted: var(--text-muted, rgba(60, 60, 67, 0.55));
+  --ve-btn-hover: rgba(0, 0, 0, 0.05);
+  --ve-btn-active: rgba(0, 0, 0, 0.09);
+  --ve-track-bg: rgba(0, 0, 0, 0.05);
+  --ve-track-border: var(--border, rgba(0, 0, 0, 0.08));
+  --ve-kbd-bg: rgba(0, 0, 0, 0.05);
+  --ve-kbd-border: rgba(0, 0, 0, 0.10);
+  --ve-slider-track: rgba(0, 0, 0, 0.12);
+  --ve-dropdown-bg: rgba(255, 255, 255, 0.95);
+  --ve-dropdown-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+
+  position: relative;
+  background: var(--bg-elevated, #f0f0f4);
+  border-radius: var(--radius-md, 12px);
+  overflow: hidden;
+  font-family: var(--font-sans);
+  user-select: none;
+  -webkit-user-select: none;
+  /* Center the editor inside whatever wrapper hosts it (Analysis,
+     ClipSEO, full-video page, etc.). Authors can override on the
+     wrapper itself when they need a non-centered layout. */
+  margin: 0 auto;
+}
+
+/* ── Dark theme overrides ─────────────────────────── */
+[data-theme="dark"] .ve-container {
+  --ve-chrome-bg: rgba(28, 28, 30, 0.88);
+  --ve-chrome-border: rgba(255, 255, 255, 0.06);
+  --ve-text: #F5F5F7;
+  --ve-text-muted: rgba(235, 235, 245, 0.6);
+  --ve-trim-dimmed: rgba(0, 0, 0, 0.55);
+  --ve-btn-hover: rgba(255, 255, 255, 0.08);
+  --ve-btn-active: rgba(255, 255, 255, 0.12);
+  --ve-track-bg: rgba(255, 255, 255, 0.06);
+  --ve-track-border: rgba(255, 255, 255, 0.08);
+  --ve-kbd-bg: rgba(255, 255, 255, 0.08);
+  --ve-kbd-border: rgba(255, 255, 255, 0.12);
+  --ve-slider-track: rgba(255, 255, 255, 0.15);
+  --ve-dropdown-bg: rgba(30, 30, 32, 0.95);
+  --ve-dropdown-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  color-scheme: dark;
+  background: #0d0d0f;
+}
+
+.ve-container--compact {
+  border-radius: var(--radius-sm, 8px);
+}
+
+/* Legacy class — kept so any external code referencing it doesn't break.
+   Lightbox styling lives on .ve-viewport--fullscreen now. */
+.ve-container--fullscreen {
+  position: relative;
+}
+
+/* ── Header ────────────────────────────────────────── */
+
+.ve-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--ve-chrome-bg);
+  border-bottom: 1px solid var(--ve-chrome-border);
+  backdrop-filter: blur(20px) saturate(1.8);
+  -webkit-backdrop-filter: blur(20px) saturate(1.8);
+  min-height: 36px;
+}
+
+.ve-header__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ve-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: calc(100% - 40px);
+}
+
+.ve-header__close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: var(--ve-btn-hover);
+  border-radius: 4px;
+  color: var(--ve-text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+.ve-header__close:hover {
+  background: var(--ve-btn-active);
+  color: var(--ve-text);
+}
+
+/* ── Viewport ──────────────────────────────────────── */
+
+.ve-viewport {
+  position: relative;
+  background: #000;
+  cursor: pointer;
+  overflow: hidden;
+  touch-action: manipulation;
+}
+
+/* ── Lightbox ("fullscreen" button) ──────────────────
+   Promotes just the viewport to a fullscreen-style overlay with a black
+   backdrop. The inner stage is sized to the user-selected aspect ratio
+   so the video sits in a clean letterbox — no editor chrome on top.
+   We use position:fixed (not the browser Fullscreen API) so the lightbox
+   respects the *selected* aspect ratio rather than the screen's. */
+.ve-viewport--fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 99999;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+  /* Hard reset of any inline aspect-ratio inherited from normal mode. */
+  aspect-ratio: auto;
+  /* Animate in. */
+  animation: ve-lightbox-fade-in 160ms ease-out;
+}
+
+@keyframes ve-lightbox-fade-in {
+  from { background: rgba(0, 0, 0, 0); }
+  to   { background: #000; }
+}
+
+/* Stage = the actual aspect-ratio-correct video frame. In normal mode
+   it perfectly overlaps the viewport (so all overlay positioning is
+   identical to before). In lightbox mode it shrinks to the chosen
+   aspect ratio with letterbox bars filled by the viewport's black bg. */
+.ve-stage {
+  position: absolute;
+  inset: 0;
+  /* Establish a containing block so absolutely-positioned overlays
+     (subtitles, text, shapes, badges) sit on the actual video frame. */
+}
+
+.ve-stage--fullscreen {
+  position: relative;
+  inset: auto;
+  /* Largest box that fits the screen at the user's target aspect ratio.
+     `--ve-target-ratio` is set inline by the component (e.g. 0.5625 for
+     9:16, 1.0 for 1:1, 1.7777 for 16:9). The min() pair guarantees the
+     stage never exceeds either viewport bound, producing a clean letter-
+     or pillar-box for any source/target ratio combination. */
+  /* `vh` for older browsers, `svh` (small viewport) overrides where supported
+     so mobile Safari's URL bar doesn't clip the bottom of the frame. */
+  width: min(100vw, calc(100vh * var(--ve-target-ratio, 1.7777)));
+  height: min(100vh, calc(100vw / var(--ve-target-ratio, 1.7777)));
+  width: min(100vw, calc(100svh * var(--ve-target-ratio, 1.7777)));
+  height: min(100svh, calc(100vw / var(--ve-target-ratio, 1.7777)));
+  display: block;
+  background: #000;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+}
+
+.ve-viewport video {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Lightbox close button */
+.ve-lightbox-close {
+  position: absolute;
+  top: max(16px, env(safe-area-inset-top, 0px));
+  right: max(16px, env(safe-area-inset-right, 0px));
+  z-index: 100000;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.10);
+  color: #fff;
+  cursor: pointer;
+  backdrop-filter: blur(20px) saturate(1.6);
+  -webkit-backdrop-filter: blur(20px) saturate(1.6);
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+.ve-lightbox-close:hover {
+  background: rgba(255, 255, 255, 0.18);
+  transform: scale(1.05);
+}
+.ve-lightbox-close:active {
+  transform: scale(0.96);
+}
+
+.ve-viewport__play-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.15);
+  pointer-events: none;
+  z-index: 5;
+  opacity: 1;
+  transition: opacity 0.2s ease;
+}
+
+.ve-viewport__play-icon {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.ve-viewport__play-icon svg {
+  margin-left: 3px;
+}
+
+.ve-aspect-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: #FFFFFF;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 2px 8px;
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 3;
+  letter-spacing: 0.02em;
+}
+
+/* ── Timeline ──────────────────────────────────────── */
+
+.ve-timeline {
+  position: relative;
+  background: var(--ve-chrome-bg);
+  padding: 6px 12px 4px 40px;
+  border-top: 1px solid var(--ve-chrome-border);
+  backdrop-filter: blur(20px) saturate(1.8);
+  -webkit-backdrop-filter: blur(20px) saturate(1.8);
+}
+
+.ve-timeline__ruler {
+  display: flex;
+  justify-content: space-between;
+  padding: 0 0 4px;
+  font-size: 9px;
+  font-family: var(--font-mono, monospace);
+  color: var(--ve-text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.ve-timeline__track {
+  position: relative;
+  height: 40px;
+  background: var(--ve-track-bg);
+  border: 1px solid var(--ve-track-border);
+  border-radius: 4px;
+  cursor: pointer;
+  touch-action: none;
+}
+
+/* Keyframe thumbnails canvas */
+.ve-timeline__thumbnails {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 0;
+  border-radius: 3px;
+}
+
+/* Waveform audio track — separate row beneath keyframes */
+.ve-timeline__waveform-track {
+  position: relative;
+  height: 28px;
+  margin-top: 3px;
+  background: #ffffff;
+  border: 1px solid var(--ve-track-border);
+  border-radius: 4px;
+  cursor: pointer;
+  touch-action: none;
+}
+
+[data-theme="dark"] .ve-timeline__waveform-track {
+  background: #1a1a1c;
+}
+
+.ve-timeline__waveform {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.ve-timeline__dimmed-left,
+.ve-timeline__dimmed-right {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: var(--ve-trim-dimmed);
+  pointer-events: none;
+  z-index: 1;
+}
+.ve-timeline__dimmed-left {
+  left: 0;
+  border-radius: 4px 0 0 4px;
+}
+.ve-timeline__dimmed-right {
+  right: 0;
+  border-radius: 0 4px 4px 0;
+}
+
+.ve-timeline__trim-region {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: rgba(10, 132, 255, 0.04);
+  border-top: 2px solid rgba(10, 132, 255, 0.35);
+  border-bottom: 2px solid rgba(10, 132, 255, 0.35);
+  z-index: 1;
+  pointer-events: none;
+}
+
+.ve-timeline__progress {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background: rgba(10, 132, 255, 0.18);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.ve-timeline__playhead {
+  position: absolute;
+  top: -4px;
+  width: 2px;
+  height: calc(100% + 8px);
+  background: #FF3B30;
+  pointer-events: none;
+  z-index: 5;
+  transition: none;
+}
+.ve-timeline__playhead::before {
+  content: '';
+  position: absolute;
+  top: -2px;
+  left: -5px;
+  width: 0;
+  height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-top: 7px solid #FF3B30;
+}
+/* Playhead glow effect */
+.ve-timeline__playhead::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -3px;
+  width: 8px;
+  height: 100%;
+  background: radial-gradient(ellipse, rgba(255, 59, 48, 0.15) 0%, transparent 70%);
+  pointer-events: none;
+}
+
+/* No triangle on waveform — the main track has it */
+.ve-timeline__waveform-track .ve-timeline__playhead::before {
+  display: none;
+}
+
+/* ── Hover time preview ───────────────────────────── */
+
+.ve-timeline__hover-line {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  background: rgba(255, 255, 255, 0.3);
+  pointer-events: none;
+  z-index: 2;
+}
+
+[data-theme="dark"] .ve-timeline__hover-line {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.ve-timeline__hover-tooltip {
+  position: absolute;
+  top: -20px;
+  transform: translateX(-50%);
+  padding: 1px 6px;
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+  font-size: 9px;
+  font-family: var(--font-mono, monospace);
+  border-radius: 3px;
+  pointer-events: none;
+  z-index: 10;
+  white-space: nowrap;
+}
+
+/* ── Track labels ─────────────────────────────────── */
+
+.ve-timeline__track-label {
+  position: absolute;
+  left: -28px;
+  top: 50%;
+  transform: translateY(-50%) rotate(-90deg);
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ve-text-muted);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0.5;
+}
+
+/* ── Segment overlay on timeline ──────────────────── */
+
+.ve-timeline__segment {
+  transition: background 0.15s ease, border-color 0.15s ease;
+  border-radius: 2px;
+}
+.ve-timeline__segment--selected {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.3);
+}
+.ve-timeline__segment--active {
+  animation: ve-seg-pulse 0.6s ease 1;
+}
+@keyframes ve-seg-pulse {
+  0% { filter: brightness(1); }
+  30% { filter: brightness(1.4); }
+  100% { filter: brightness(1); }
+}
+.ve-timeline__segment-label {
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
+/* ── Segment drag handles (visual affordance on hover) ── */
+.ve-timeline__segment-handle {
+  position: absolute;
+  top: 0;
+  width: 8px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 5;
+}
+.ve-timeline__segment-handle--left {
+  left: -4px;
+}
+.ve-timeline__segment-handle--right {
+  right: -4px;
+}
+
+/* ── Trim handles ──────────────────────────────────── */
+
+.ve-trim-handle {
+  position: absolute;
+  top: 0;
+  width: 10px;
+  height: 100%;
+  background: var(--ve-trim-color);
+  cursor: ew-resize;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: box-shadow 0.1s ease;
+}
+.ve-trim-handle--left {
+  border-radius: 4px 0 0 4px;
+}
+.ve-trim-handle--right {
+  border-radius: 0 4px 4px 0;
+}
+.ve-trim-handle:hover,
+.ve-trim-handle--active {
+  box-shadow: 0 0 10px rgba(10, 132, 255, 0.5);
+}
+
+/* Active trim handle pulse */
+.ve-trim-handle--active {
+  animation: ve-handle-pulse 0.8s ease infinite;
+}
+@keyframes ve-handle-pulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(10, 132, 255, 0.4); }
+  50% { box-shadow: 0 0 16px rgba(10, 132, 255, 0.7); }
+}
+
+/* Grip texture */
+.ve-trim-handle__grip {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: center;
+}
+.ve-trim-handle__grip span {
+  display: block;
+  width: 5px;
+  height: 1.5px;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 1px;
+}
+
+/* Trim tooltip */
+.ve-trim-tooltip {
+  position: absolute;
+  top: -22px;
+  padding: 2px 6px;
+  background: var(--ve-trim-color);
+  color: #FFFFFF;
+  font-size: 9px;
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+  border-radius: 3px;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translateX(-50%);
+  left: 50%;
+  z-index: 10;
+}
+
+/* ── Controls bar ──────────────────────────────────── */
+
+.ve-controls {
+  display: flex;
+  align-items: center;
+  padding: 6px 12px;
+  background: var(--ve-chrome-bg);
+  border-top: 1px solid var(--ve-chrome-border);
+  backdrop-filter: blur(20px) saturate(1.8);
+  -webkit-backdrop-filter: blur(20px) saturate(1.8);
+  min-height: 40px;
+  gap: 4px;
+}
+
+.ve-controls--compact {
+  padding: 4px 8px;
+  min-height: 36px;
+}
+
+.ve-controls__transport,
+.ve-controls__center,
+.ve-controls__right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ve-controls__transport {
+  flex: 0 0 auto;
+}
+.ve-controls__center {
+  flex: 1;
+  justify-content: center;
+}
+.ve-controls__right {
+  flex: 0 0 auto;
+}
+
+/* Segment editing mode — visual scope indicator */
+.ve-controls--segment-mode {
+  background: rgba(10, 132, 255, 0.04);
+  border-left: 3px solid var(--ve-accent);
+  box-shadow: inset 0 1px 0 rgba(10, 132, 255, 0.3),
+              inset 0 -1px 0 rgba(10, 132, 255, 0.3);
+}
+
+.ve-controls--segment-mode .ve-volume__label,
+.ve-controls--segment-mode .ve-speed__btn {
+  color: var(--ve-accent);
+}
+
+[data-theme="dark"] .ve-controls--segment-mode {
+  background: rgba(10, 132, 255, 0.06);
+}
+
+/* ── Buttons ───────────────────────────────────────── */
+
+.ve-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--ve-text);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: all 0.15s ease;
+  padding: 4px;
+  min-width: 32px;
+  min-height: 32px;
+}
+.ve-btn:hover {
+  background: var(--ve-btn-hover);
+}
+.ve-btn:active {
+  background: var(--ve-btn-active);
+  transform: scale(0.95);
+}
+.ve-btn svg {
+  flex-shrink: 0;
+}
+
+.ve-btn--play {
+  width: 36px;
+  height: 36px;
+}
+/* Transport button press feedback */
+.ve-btn--play:active {
+  transform: scale(0.9);
+  transition: transform 0.05s ease;
+}
+
+/* ── Timecode ──────────────────────────────────────── */
+
+.ve-timecode {
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  color: var(--ve-text-muted);
+  white-space: nowrap;
+  padding: 2px 4px;
+  cursor: pointer;
+  min-width: 72px;
+  letter-spacing: -0.02em;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.ve-timecode:hover {
+  border-color: var(--border, rgba(128,128,128,0.3));
+  background: var(--bg-elevated, rgba(128,128,128,0.08));
+}
+
+input.ve-timecode--input {
+  background: var(--bg-elevated, rgba(0,0,0,0.15));
+  border: 1px solid var(--accent-cyan, #0A84FF);
+  color: var(--ve-text-primary, #fff);
+  outline: none;
+  width: 72px;
+  text-align: center;
+  cursor: text;
+}
+
+/* ── Trim info ─────────────────────────────────────── */
+
+.ve-trim-info {
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--ve-trim-color);
+  white-space: nowrap;
+  padding: 2px 8px;
+  background: rgba(10, 132, 255, 0.08);
+  border-radius: 4px;
+  opacity: 0.8;
+}
+
+/* Apply trim button */
+.ve-apply-trim {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  border: 1px solid var(--ve-trim-color);
+  background: rgba(10, 132, 255, 0.08);
+  color: var(--ve-trim-color);
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+.ve-apply-trim:hover {
+  background: rgba(10, 132, 255, 0.18);
+  box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.15);
+}
+.ve-apply-trim:active {
+  transform: scale(0.97);
+}
+
+/* Trim applied confirmation */
+.ve-trim-applied {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  background: rgba(48, 209, 88, 0.10);
+  color: #30D158;
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+  border-radius: 6px;
+  white-space: nowrap;
+  animation: ve-trim-confirm 0.3s ease;
+}
+@keyframes ve-trim-confirm {
+  0% { transform: scale(0.9); opacity: 0; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+/* ── Volume ────────────────────────────────────────── */
+
+.ve-volume {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ve-volume__slider-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  max-width: 0;
+  opacity: 0;
+  transition: max-width 0.2s ease, opacity 0.2s ease;
+}
+.ve-volume:hover .ve-volume__slider-wrap,
+.ve-volume--expanded .ve-volume__slider-wrap {
+  max-width: 120px;
+  opacity: 1;
+}
+
+.ve-volume__slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 64px;
+  height: 3px;
+  background: var(--ve-slider-track);
+  border-radius: 2px;
+  outline: none;
+  border: none;
+  cursor: pointer;
+  margin: 0;
+  padding: 0;
+}
+.ve-volume__slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--ve-text);
+  cursor: pointer;
+  border: none;
+  margin-top: -3.5px;
+}
+.ve-volume__slider::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--ve-text);
+  cursor: pointer;
+  border: none;
+}
+.ve-volume__slider::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 2px;
+}
+.ve-volume__slider::-moz-range-track {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--ve-slider-track);
+}
+
+.ve-volume__label {
+  font-size: 9px;
+  font-family: var(--font-mono, monospace);
+  color: var(--ve-text-muted);
+  min-width: 28px;
+  text-align: right;
+}
+.ve-volume__label--warn {
+  color: var(--accent-amber, #FF9F0A);
+}
+
+/* ── Speed dropdown ────────────────────────────────── */
+
+.ve-speed {
+  position: relative;
+}
+
+.ve-speed__btn {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 10px;
+  border: 1px solid var(--ve-track-border);
+  background: var(--ve-track-bg);
+  color: var(--ve-text);
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  font-weight: 500;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.ve-speed__btn:hover {
+  background: var(--ve-btn-hover);
+  color: var(--ve-text);
+}
+.ve-speed__btn--active {
+  color: var(--ve-accent);
+  border-color: rgba(10, 132, 255, 0.25);
+}
+
+.ve-speed__dropdown {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  right: 0;
+  background: var(--ve-dropdown-bg);
+  border: 1px solid var(--ve-chrome-border);
+  border-radius: 6px;
+  padding: 4px;
+  z-index: 20;
+  min-width: 100px;
+  box-shadow: var(--ve-dropdown-shadow);
+  backdrop-filter: blur(20px) saturate(1.8);
+  -webkit-backdrop-filter: blur(20px) saturate(1.8);
+}
+
+.ve-speed__option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border: none;
+  background: transparent;
+  color: var(--ve-text-muted);
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  border-radius: 4px;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  transition: all 0.1s ease;
+}
+.ve-speed__option:hover {
+  background: var(--ve-btn-hover);
+  color: var(--ve-text);
+}
+.ve-speed__option--current {
+  color: var(--ve-accent);
+  background: rgba(10, 132, 255, 0.08);
+}
+.ve-speed__option-label {
+  font-size: 9px;
+  color: var(--ve-text-muted);
+  margin-left: 8px;
+}
+
+/* ── Responsive ────────────────────────────────────── */
+
+@media (max-width: 767px) {
+  .ve-controls {
+    min-height: auto;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 2px;
+    padding: 6px 8px;
+  }
+
+  /* Transport: full width, centered */
+  .ve-controls__transport {
+    flex: 1 1 100%;
+    justify-content: center;
+    order: 1;
+  }
+
+  /* Center (trim): full width, centered */
+  .ve-controls__center {
+    flex: 1 1 100%;
+    order: 2;
+  }
+
+  .ve-controls__center:empty {
+    display: none;
+  }
+
+  /* Right (vol/speed/fs): full width, centered */
+  .ve-controls__right {
+    flex: 1 1 100%;
+    justify-content: center;
+    order: 3;
+  }
+
+  .ve-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .ve-timeline__track {
+    height: 48px;
+  }
+
+  .ve-timeline__waveform-track {
+    height: 32px;
+  }
+
+  .ve-trim-handle {
+    width: 14px;
+  }
+
+  .ve-timecode {
+    font-size: 10px;
+    min-width: 60px;
+    text-align: center;
+  }
+
+  input.ve-timecode--input {
+    width: 60px;
+  }
+
+  .ve-volume__slider-wrap {
+    max-width: 0 !important;
+    opacity: 0 !important;
+  }
+}
+
+@media (min-width: 481px) and (max-width: 768px) {
+  .ve-volume__slider-wrap {
+    max-width: 0 !important;
+    opacity: 0 !important;
+  }
+}
+
+/* ── Keyboard shortcuts hint ───────────────────────── */
+
+.ve-shortcuts {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 4px 12px;
+  background: var(--ve-chrome-bg);
+  border-top: 1px solid var(--ve-chrome-border);
+  font-size: 10px;
+  color: var(--ve-text-muted);
+  flex-wrap: wrap;
+}
+
+.ve-shortcuts kbd {
+  display: inline-block;
+  padding: 1px 4px;
+  background: var(--ve-kbd-bg);
+  border: 1px solid var(--ve-kbd-border);
+  border-radius: 3px;
+  font-family: var(--font-mono, monospace);
+  font-size: 9px;
+  line-height: 1.3;
+  color: var(--ve-text);
+}
+
+.ve-shortcuts span {
+  white-space: nowrap;
+}
+
+@media (max-width: 767px) {
+  .ve-shortcuts {
+    display: none;
+  }
+}
+
+/* ── Segment Chips ────────────────────────────────── */
+
+.ve-segment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font-size: 9px;
+  font-weight: 500;
+  background: var(--bg-elevated, #f5f5f5);
+  color: var(--text-secondary, #666);
+  border: 1.5px solid var(--border, #ddd);
+  border-radius: var(--radius-xs, 4px);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.ve-segment-chip:hover {
+  background: var(--ve-btn-hover);
+}
+.ve-segment-chip--selected {
+  background: rgba(10, 132, 255, 0.06);
+  outline: 2px solid rgba(10, 132, 255, 0.15);
+}
+.ve-segment-chip--add {
+  font-weight: 600;
+  background: var(--accent-cyan-dim, rgba(10, 132, 255, 0.1));
+  color: var(--accent-cyan, #0A84FF);
+  border-color: var(--accent-cyan, #0A84FF);
+}
+.ve-segment-chip--action {
+  font-weight: 500;
+  color: var(--ve-text-muted);
+  border-style: dashed;
+}
+.ve-segment-chip__dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.ve-segment-chip__label {
+  font-weight: 600;
+  color: var(--ve-text);
+}
+.ve-segment-chip__time {
+  font-family: var(--font-mono, monospace);
+  font-size: 8px;
+  opacity: 0.7;
+}
+.ve-segment-chip__summary {
+  font-size: 8px;
+  color: var(--ve-text-muted);
+}
+
+[data-theme="dark"] .ve-segment-chip {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+[data-theme="dark"] .ve-segment-chip--selected {
+  background: rgba(10, 132, 255, 0.1);
+}
+
+/* ── Segment Inspector Panel ─────────────────────── */
+
+.ve-segment-inspector {
+  background: var(--ve-chrome-bg);
+  border: 1px solid var(--ve-chrome-border);
+  border-left: 3px solid var(--seg-color, var(--ve-accent));
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 4px 0 0;
+  backdrop-filter: blur(20px) saturate(1.8);
+  -webkit-backdrop-filter: blur(20px) saturate(1.8);
+  animation: ve-inspector-enter 0.2s ease;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+}
+
+@keyframes ve-inspector-enter {
+  0% { opacity: 0; transform: translateY(-4px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+[data-theme="dark"] .ve-segment-inspector {
+  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.3);
+}
+
+.ve-segment-inspector__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.ve-segment-inspector__color-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.ve-segment-inspector__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ve-text);
+  cursor: text;
+  padding: 1px 4px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  transition: border-color 0.15s, background 0.15s;
+}
+.ve-segment-inspector__label:hover {
+  border-color: var(--ve-chrome-border);
+  background: var(--ve-btn-hover);
+}
+
+.ve-segment-inspector__label-input {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ve-text);
+  padding: 1px 4px;
+  border-radius: 3px;
+  border: 1px solid var(--seg-color, var(--ve-accent));
+  background: var(--bg-elevated, rgba(0, 0, 0, 0.05));
+  outline: none;
+  width: 120px;
+}
+
+.ve-segment-inspector__time-range {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: var(--ve-text-muted);
+}
+
+.ve-segment-inspector__time-editable {
+  padding: 1px 4px;
+  border-radius: 3px;
+  cursor: text;
+  border: 1px solid transparent;
+  transition: border-color 0.15s, background 0.15s;
+}
+.ve-segment-inspector__time-editable:hover {
+  border-color: var(--seg-color, var(--ve-accent));
+  background: rgba(10, 132, 255, 0.06);
+}
+
+.ve-segment-inspector__time-input {
+  width: 42px;
+  padding: 1px 4px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  text-align: center;
+  border: 1px solid var(--seg-color, var(--ve-accent));
+  border-radius: 3px;
+  outline: none;
+  background: var(--bg-elevated, rgba(0, 0, 0, 0.08));
+  color: var(--ve-text);
+}
+
+.ve-segment-inspector__time-sep {
+  color: var(--ve-text-muted);
+  opacity: 0.5;
+}
+
+.ve-segment-inspector__time-dur {
+  font-size: 9px;
+  color: var(--ve-text-muted);
+  opacity: 0.6;
+  margin-left: 2px;
+}
+
+.ve-segment-inspector__delete {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 6px;
+  border: none;
+  background: transparent;
+  color: var(--ve-text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  min-width: 24px;
+}
+.ve-segment-inspector__delete:hover {
+  background: rgba(255, 59, 48, 0.1);
+  color: #FF3B30;
+}
+
+.ve-segment-inspector__controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ve-segment-inspector__volume-row,
+.ve-segment-inspector__speed-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ve-segment-inspector__control-label {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--ve-text-muted);
+  width: 48px;
+  flex-shrink: 0;
+}
+
+.ve-segment-inspector__volume-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  height: 3px;
+  border-radius: 2px;
+  outline: none;
+  border: none;
+  cursor: pointer;
+  margin: 0;
+  padding: 0;
+}
+.ve-segment-inspector__volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--ve-text);
+  cursor: pointer;
+  border: none;
+  margin-top: -4.5px;
+}
+.ve-segment-inspector__volume-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--ve-text);
+  cursor: pointer;
+  border: none;
+}
+.ve-segment-inspector__volume-slider::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 2px;
+}
+.ve-segment-inspector__volume-slider::-moz-range-track {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--ve-slider-track);
+}
+
+.ve-segment-inspector__volume-value {
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--ve-text-muted);
+  min-width: 32px;
+  text-align: right;
+}
+
+.ve-segment-inspector__speed-pills {
+  display: flex;
+  gap: 3px;
+  flex-wrap: wrap;
+}
+
+.ve-segment-inspector__speed-pill {
+  padding: 2px 8px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  font-weight: 500;
+  border: 1px solid var(--ve-track-border);
+  background: var(--ve-track-bg);
+  color: var(--ve-text-muted);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.ve-segment-inspector__speed-pill:hover {
+  background: var(--ve-btn-hover);
+  color: var(--ve-text);
+}
+.ve-segment-inspector__speed-pill--active {
+  font-weight: 600;
+}
+
+.ve-segment-inspector__toggles {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 2px;
+}
+
+.ve-segment-inspector__toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--ve-text);
+  cursor: pointer;
+}
+
+.ve-segment-inspector__toggle input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  accent-color: var(--seg-color, var(--ve-accent));
+}
+
+.ve-segment-inspector__actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+.ve-segment-inspector__done {
+  padding: 3px 12px;
+  font-size: 10px;
+  font-weight: 600;
+  background: var(--seg-color, var(--ve-accent));
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.ve-segment-inspector__done:hover {
+  filter: brightness(1.1);
+}
+.ve-segment-inspector__done:active {
+  transform: scale(0.97);
+}
+
+/* ── Segment Entry Indicator (viewport overlay) ──── */
+
+.ve-segment-enter-indicator {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 500;
+  border-radius: 4px;
+  border-left: 3px solid var(--seg-color, #0A84FF);
+  pointer-events: none;
+  z-index: 6;
+  animation: ve-seg-entry-fade 1.5s ease forwards;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.ve-segment-enter-indicator__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+@keyframes ve-seg-entry-fade {
+  0% { opacity: 0; transform: translateY(-4px); }
+  10% { opacity: 1; transform: translateY(0); }
+  70% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* ── Responsive: segment inspector ───────────────── */
+
+@media (max-width: 767px) {
+  .ve-segment-inspector {
+    padding: 6px 8px;
+  }
+  .ve-segment-inspector__header {
+    flex-wrap: wrap;
+  }
+  .ve-segment-inspector__time-range {
+    margin-left: 0;
+    width: 100%;
+    margin-top: 4px;
+  }
+  .ve-segment-inspector__volume-row,
+  .ve-segment-inspector__speed-row {
+    flex-wrap: wrap;
+  }
+  .ve-segment-inspector__control-label {
+    width: auto;
+  }
+  .ve-segment-inspector__speed-pills {
+    flex-wrap: wrap;
+  }
+}
+
+/* ── Loading/Error states ──────────────────────────── */
+
+.ve-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  background: var(--bg-elevated, #f0f0f4);
+  border-radius: var(--radius-md, 12px);
+}
+
+.ve-loading__spinner {
+  width: 24px;
+  height: 24px;
+  border: 2px solid var(--ve-track-bg, rgba(0, 0, 0, 0.08));
+  border-top-color: var(--ve-accent);
+  border-radius: 50%;
+  animation: ve-spin 0.8s linear infinite;
+}
+
+@keyframes ve-spin {
+  to { transform: rotate(360deg); }
+}
+
+.ve-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 200px;
+  background: var(--bg-elevated, #f0f0f4);
+  border-radius: var(--radius-md, 12px);
+  color: var(--ve-text-muted);
+  font-size: 13px;
+}
+
+.ve-error__retry {
+  padding: 6px 16px;
+  border: 1px solid var(--ve-chrome-border);
+  background: var(--ve-btn-hover);
+  color: var(--ve-text);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: all 0.15s ease;
+}
+.ve-error__retry:hover {
+  background: var(--ve-btn-active);
+}
+
+/* ═══════════════════════════════════════════════════════
+   Multi-Track Editor Panels
+   ═══════════════════════════════════════════════════════ */
+
+/* ── Multi-track toggle bar ─────────────────────────── */
+
+.ve-multitrack-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  background: var(--ve-chrome-bg);
+  border-top: 1px solid var(--ve-chrome-border);
+  backdrop-filter: blur(20px) saturate(1.8);
+  -webkit-backdrop-filter: blur(20px) saturate(1.8);
+}
+
+.ve-multitrack-toggle__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 10px;
+  font-weight: 600;
+  background: var(--ve-track-bg);
+  color: var(--ve-text-muted);
+  border: 1px solid var(--ve-track-border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.ve-multitrack-toggle__btn:hover {
+  background: var(--ve-btn-hover);
+  color: var(--ve-text);
+}
+.ve-multitrack-toggle__btn--active {
+  background: rgba(10, 132, 255, 0.08);
+  color: var(--ve-accent);
+  border-color: rgba(10, 132, 255, 0.25);
+}
+.ve-multitrack-toggle__btn--sub {
+  font-size: 9px;
+  padding: 3px 8px;
+}
+
+/* ── Multi-track container ──────────────────────────── */
+
+.ve-multitrack {
+  display: flex;
+  flex-direction: column;
+  background: var(--ve-chrome-bg);
+  border-top: 1px solid var(--ve-chrome-border);
+  overflow: hidden;
+}
+
+.ve-multitrack__encoding-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: all;
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+.ve-multitrack__encoding-label {
+  padding: 8px 20px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.7);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.ve-multitrack__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  background: var(--ve-chrome-bg);
+  border-bottom: 1px solid var(--ve-chrome-border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.ve-multitrack__toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.ve-multitrack__content {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ve-multitrack__center {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Sections within the right sidebar (effects, transitions, clip settings) */
+.ve-multitrack__sidebar-section {
+  border-top: 1px solid var(--ve-chrome-border);
+}
+
+.ve-multitrack__sidebar {
+  width: 240px;
+  min-width: 200px;
+  max-width: 280px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  border-right: 1px solid var(--ve-chrome-border);
+  padding: 0;
+}
+.ve-multitrack__sidebar--right {
+  border-right: none;
+  border-left: 1px solid var(--ve-chrome-border);
+  width: 260px;
+  max-width: 300px;
+}
+
+.ve-multitrack__sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ve-text-muted);
+  background: var(--ve-track-bg);
+  border-bottom: 1px solid var(--ve-chrome-border);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.ve-multitrack__timeline {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Disabled state for multi-track toggle when analysis not done */
+.ve-multitrack-toggle__btn--disabled {
+  opacity: 0.4;
+  pointer-events: none;
+  cursor: not-allowed;
+}
+
+/* Active small button styles */
+.ve-btn--active {
+  background: rgba(10, 132, 255, 0.1) !important;
+  color: var(--ve-accent) !important;
+  border-color: rgba(10, 132, 255, 0.3) !important;
+}
+
+.ve-btn--export {
+  background: var(--ve-accent) !important;
+  color: #fff !important;
+  border: none !important;
+  font-weight: 600;
+}
+.ve-btn--export:hover {
+  background: var(--ve-accent-hover) !important;
+}
+
+.ve-btn--small {
+  padding: 4px 10px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 5px;
+  border: 1px solid var(--ve-chrome-border);
+  background: var(--ve-track-bg);
+  color: var(--ve-text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.ve-btn--small:hover {
+  background: var(--ve-btn-hover);
+  color: var(--ve-text);
+}
+
+/* ── Multi-track timeline canvas ────────────────────── */
+
+.ve-multi-timeline {
+  height: 100%;
+  min-height: 280px;
+  display: flex;
+  flex-direction: column;
+}
+
+.ve-multi-timeline__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: var(--ve-track-bg);
+  border-bottom: 1px solid var(--ve-chrome-border);
+  flex-shrink: 0;
+}
+
+.ve-multi-timeline__zoom-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 80px;
+  height: 3px;
+  background: var(--ve-slider-track);
+  border-radius: 2px;
+  outline: none;
+  border: none;
+  cursor: pointer;
+  margin: 0;
+  padding: 0;
+}
+.ve-multi-timeline__zoom-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--ve-text);
+  cursor: pointer;
+  border: none;
+  margin-top: -3.5px;
+}
+
+.ve-multi-timeline__canvas {
+  flex: 1;
+  display: block;
+  touch-action: none;
+  min-height: 100px;
+}
+
+.ve-btn--active-snap {
+  background: rgba(10, 132, 255, 0.08);
+  color: var(--ve-accent);
+}
+
+.ve-multi-timeline__context-menu {
+  position: absolute;
+  background: var(--ve-dropdown-bg);
+  border: 1px solid var(--ve-chrome-border);
+  border-radius: 6px;
+  padding: 4px;
+  z-index: 20;
+  min-width: 120px;
+  box-shadow: var(--ve-dropdown-shadow);
+  backdrop-filter: blur(20px) saturate(1.8);
+  -webkit-backdrop-filter: blur(20px) saturate(1.8);
+}
+
+.ve-multi-timeline__context-menu button {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  background: transparent;
+  color: var(--ve-text);
+  font-size: 11px;
+  text-align: left;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.1s ease;
+}
+.ve-multi-timeline__context-menu button:hover {
+  background: var(--ve-btn-hover);
+}
+
+/* ── Media Uploader ─────────────────────────────────── */
+
+.ve-media-uploader {
+  padding: 8px;
+}
+.ve-media-uploader--compact {
+  padding: 4px;
+}
+
+.ve-media-uploader__add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  background: var(--accent-cyan-dim, rgba(10, 132, 255, 0.1));
+  color: var(--accent-cyan, #0A84FF);
+  border: 1px solid var(--accent-cyan, #0A84FF);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.ve-media-uploader__add-btn:hover {
+  background: rgba(10, 132, 255, 0.18);
+}
+
+.ve-media-uploader__dropzone {
+  border: 2px dashed var(--ve-chrome-border);
+  border-radius: 6px;
+  padding: 16px 12px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: transparent;
+}
+.ve-media-uploader__dropzone:hover,
+.ve-media-uploader__dropzone--active {
+  border-color: var(--ve-accent);
+  background: rgba(10, 132, 255, 0.04);
+}
+
+.ve-media-uploader__dropzone-icon {
+  display: block;
+  font-size: 20px;
+  color: var(--ve-text-muted);
+  margin-bottom: 4px;
+}
+
+.ve-media-uploader__dropzone-text {
+  display: block;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ve-text);
+  margin-bottom: 2px;
+}
+
+.ve-media-uploader__dropzone-hint {
+  display: block;
+  font-size: 9px;
+  color: var(--ve-text-muted);
+}
+
+.ve-media-uploader__progress {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 4px 6px;
+  background: var(--ve-track-bg);
+  border-radius: 4px;
+}
+
+.ve-media-uploader__progress-name {
+  font-size: 9px;
+  color: var(--ve-text-muted);
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ve-media-uploader__progress-bar {
+  flex: 1;
+  height: 3px;
+  background: var(--ve-slider-track);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.ve-media-uploader__progress-fill {
+  height: 100%;
+  background: var(--ve-accent);
+  border-radius: 2px;
+  transition: width 0.2s ease;
+}
+
+.ve-media-uploader__progress-pct {
+  font-size: 9px;
+  font-family: var(--font-mono, monospace);
+  color: var(--ve-text-muted);
+  min-width: 28px;
+  text-align: right;
+}
+
+.ve-media-uploader__error {
+  margin-top: 6px;
+  padding: 4px 8px;
+  background: rgba(255, 59, 48, 0.08);
+  color: #FF3B30;
+  font-size: 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.ve-media-uploader__library {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(70px, 1fr));
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.ve-media-uploader__item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 4px;
+  border: 1px solid var(--ve-chrome-border);
+  border-radius: 4px;
+  cursor: grab;
+  transition: all 0.15s ease;
+  position: relative;
+}
+.ve-media-uploader__item-delete {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 16px;
+  height: 16px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 55, 95, 0.8);
+  color: #fff;
+  font-size: 9px;
+  line-height: 1;
+  cursor: pointer;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.ve-media-uploader__item:hover .ve-media-uploader__item-delete {
+  display: flex;
+}
+.ve-media-uploader__item:hover {
+  background: var(--ve-btn-hover);
+  border-color: var(--ve-accent);
+}
+
+.ve-media-uploader__thumb {
+  width: 60px;
+  height: 36px;
+  object-fit: cover;
+  border-radius: 3px;
+}
+.ve-media-uploader__thumb--placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--ve-track-bg);
+  font-size: 16px;
+}
+
+.ve-media-uploader__item-name {
+  font-size: 8px;
+  color: var(--ve-text-muted);
+  max-width: 60px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 2px;
+}
+
+/* ── Properties Panel ───────────────────────────────── */
+
+.ve-properties {
+  padding: 8px;
+}
+.ve-properties--empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+}
+.ve-properties--compact {
+  padding: 4px;
+}
+
+.ve-properties__placeholder {
+  font-size: 10px;
+  color: var(--ve-text-muted);
+  text-align: center;
+}
+
+.ve-properties__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.ve-properties__type-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-radius: 3px;
+  color: #fff;
+}
+.ve-properties__type-badge[data-type="video"] { background: #3B82F6; }
+.ve-properties__type-badge[data-type="audio"] { background: #10B981; }
+.ve-properties__type-badge[data-type="text"] { background: #EC4899; }
+.ve-properties__type-badge[data-type="image"],
+.ve-properties__type-badge[data-type="overlay"] { background: #F59E0B; }
+.ve-properties__type-badge[data-type="shape"] { background: #F97316; }
+.ve-properties__type-badge[data-type="subtitle"] { background: #8B5CF6; }
+
+.ve-properties__delete {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: var(--ve-text-muted);
+  font-size: 11px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.ve-properties__delete:hover {
+  background: rgba(255, 59, 48, 0.1);
+  color: #FF3B30;
+}
+
+.ve-properties__section {
+  margin-bottom: 10px;
+}
+
+.ve-properties__label {
+  display: block;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ve-text-muted);
+  margin-bottom: 4px;
+}
+
+.ve-properties__row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ve-properties__field {
+  flex: 1;
+  min-width: 50px;
+}
+
+.ve-properties__field-label {
+  display: block;
+  font-size: 8px;
+  color: var(--ve-text-muted);
+  margin-bottom: 1px;
+}
+
+.ve-properties__field-value {
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--ve-text);
+}
+
+.ve-properties__input {
+  width: 100%;
+  padding: 3px 6px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  background: var(--ve-track-bg);
+  border: 1px solid var(--ve-track-border);
+  border-radius: 3px;
+  color: var(--ve-text);
+  outline: none;
+}
+.ve-properties__input:focus {
+  border-color: var(--ve-accent);
+}
+
+.ve-properties__slider-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ve-properties__slider {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  height: 3px;
+  background: var(--ve-slider-track);
+  border-radius: 2px;
+  outline: none;
+  border: none;
+  cursor: pointer;
+  margin: 0;
+  padding: 0;
+}
+.ve-properties__slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--ve-accent);
+  cursor: pointer;
+  border: none;
+  margin-top: -3.5px;
+}
+.ve-properties__slider::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--ve-accent);
+  cursor: pointer;
+  border: none;
+}
+
+.ve-properties__slider-value {
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--ve-text-muted);
+  min-width: 38px;
+  text-align: right;
+}
+.ve-properties__slider-value--clickable {
+  cursor: text;
+  border-radius: 3px;
+  padding: 1px 3px;
+  transition: background 0.15s;
+}
+.ve-properties__slider-value--clickable:hover {
+  background: var(--ve-track-bg, rgba(0,0,0,0.08));
+  color: var(--ve-text);
+}
+.ve-properties__slider-value--editing {
+  width: 48px;
+  padding: 1px 3px;
+  border: 1px solid var(--ve-accent, #0A84FF);
+  border-radius: 3px;
+  background: var(--ve-chrome, #1a1a1a);
+  color: var(--ve-text);
+  outline: none;
+  -moz-appearance: textfield;
+}
+.ve-properties__slider-value--editing::-webkit-inner-spin-button,
+.ve-properties__slider-value--editing::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.ve-properties__speed-pills {
+  display: flex;
+  gap: 3px;
+  flex-wrap: wrap;
+}
+
+.ve-properties__speed-pill {
+  padding: 2px 6px;
+  font-size: 9px;
+  font-family: var(--font-mono, monospace);
+  font-weight: 500;
+  border: 1px solid var(--ve-track-border);
+  background: var(--ve-track-bg);
+  color: var(--ve-text-muted);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.ve-properties__speed-pill:hover {
+  background: var(--ve-btn-hover);
+  color: var(--ve-text);
+}
+.ve-properties__speed-pill--active {
+  background: var(--ve-accent);
+  color: #fff;
+  border-color: var(--ve-accent);
+  font-weight: 600;
+}
+
+.ve-properties__preset-btn {
+  width: 100%;
+  padding: 6px 10px;
+  font-size: 10px;
+  font-weight: 600;
+  background: var(--ve-accent, #0A84FF);
+  color: #fff;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+.ve-properties__preset-btn:hover {
+  opacity: 0.85;
+}
+
+.ve-properties__textarea {
+  width: 100%;
+  padding: 4px 6px;
+  font-size: 11px;
+  font-family: var(--font-sans);
+  background: var(--ve-track-bg);
+  border: 1px solid var(--ve-track-border);
+  border-radius: 4px;
+  color: var(--ve-text);
+  outline: none;
+  resize: vertical;
+  min-height: 40px;
+}
+.ve-properties__textarea:focus {
+  border-color: var(--ve-accent);
+}
+
+/* ── Responsive: multi-track ────────────────────────── */
+
+@media (max-width: 767px) {
+  .ve-multitrack__content {
+    flex-direction: column;
+  }
+  .ve-multitrack__sidebar {
+    width: 100%;
+    max-width: none;
+    max-height: 120px;
+    border-right: none;
+    border-bottom: 1px solid var(--ve-chrome-border);
+  }
+  .ve-multitrack__sidebar--right {
+    border-left: none;
+    border-top: 1px solid var(--ve-chrome-border);
+    width: 100%;
+    max-width: none;
+    max-height: 50vh;
+  }
+  .ve-multitrack-toggle {
+    flex-wrap: wrap;
+  }
+  .ve-multitrack__toolbar {
+    overflow-x: auto;
+  }
+  .ve-multitrack__toolbar-actions {
+    margin-left: 0;
+  }
+  /* Timeline: horizontal scroll for narrow screens */
+  .ve-multitrack__timeline {
+    min-height: 120px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  /* Touch-friendly toggle buttons */
+  .ve-multitrack-toggle__btn {
+    min-height: 36px;
+    padding: 6px 10px;
+    font-size: 11px;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   NEW COMPONENTS — Video Editor Upgrade
+   ═══════════════════════════════════════════════════════ */
+
+/* ── Canvas Viewport ─────────────────────────────────── */
+.ve-viewport canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.ve-viewport--canvas {
+  position: relative;
+  background: #000;
+  overflow: hidden;
+}
+
+.ve-viewport__hidden-video {
+  position: absolute;
+  top: -9999px;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* ── ToolBar ─────────────────────────────────────────── */
+.ve-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 8px;
+  background: var(--ve-chrome-bg);
+  border-bottom: 1px solid var(--ve-chrome-border);
+  min-height: 34px;
+}
+
+.ve-toolbar--compact {
+  padding: 2px 4px;
+  min-height: 28px;
+}
+
+.ve-toolbar__btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--ve-text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  transition: all 0.15s ease;
+  min-height: 28px;
+}
+
+.ve-toolbar__btn:hover {
+  background: var(--ve-btn-hover);
+  color: var(--ve-text);
+}
+
+.ve-toolbar__btn--active {
+  background: var(--ve-accent);
+  color: #fff;
+  border-color: var(--ve-accent);
+}
+
+.ve-toolbar__label {
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.ve-toolbar__divider {
+  width: 1px;
+  height: 20px;
+  background: var(--ve-chrome-border);
+  margin: 0 4px;
+}
+
+/* ── Effects Panel ───────────────────────────────────── */
+.ve-effects {
+  padding: 8px;
+}
+
+.ve-effects--empty {
+  padding: 16px;
+  text-align: center;
+}
+
+.ve-effects__placeholder {
+  font-size: 11px;
+  color: var(--ve-text-muted);
+}
+
+.ve-effects__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.ve-effects__title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ve-text);
+}
+
+.ve-effects__reset {
+  font-size: 10px;
+  color: var(--ve-accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.ve-effects__reset:hover {
+  background: var(--ve-btn-hover);
+}
+
+.ve-effects__control {
+  margin-bottom: 6px;
+}
+
+.ve-effects__control-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 2px;
+}
+
+.ve-effects__label {
+  font-size: 10px;
+  color: var(--ve-text-muted);
+}
+
+.ve-effects__value {
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--ve-text);
+  min-width: 40px;
+  text-align: right;
+}
+
+.ve-effects__slider {
+  width: 100%;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  border-radius: 2px;
+  cursor: pointer;
+  outline: none;
+}
+
+.ve-effects__slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid var(--ve-accent);
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+
+/* ── Transition Picker ───────────────────────────────── */
+.ve-transition-picker {
+  padding: 8px;
+  background: var(--ve-dropdown-bg);
+  border-radius: 8px;
+  border: 1px solid var(--ve-chrome-border);
+  box-shadow: var(--ve-dropdown-shadow);
+  min-width: 200px;
+}
+
+.ve-transition-picker__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.ve-transition-picker__title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--ve-text);
+}
+
+.ve-transition-picker__close {
+  background: none;
+  border: none;
+  color: var(--ve-text-muted);
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.ve-transition-picker__grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.ve-transition-picker__item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 4px;
+  background: var(--ve-track-bg);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.ve-transition-picker__item:hover {
+  background: var(--ve-btn-hover);
+}
+
+.ve-transition-picker__item--active {
+  background: rgba(10, 132, 255, 0.1);
+  border-color: var(--ve-accent);
+}
+
+.ve-transition-picker__icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.ve-transition-picker__label {
+  font-size: 8px;
+  color: var(--ve-text-muted);
+  text-align: center;
+}
+
+.ve-transition-picker__duration {
+  border-top: 1px solid var(--ve-chrome-border);
+  padding-top: 6px;
+}
+
+.ve-transition-picker__dur-label {
+  font-size: 10px;
+  color: var(--ve-text-muted);
+  margin-bottom: 4px;
+  display: block;
+}
+
+.ve-transition-picker__dur-pills {
+  display: flex;
+  gap: 3px;
+}
+
+.ve-transition-picker__dur-pill {
+  padding: 2px 8px;
+  font-size: 10px;
+  background: var(--ve-track-bg);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--ve-text);
+}
+
+.ve-transition-picker__dur-pill--active {
+  background: var(--ve-accent);
+  color: #fff;
+}
+
+/* ── Export Dialog ────────────────────────────────────── */
+.ve-export-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--ve-dropdown-bg);
+  border: 1px solid var(--ve-chrome-border);
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0,0,0,0.3);
+  padding: 20px;
+  min-width: 360px;
+  max-width: 440px;
+  z-index: 10000;
+  backdrop-filter: blur(20px);
+}
+
+.ve-export-dialog__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.ve-export-dialog__title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--ve-text);
+}
+
+.ve-export-dialog__close {
+  background: none;
+  border: none;
+  color: var(--ve-text-muted);
+  cursor: pointer;
+  font-size: 18px;
+  padding: 4px;
+}
+
+.ve-export-dialog__mode {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.ve-export-dialog__mode-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--ve-track-bg);
+  border: 1px solid var(--ve-chrome-border);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ve-text);
+  transition: all 0.15s ease;
+}
+
+.ve-export-dialog__mode-btn--active {
+  background: rgba(10, 132, 255, 0.1);
+  border-color: var(--ve-accent);
+  color: var(--ve-accent);
+}
+
+.ve-export-dialog__mode-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.ve-export-dialog__quality {
+  margin-bottom: 12px;
+}
+
+.ve-export-dialog__label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--ve-text-muted);
+  margin-bottom: 6px;
+  display: block;
+}
+
+.ve-export-dialog__quality-pills {
+  display: flex;
+  gap: 4px;
+}
+
+.ve-export-dialog__quality-pill {
+  flex: 1;
+  padding: 6px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--ve-track-bg);
+  border: 1px solid var(--ve-chrome-border);
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--ve-text);
+  transition: all 0.15s ease;
+}
+
+.ve-export-dialog__quality-pill--active {
+  background: var(--ve-accent);
+  color: #fff;
+  border-color: var(--ve-accent);
+}
+
+.ve-export-dialog__info {
+  font-size: 11px;
+  color: var(--ve-text-muted);
+  margin-bottom: 12px;
+  line-height: 1.5;
+}
+
+.ve-export-dialog__info p {
+  margin: 0;
+}
+
+.ve-export-dialog__progress {
+  margin-bottom: 12px;
+}
+
+.ve-export-dialog__progress-bar {
+  height: 6px;
+  background: var(--ve-slider-track);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+
+.ve-export-dialog__progress-fill {
+  height: 100%;
+  background: var(--ve-accent);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.ve-export-dialog__progress-text {
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--ve-text-muted);
+}
+
+.ve-export-dialog__error {
+  padding: 8px;
+  background: rgba(255, 59, 48, 0.1);
+  border: 1px solid rgba(255, 59, 48, 0.2);
+  border-radius: 6px;
+  font-size: 11px;
+  color: #FF3B30;
+  margin-bottom: 12px;
+}
+
+.ve-export-dialog__actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.ve-export-dialog__btn {
+  padding: 8px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 8px;
+  cursor: pointer;
+  border: none;
+  transition: all 0.15s ease;
+}
+
+.ve-export-dialog__btn--primary {
+  background: var(--ve-accent);
+  color: #fff;
+}
+
+.ve-export-dialog__btn--primary:hover {
+  background: var(--ve-accent-hover);
+}
+
+.ve-export-dialog__btn--secondary {
+  background: var(--ve-track-bg);
+  color: var(--ve-text);
+  border: 1px solid var(--ve-chrome-border);
+}
+
+.ve-export-dialog__btn--cancel {
+  background: rgba(255, 59, 48, 0.1);
+  color: #FF3B30;
+  border: 1px solid rgba(255, 59, 48, 0.2);
+}
+
+/* ── Export Dialog Backdrop ───────────────────────────── */
+.ve-export-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 9999;
+  backdrop-filter: blur(4px);
+}
+
+/* ── Properties Panel additions ───────────────────────── */
+.ve-properties__select {
+  width: 100%;
+  padding: 3px 6px;
+  font-size: 11px;
+  background: var(--ve-track-bg);
+  border: 1px solid var(--ve-track-border);
+  border-radius: 4px;
+  color: var(--ve-text);
+  outline: none;
+  cursor: pointer;
+}
+
+.ve-properties__select:focus {
+  border-color: var(--ve-accent);
+}
+.ve-properties__select option {
+  background: var(--ve-dropdown-bg, #fff);
+  color: var(--ve-text);
+}
+
+.ve-properties__color {
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  border: 2px solid var(--ve-track-border);
+  border-radius: 4px;
+  cursor: pointer;
+  background: none;
+}
+
+/* ── Multi-track timeline additions ──────────────────── */
+.ve-multi-timeline__add-track-dropdown {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  background: var(--ve-dropdown-bg);
+  border: 1px solid var(--ve-chrome-border);
+  border-radius: 8px;
+  box-shadow: var(--ve-dropdown-shadow);
+  z-index: 100;
+  min-width: 140px;
+  padding: 4px;
+}
+
+.ve-multi-timeline__add-track-option {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 10px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--ve-text);
+  cursor: pointer;
+}
+
+.ve-multi-timeline__add-track-option:hover {
+  background: var(--ve-btn-hover);
+}
+
+/* ── Track Header Controls (visibility/mute/lock toggles) ─── */
+.ve-multi-timeline__track-header {
+  box-sizing: border-box;
+}
+.ve-multi-timeline__track-ctrl {
+  transition: opacity 0.15s ease;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+}
+.ve-multi-timeline__track-ctrl:hover {
+  opacity: 1 !important;
+  background: rgba(255,255,255,0.08);
+}
+
+/* ── Editor Layout (NLE-style) ───────────────────────── */
+.ve-editor-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.ve-editor-main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.ve-editor-viewport-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ve-editor-sidebar {
+  width: 260px;
+  min-width: 200px;
+  max-width: 320px;
+  border-left: 1px solid var(--ve-chrome-border);
+  background: var(--ve-chrome-bg);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.ve-editor-sidebar__tabs {
+  display: flex;
+  border-bottom: 1px solid var(--ve-chrome-border);
+}
+
+.ve-editor-sidebar__tab {
+  flex: 1;
+  padding: 6px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  text-align: center;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--ve-text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.ve-editor-sidebar__tab--active {
+  color: var(--ve-accent);
+  border-bottom-color: var(--ve-accent);
+}
+
+.ve-editor-sidebar__tab:hover {
+  color: var(--ve-text);
+}
+
+/* ── Export button in controls ────────────────────────── */
+.ve-export-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background: var(--ve-accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.ve-export-btn:hover {
+  background: var(--ve-accent-hover);
+}
+
+/* ── Responsive additions ────────────────────────────── */
+@media (max-width: 767px) {
+  .ve-editor-sidebar {
+    display: none;
+  }
+  .ve-toolbar {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .ve-toolbar__label {
+    display: none;
+  }
+  .ve-export-dialog {
+    min-width: auto;
+    width: calc(100% - 32px);
+    max-width: 400px;
+  }
+}

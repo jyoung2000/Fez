@@ -1,0 +1,37 @@
+# GPU override — use: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+      - GPU_ACCELERATION_ENABLED=true
+      # ClipAI v4 universal reframing: enable all editorial signals by default.
+      - CLIPAI_ANIME_ANCHOR=1
+      - CLIPAI_MUSIC_BEAT_SNAP=1
+      - CLIPAI_GAMEPLAY_TRACKER=1
+      - CLIPAI_EDITORIAL_PRIOR=1
+      - CLIPAI_THIRDS_BIAS=1
+      - CLIPAI_GAZE_LEAD_ROOM_V2=1
+    devices:
+      # Intel/AMD VA-API support (passthrough DRI devices)
+      - /dev/dri:/dev/dri
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute]
+
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, compute]

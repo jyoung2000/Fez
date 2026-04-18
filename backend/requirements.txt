@@ -1,0 +1,38 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+python-multipart>=0.0.18
+websockets==12.0
+pydantic>=2.7.2,<3.0.0
+pydantic-settings>=2.5.2
+httpx==0.27.2
+# Fernet encryption for cloud storage OAuth tokens at rest. See
+# backend/app/cloud/crypto.py and docs/cloud-storage/RECON.md.
+cryptography>=42.0.0
+openai==1.35.0
+anthropic==0.28.0
+google-generativeai==0.8.0
+groq==0.9.0
+ollama==0.2.0
+faster-whisper==1.1.0
+aiofiles==23.2.1
+python-dotenv==1.0.1
+Pillow==10.3.0
+fonttools[woff]==4.51.0
+psutil>=5.9.0
+# mediapipe installed separately in Dockerfile (protobuf conflict with torch/pyannote)
+numpy>=1.24.0
+scipy>=1.10.0
+opencv-python-headless>=4.8.0
+# v4.1: ultralytics (YOLOv8n) backend for object_detector /
+# person_detector. Without this, PersonDetector silently falls back to
+# backend=none → person_body anchor source produces 0 anchors on
+# faceless frames and the camera drifts onto background motion.
+ultralytics>=8.0.0
+mcp>=1.8.0
+pyannote.audio>=3.1.0
+torch>=2.0.0
+# ArcFace (InsightFace buffalo_s) for identity embeddings.
+# CPU-only via onnxruntime — must not compete with Whisper/Ollama on the GPU.
+# Enabled via CLIPAI_FACE_EMBEDDING=arcface (default: sface).
+insightface==0.7.3
+onnxruntime>=1.17.0

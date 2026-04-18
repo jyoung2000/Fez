@@ -1,0 +1,17 @@
+__pycache__/
+node_modules/
+frontend/dist/
+data/
+# Downloaded model weights (YuNet face detector, etc.)
+backend/models/*.onnx
+
+# Week 3 real-content clip cache + extraction cache. The manifest
+# at tests/real_content/manifest.json pins sha256 hashes; clips are
+# pulled via tests/real_content/fetch.sh into
+# $CLIPAI_REAL_CONTENT_CACHE (default /var/cache/clipai/real_content).
+tests/real_content/*.mp4
+tests/real_content/*.mov
+tests/real_content/*.mkv
+tests/real_content/*.webm
+tests/real_content/extraction_cache/
+tests/real_content/ground_truth/

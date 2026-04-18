@@ -1,0 +1,113 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    container_name: clipai-app
+    restart: unless-stopped
+    ports:
+      - "1353:1353"
+    volumes:
+      - ./data/uploads:/data/uploads
+      - ./data/outputs:/data/outputs
+      - ./data/logs:/data/logs
+      - ./data/fonts:/data/fonts
+      # Persist user accounts + sessions + per-user settings across container
+      # restarts. Without this mount the auth store (users.json, sessions.json,
+      # and user_settings/*.json) lives only in the ephemeral container layer,
+      # so every restart wipes the head admin's UUID and the ``owner_user_id``
+      # / ``exported_by_user_id`` stamps on persisted jobs no longer resolve —
+      # causing generated clips and exports to disappear from the current
+      # user's view even though the underlying job files survive.
+      - ./data/auth:/data/auth
+      - whisper_models:/root/.cache/huggingface
+    environment:
+      - PYTHONUNBUFFERED=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+      # Tell PyTorch to release memory back to OS aggressively.
+      # Without this, torch caches 1.6GB+ VRAM after Whisper, starving Ollama.
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.6
+      # ClipAI v4 universal reframing: enable all editorial signals by default.
+      - CLIPAI_ANIME_ANCHOR=1
+      - CLIPAI_MUSIC_BEAT_SNAP=1
+      - CLIPAI_GAMEPLAY_TRACKER=1
+      - CLIPAI_EDITORIAL_PRIOR=1
+      - CLIPAI_THIRDS_BIAS=1
+      - CLIPAI_GAZE_LEAD_ROOM_V2=1
+    # Enable GPU passthrough when NVIDIA Container Toolkit is installed.
+    # If no GPU is available, the container still starts normally on CPU.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute]
+    env_file:
+      - path: .env
+        required: false
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1353/api/jobs"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: clipai-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OLLAMA_KEEP_ALIVE=30s
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_NUM_PARALLEL=1
+      # Force Ollama to use all available GPU layers
+      - OLLAMA_GPU_LAYERS=-1
+      # Set VRAM budget to leave headroom (GTX 1650 = 4GB, reserve 1GB for system/CUDA overhead)
+      # The compute graph allocation (~300MB) must fit on top of weights + KV cache.
+      # With 3.0GB budget: weights(1.8GB) + KV(38MB) + compute(300MB) = 2.14GB fits.
+      - OLLAMA_MAX_VRAM=3221225472
+      # Enable flash attention for memory efficiency
+      - OLLAMA_FLASH_ATTENTION=1
+      # Reduce KV cache to fit in VRAM
+      - OLLAMA_KV_CACHE_TYPE=q8_0
+      # Increase GPU discovery timeout (default 30s can fail on slow CUDA init)
+      - OLLAMA_LOAD_TIMEOUT=5m
+      # DO NOT set CUDA_VISIBLE_DEVICES here — it causes intermittent GPU
+      # discovery failures. The NVIDIA Container Toolkit handles device
+      # mapping via NVIDIA_VISIBLE_DEVICES=all + deploy.resources.
+      # Help Ollama find CUDA libraries faster (prevents GPU discovery timeout)
+      - LD_LIBRARY_PATH=/usr/lib/ollama/cuda_v12:/usr/local/cuda/lib64
+    # Enable GPU passthrough so Ollama can use NVIDIA GPUs for inference.
+    # Without this, models run on CPU (~30x slower for vision).
+    # If no GPU is available, the container still starts normally on CPU.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, compute]
+    # Add CPU quota to fix the cgroup parsing warning
+    cpus: '4.0'
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 8
+      start_period: 45s
+
+
+volumes:
+  ollama_models:
+  whisper_models:

@@ -1,0 +1,100 @@
+{
+  "fps": 30.0,
+  "ground_truth_changes": 9,
+  "detected_changes": 9,
+  "missed_changes": 0,
+  "per_change": [
+    {
+      "ground_truth_time": 2.0,
+      "from_slot": 0,
+      "to_slot": 1,
+      "crop_switch_time": 1.8,
+      "lag_seconds": -0.2,
+      "lag_frames": -6,
+      "status": "detected"
+    },
+    {
+      "ground_truth_time": 4.0,
+      "from_slot": 1,
+      "to_slot": 0,
+      "crop_switch_time": 3.8,
+      "lag_seconds": -0.2,
+      "lag_frames": -6,
+      "status": "detected"
+    },
+    {
+      "ground_truth_time": 6.0,
+      "from_slot": 0,
+      "to_slot": 1,
+      "crop_switch_time": 5.8,
+      "lag_seconds": -0.2,
+      "lag_frames": -6,
+      "status": "detected"
+    },
+    {
+      "ground_truth_time": 8.0,
+      "from_slot": 1,
+      "to_slot": 0,
+      "crop_switch_time": 7.8,
+      "lag_seconds": -0.2,
+      "lag_frames": -6,
+      "status": "detected"
+    },
+    {
+      "ground_truth_time": 10.0,
+      "from_slot": 0,
+      "to_slot": 1,
+      "crop_switch_time": 9.8,
+      "lag_seconds": -0.2,
+      "lag_frames": -6,
+      "status": "detected"
+    },
+    {
+      "ground_truth_time": 12.0,
+      "from_slot": 1,
+      "to_slot": 0,
+      "crop_switch_time": 11.8,
+      "lag_seconds": -0.2,
+      "lag_frames": -6,
+      "status": "detected"
+    },
+    {
+      "ground_truth_time": 14.0,
+      "from_slot": 0,
+      "to_slot": 1,
+      "crop_switch_time": 13.8,
+      "lag_seconds": -0.2,
+      "lag_frames": -6,
+      "status": "detected"
+    },
+    {
+      "ground_truth_time": 16.0,
+      "from_slot": 1,
+      "to_slot": 0,
+      "crop_switch_time": 15.8,
+      "lag_seconds": -0.2,
+      "lag_frames": -6,
+      "status": "detected"
+    },
+    {
+      "ground_truth_time": 18.0,
+      "from_slot": 0,
+      "to_slot": 1,
+      "crop_switch_time": 17.8,
+      "lag_seconds": -0.2,
+      "lag_frames": -6,
+      "status": "detected"
+    }
+  ],
+  "sub_second_switch_recall": {
+    "expected_switches": 4,
+    "detected_switches": 4,
+    "recall_pct": 100.0
+  },
+  "overlap_count": 0,
+  "summary": {
+    "avg_lag_frames": 6.0,
+    "max_lag_frames": 6,
+    "min_lag_frames": 6
+  }
+}

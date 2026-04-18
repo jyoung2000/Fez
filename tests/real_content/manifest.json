@@ -1,0 +1,152 @@
+{
+  "schema": 1,
+  "notes": "Week 3 real-content bench set. Clips are NOT committed to the repo — the fetcher pulls them into a homelab cache directory and pins the sha256. Each entry names its target ClipContentType so the harness can assert the classifier lands on the right row. Source URLs are placeholders; Jalon fills these in with his own archive paths before running fetch.sh for the first time. After the first successful fetch, copy the 'new sha256' lines emitted by fetch.sh on stderr back into this file to pin the entries.",
+  "cache_dir_env": "CLIPAI_REAL_CONTENT_CACHE",
+  "cache_dir_default": "/var/cache/clipai/real_content",
+  "clips": [
+    {
+      "slug": "panel_verzuz_tank_tyrese_10s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 10,
+      "content_type": "debate",
+      "subtype": null,
+      "target_clipcontenttype": "multi_speaker_panel",
+      "description": "4-seat Verzuz-style panel, steady wide source, moderate speaker changes. Stress test for the panel short-shot override and the editorial J/L cut anticipation.",
+      "ground_truth_vertical_url": null
+    },
+    {
+      "slug": "panel_joebudden_10s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 10,
+      "content_type": "podcast",
+      "subtype": null,
+      "target_clipcontenttype": "multi_speaker_panel",
+      "description": "4-seat table, static camera, speaker changes every 2-4s. Baseline for the MULTI_SPEAKER_PANEL hold distribution.",
+      "ground_truth_vertical_url": null
+    },
+    {
+      "slug": "panel_breakfast_club_10s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 10,
+      "content_type": "podcast",
+      "subtype": null,
+      "target_clipcontenttype": "multi_speaker_panel",
+      "description": "3-host panel with occasional B-roll cutaways. Tests the short-shot override gate when opencv-fallback flicker shots would otherwise trip it.",
+      "ground_truth_vertical_url": null
+    },
+    {
+      "slug": "anime_fate_stay_night_fight_15s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 15,
+      "content_type": "anime",
+      "subtype": "action",
+      "target_clipcontenttype": "animation",
+      "description": "Saber vs. Archer — 6-8 frame cuts, stylized line art, motion blur. Stress test for the Week 2 anime shot detector (histogram + edge-density) and the anime face cascade augmentation.",
+      "ground_truth_vertical_url": null
+    },
+    {
+      "slug": "anime_demon_slayer_fight_15s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 15,
+      "content_type": "anime",
+      "subtype": "action",
+      "target_clipcontenttype": "animation",
+      "description": "Tanjiro water-breathing sequence — particle effects, rapid camera pushes. Tests whether the anime anchor's impact-frame detection lands on the wind-up, not the blur.",
+      "ground_truth_vertical_url": null
+    },
+    {
+      "slug": "anime_jujutsu_kaisen_dialogue_15s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 15,
+      "content_type": "anime",
+      "subtype": "dialogue",
+      "target_clipcontenttype": "animation_dialogue",
+      "description": "2-shot dialogue, over-shoulder coverage. Baseline for the ANIMATION_DIALOGUE tuning path (no wide_master_on_multi_face).",
+      "ground_truth_vertical_url": null
+    },
+    {
+      "slug": "sports_nba_fastbreak_20s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 20,
+      "content_type": "sports",
+      "subtype": "basketball",
+      "target_clipcontenttype": "sports_basketball",
+      "description": "Broadcast-style fastbreak with ball passes. Stress test for the Week 2 sports subtype auto-promotion from COCO ball detections and the ball-tracking required-region branch.",
+      "ground_truth_vertical_url": null
+    },
+    {
+      "slug": "sports_f1_onboard_20s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 20,
+      "content_type": "sports",
+      "subtype": "racing",
+      "target_clipcontenttype": "sports_racing",
+      "description": "Onboard F1 lap — car mostly static in frame, background flies by. Tests the racing lower-third cy clamp and the car-tracking required-region branch.",
+      "ground_truth_vertical_url": null
+    },
+    {
+      "slug": "sports_boxing_8s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 8,
+      "content_type": "sports",
+      "subtype": null,
+      "target_clipcontenttype": "sports",
+      "description": "Two-fighter static wide with camera micro-pans. Tests generic SPORTS routing (no sub-promotion; there's no ball and no car).",
+      "ground_truth_vertical_url": null
+    },
+    {
+      "slug": "music_mj_thriller_formation_15s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 15,
+      "content_type": "music_video",
+      "subtype": "performance",
+      "target_clipcontenttype": "music_video",
+      "description": "Zombie-formation dance break — strong downbeats, ~3 faces spanning 60% width. Primary real-content target for the Week 2 formation→downbeat snap (Stage 11 Pass C) and music-video performance auto-promotion.",
+      "ground_truth_vertical_url": null
+    },
+    {
+      "slug": "music_chris_brown_performance_15s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 15,
+      "content_type": "music_video",
+      "subtype": "performance",
+      "target_clipcontenttype": "music_video",
+      "description": "Ensemble dance routine, tight beat, multiple mid-shot formations. Secondary performance target — tests whether the formation density threshold (≥0.08) is tight enough.",
+      "ground_truth_vertical_url": null
+    },
+    {
+      "slug": "music_beyonce_solo_narrative_15s",
+      "source_url": "",
+      "sha256": "",
+      "ext": "mp4",
+      "duration_sec": 15,
+      "content_type": "music_video",
+      "subtype": "narrative",
+      "target_clipcontenttype": "music_video",
+      "description": "Single-subject narrative video with slower cuts — control case for the music-video path. Auto-promotion should NOT fire here (formation density too low).",
+      "ground_truth_vertical_url": null
+    }
+  ]
+}
