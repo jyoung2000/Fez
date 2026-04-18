@@ -11,11 +11,14 @@ import threading
 # preventing the main process from corrupting the CUDA driver state.
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
+
+from backend.app.auth.deps import get_current_user, require_job_access
+from backend.app.auth.models import User
 
 from backend.services.range_stream import parse_range_header, stream_file_range
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -594,8 +597,33 @@ if _symlinked:
 
 
 @app.get("/api/files/{job_id}/{path:path}")
-async def serve_file(job_id: str, path: str, request: Request):
-    """Serve video files and exported clips with range request support."""
+async def serve_file(
+    job_id: str,
+    path: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    """Serve video files and exported clips with range request support.
+
+    Every request is authenticated and checked against job ownership so
+    one user (admin or otherwise) can't read another's source video or
+    exported clips by guessing job IDs. The per-user media library
+    directories (``_library_{user_id}``) match by ownership name too
+    when ``job_id`` starts with the library sentinel.
+    """
+    # Per-user media library: ``_library_{user_id}`` directories are
+    # owned by the user in their name; any other user is rejected.
+    if job_id.startswith("_library_"):
+        suffix = job_id[len("_library_"):]
+        if suffix != user.id:
+            return Response(status_code=404, content="File not found")
+    elif job_id != "_library":
+        # For real jobs, verify ownership before serving any bytes.
+        await require_job_access(job_id, user)
+    else:
+        # Legacy unscoped ``_library`` — not owned by anyone; reject.
+        return Response(status_code=404, content="File not found")
+
     # Check uploads first, then outputs
     file_path = None
     candidates = [
