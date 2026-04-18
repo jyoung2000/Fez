@@ -3,6 +3,7 @@ import logging
 import logging.handlers
 import subprocess
 import threading
+import time
 
 # ── Prevent PyTorch from eagerly initializing CUDA in the main process ──
 # PyTorch's torch.cuda.is_available() triggers full CUDA initialization which
@@ -596,6 +597,31 @@ if _symlinked:
     logger.info("Symlinked %d system fonts into /data/fonts for FFmpeg fontsdir", _symlinked)
 
 
+# Short-lived cache of successful (user_id, job_id) access checks so
+# HTML5 <video> range requests during scrubbing don't re-load job.json
+# from disk on every seek. The real ownership check runs at least once
+# per minute; on cache miss the full require_job_access validates.
+_file_access_cache: dict[tuple[str, str], float] = {}
+_FILE_ACCESS_TTL = 60.0
+
+
+async def _fast_require_job_access(job_id: str, user: User) -> None:
+    """Cached wrapper around require_job_access for hot file-serving path."""
+    key = (user.id, job_id)
+    now = time.monotonic()
+    exp = _file_access_cache.get(key)
+    if exp is not None and exp > now:
+        return
+    await require_job_access(job_id, user)
+    _file_access_cache[key] = now + _FILE_ACCESS_TTL
+    # Opportunistic eviction — keep the dict bounded without needing a
+    # dedicated reaper thread. 4096 entries is plenty for concurrent
+    # users and evicts FIFO-ish (dict insertion order).
+    if len(_file_access_cache) > 4096:
+        for _k in list(_file_access_cache.keys())[:256]:
+            _file_access_cache.pop(_k, None)
+
+
 @app.get("/api/files/{job_id}/{path:path}")
 async def serve_file(
     job_id: str,
@@ -619,7 +645,8 @@ async def serve_file(
             return Response(status_code=404, content="File not found")
     elif job_id != "_library":
         # For real jobs, verify ownership before serving any bytes.
-        await require_job_access(job_id, user)
+        # Cached so range-heavy video playback doesn't hammer job.json.
+        await _fast_require_job_access(job_id, user)
     else:
         # Legacy unscoped ``_library`` — not owned by anyone; reject.
         return Response(status_code=404, content="File not found")
