@@ -471,10 +471,19 @@ def _key_is_set(key: str) -> bool:
 
 @router.get("/providers/status")
 async def provider_status(user: User = Depends(get_current_user)):
-    # Per-user: read from user's settings file, fall back to global.
+    # Per-user: read from user's settings file.  API keys are STRICT
+    # per-user (no fallback) so one user can never see another's key
+    # as "configured".  Model/preset selections fall back to env-var
+    # defaults from backend.config so an empty user gets sensible values.
     us = await read_user_settings(user.id)
 
-    def _us(key: str) -> str | bool | int:
+    # Strict: returns the user's value or "" (never leaks another user's key).
+    def _user_key(key: str) -> str:
+        val = us.get(key, "")
+        return val if isinstance(val, str) else ""
+
+    # Lenient: per-user override, else instance default from env-backed config.
+    def _user_pref(key: str):
         if key in us:
             return us[key]
         return getattr(settings, key, "")
@@ -498,14 +507,14 @@ async def provider_status(user: User = Depends(get_current_user)):
     except Exception as e:
         statuses["ollama"] = {"status": "offline", "error": str(e)}
 
-    # OpenRouter — per-user API key + model selections
-    or_key = _us("OPENROUTER_API_KEY")
+    # OpenRouter — STRICT per-user API key
+    or_key = _user_key("OPENROUTER_API_KEY")
     if _key_is_set(or_key):
-        preset_name = _us("OPENROUTER_PRESET") or "free"
+        preset_name = _user_pref("OPENROUTER_PRESET") or "free"
         preset = PRESETS.get(preset_name, PRESETS["free"])
-        vision_model = _us("OPENROUTER_VISION_MODEL") or preset["vision"]
-        text_model = _us("OPENROUTER_TEXT_MODEL") or preset["text"]
-        summary_model = _us("OPENROUTER_SUMMARY_MODEL") or text_model
+        vision_model = _user_pref("OPENROUTER_VISION_MODEL") or preset["vision"]
+        text_model = _user_pref("OPENROUTER_TEXT_MODEL") or preset["text"]
+        summary_model = _user_pref("OPENROUTER_SUMMARY_MODEL") or text_model
         statuses["openrouter"] = {
             "status": "configured",
             "preset": preset_name,
@@ -516,36 +525,29 @@ async def provider_status(user: User = Depends(get_current_user)):
     else:
         statuses["openrouter"] = {"status": "not_configured"}
 
-    # Anthropic — per-user key
-    if _key_is_set(_us("ANTHROPIC_API_KEY")):
-        statuses["anthropic"] = {"status": "configured"}
-    else:
-        statuses["anthropic"] = {"status": "not_configured"}
-
-    # Gemini — per-user key
-    if _key_is_set(_us("GEMINI_API_KEY")):
-        statuses["gemini"] = {"status": "configured"}
-    else:
-        statuses["gemini"] = {"status": "not_configured"}
-
-    # Groq — per-user key
-    if _key_is_set(_us("GROQ_API_KEY")):
-        statuses["groq"] = {"status": "configured"}
-    else:
-        statuses["groq"] = {"status": "not_configured"}
-
-    # HuggingFace — per-user token
-    hf_token = _us("HF_AUTH_TOKEN")
-    if hf_token and str(hf_token).strip():
+    # Anthropic / Gemini / Groq / HuggingFace — all STRICT per-user
+    statuses["anthropic"] = {
+        "status": "configured" if _key_is_set(_user_key("ANTHROPIC_API_KEY")) else "not_configured"
+    }
+    statuses["gemini"] = {
+        "status": "configured" if _key_is_set(_user_key("GEMINI_API_KEY")) else "not_configured"
+    }
+    statuses["groq"] = {
+        "status": "configured" if _key_is_set(_user_key("GROQ_API_KEY")) else "not_configured"
+    }
+    hf_token = _user_key("HF_AUTH_TOKEN")
+    if hf_token and hf_token.strip():
         statuses["huggingface"] = {"status": "configured", "message": "Token set"}
     else:
         statuses["huggingface"] = {"status": "not_configured", "message": "No HF token"}
 
-    # Determine the active provider and models based on fallback chain
-    chain_raw = _us("AI_FALLBACK_CHAIN")
-    chain = settings.active_provider_chain  # default
+    # Determine the active provider and models based on fallback chain.
+    # Chain is per-user preference; default still comes from env config.
+    chain_raw = us.get("AI_FALLBACK_CHAIN")
     if chain_raw and isinstance(chain_raw, str):
         chain = [p.strip() for p in chain_raw.split(",") if p.strip()]
+    else:
+        chain = settings.active_provider_chain
     active_provider = None
     active_vision_model = None
     active_text_model = None
@@ -560,8 +562,8 @@ async def provider_status(user: User = Depends(get_current_user)):
                 active_summary_model = info.get("summary_model", "")
                 active_text_model = info.get("text_model", "")
             elif name == "ollama":
-                active_vision_model = _us("OLLAMA_VISION_MODEL") or settings.OLLAMA_VISION_MODEL
-                active_text_model = _us("OLLAMA_TEXT_MODEL") or settings.OLLAMA_TEXT_MODEL
+                active_vision_model = _user_pref("OLLAMA_VISION_MODEL") or settings.OLLAMA_VISION_MODEL
+                active_text_model = _user_pref("OLLAMA_TEXT_MODEL") or settings.OLLAMA_TEXT_MODEL
                 active_summary_model = active_text_model
             elif name == "gemini":
                 active_vision_model = "gemini-2.5-flash"
@@ -577,13 +579,9 @@ async def provider_status(user: User = Depends(get_current_user)):
                 active_summary_model = "llama-3.1-8b-instant"
             break
 
-    whisper_model = _us("WHISPER_MODEL") or settings.WHISPER_MODEL
-    whisper_beam = _us("WHISPER_BEAM_SIZE")
-    if not isinstance(whisper_beam, int):
-        whisper_beam = settings.WHISPER_BEAM_SIZE
-    whisper_vad = _us("WHISPER_VAD_FILTER")
-    if not isinstance(whisper_vad, bool):
-        whisper_vad = settings.WHISPER_VAD_FILTER
+    whisper_model = _user_pref("WHISPER_MODEL") or settings.WHISPER_MODEL
+    whisper_beam = us.get("WHISPER_BEAM_SIZE", settings.WHISPER_BEAM_SIZE)
+    whisper_vad = us.get("WHISPER_VAD_FILTER", settings.WHISPER_VAD_FILTER)
 
     statuses["_active"] = {
         "provider": active_provider or "none",
@@ -593,7 +591,7 @@ async def provider_status(user: User = Depends(get_current_user)):
         "vision_model": active_vision_model or "",
         "summary_model": active_summary_model or "",
         "text_model": active_text_model or "",
-        "preset": (_us("OPENROUTER_PRESET") or settings.OPENROUTER_PRESET) if active_provider == "openrouter" else "",
+        "preset": (_user_pref("OPENROUTER_PRESET") or "") if active_provider == "openrouter" else "",
         "fallback_chain": chain,
         "ollama_enabled": "ollama" in chain,
     }
@@ -603,30 +601,30 @@ async def provider_status(user: User = Depends(get_current_user)):
 
 @router.post("/providers/test/{provider_name}")
 async def test_provider(provider_name: str, user: User = Depends(get_current_user)):
-    """Live-test a provider by making a real API call and returning detailed status."""
+    """Live-test a provider using the calling user's own API key."""
+    us = await read_user_settings(user.id)
 
     if provider_name == "openrouter":
-        return await _test_openrouter()
+        return await _test_openrouter(us.get("OPENROUTER_API_KEY", ""))
     elif provider_name == "ollama":
         return await _test_ollama()
     elif provider_name == "anthropic":
-        return await _test_anthropic()
+        return await _test_anthropic(us.get("ANTHROPIC_API_KEY", ""))
     elif provider_name == "gemini":
-        return await _test_gemini()
+        return await _test_gemini(us.get("GEMINI_API_KEY", ""))
     elif provider_name == "groq":
-        return await _test_groq()
+        return await _test_groq(us.get("GROQ_API_KEY", ""))
     elif provider_name == "huggingface":
-        return await _test_huggingface()
+        return await _test_huggingface(us.get("HF_AUTH_TOKEN", ""))
     else:
         return {"status": "error", "message": f"Unknown provider: {provider_name}"}
 
 
-async def _test_openrouter():
-    key = settings.OPENROUTER_API_KEY
+async def _test_openrouter(key: str = ""):
     if not _key_is_set(key):
         return {
             "status": "not_configured",
-            "message": "OPENROUTER_API_KEY is not set. Add it to your .env file.",
+            "message": "OPENROUTER_API_KEY is not set for your account. Add it on the AI Providers page.",
             "help": "Get a free key at https://openrouter.ai/keys",
         }
 
@@ -753,10 +751,9 @@ async def _test_ollama():
         }
 
 
-async def _test_anthropic():
-    key = settings.ANTHROPIC_API_KEY
+async def _test_anthropic(key: str = ""):
     if not _key_is_set(key):
-        return {"status": "not_configured", "message": "ANTHROPIC_API_KEY is not set."}
+        return {"status": "not_configured", "message": "ANTHROPIC_API_KEY is not set for your account."}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -782,10 +779,9 @@ async def _test_anthropic():
         return {"status": "error", "message": f"Connection failed: {str(e)[:200]}"}
 
 
-async def _test_gemini():
-    key = settings.GEMINI_API_KEY
+async def _test_gemini(key: str = ""):
     if not _key_is_set(key):
-        return {"status": "not_configured", "message": "GEMINI_API_KEY is not set."}
+        return {"status": "not_configured", "message": "GEMINI_API_KEY is not set for your account."}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -803,10 +799,9 @@ async def _test_gemini():
         return {"status": "error", "message": f"Connection failed: {str(e)[:200]}"}
 
 
-async def _test_groq():
-    key = settings.GROQ_API_KEY
+async def _test_groq(key: str = ""):
     if not _key_is_set(key):
-        return {"status": "not_configured", "message": "GROQ_API_KEY is not set."}
+        return {"status": "not_configured", "message": "GROQ_API_KEY is not set for your account."}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -828,12 +823,11 @@ async def _test_groq():
         return {"status": "error", "message": f"Connection failed: {str(e)[:200]}"}
 
 
-async def _test_huggingface():
-    token = settings.HF_AUTH_TOKEN
+async def _test_huggingface(token: str = ""):
     if not token or not token.strip():
         return {
             "status": "not_configured",
-            "message": "HF_AUTH_TOKEN is not set. Add your HuggingFace access token to enable pyannote speaker diarization.",
+            "message": "HF_AUTH_TOKEN is not set for your account. Add your HuggingFace access token on the AI Providers page.",
             "help": "Get a free token at https://huggingface.co/settings/tokens",
         }
     try:
@@ -1089,11 +1083,11 @@ def _upsert_env_var(env_path: str, var_name: str, value: str):
 async def recommended_models(user: User = Depends(get_current_user)):
     """Dynamically discover vision-capable models from OpenRouter and build recommendations."""
     us = await read_user_settings(user.id)
-    or_key = us.get("OPENROUTER_API_KEY") or settings.OPENROUTER_API_KEY
+    or_key = us.get("OPENROUTER_API_KEY") or ""
     if not _key_is_set(or_key):
         return {"models": [], "error": "OpenRouter API key not configured"}
 
-    all_models = await _fetch_openrouter_models()
+    all_models = await _fetch_openrouter_models(or_key)
     if all_models is None:
         return {"models": [], "error": "Failed to fetch models from OpenRouter"}
 
@@ -1260,9 +1254,15 @@ def _is_zero_cost(model_data: dict) -> bool:
         return False
 
 
-async def _fetch_openrouter_models() -> list | None:
-    """Fetch model list from OpenRouter, using cache if fresh."""
-    # Check cache first
+async def _fetch_openrouter_models(api_key: str = "") -> list | None:
+    """Fetch model list from OpenRouter, using cache if fresh.
+
+    ``api_key`` is the caller's per-user OpenRouter key — required; the model
+    listing is a free endpoint from OpenRouter's perspective but the cache
+    we write is shared across users (the catalog doesn't vary per account),
+    so we still read-through the cache for everyone.
+    """
+    # Check cache first — model catalog is the same for every user.
     if os.path.exists(MODEL_CACHE_PATH):
         try:
             with open(MODEL_CACHE_PATH, "r") as f:
@@ -1272,11 +1272,14 @@ async def _fetch_openrouter_models() -> list | None:
         except Exception:
             pass
 
+    if not _key_is_set(api_key):
+        return None
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(
                 "https://openrouter.ai/api/v1/models",
-                headers={"Authorization": f"Bearer {settings.OPENROUTER_API_KEY}"},
+                headers={"Authorization": f"Bearer {api_key}"},
             )
             resp.raise_for_status()
             models = resp.json().get("data", [])
@@ -1362,11 +1365,13 @@ async def list_models(user: User = Depends(get_current_user)):
         except Exception:
             pass
 
-    # Fetch from OpenRouter
-    if not _key_is_set(settings.OPENROUTER_API_KEY):
+    # Fetch from OpenRouter using the caller's key
+    us = await read_user_settings(user.id)
+    or_key = us.get("OPENROUTER_API_KEY") or ""
+    if not _key_is_set(or_key):
         return {"vision_models": [], "text_models": [], "cached": False}
 
-    models = await _fetch_openrouter_models()
+    models = await _fetch_openrouter_models(or_key)
     if models is None:
         return {"vision_models": [], "text_models": [], "cached": False}
 
@@ -1389,10 +1394,12 @@ async def refresh_models(user: User = Depends(get_current_user)):
         except Exception:
             pass
 
-    if not _key_is_set(settings.OPENROUTER_API_KEY):
+    us = await read_user_settings(user.id)
+    or_key = us.get("OPENROUTER_API_KEY") or ""
+    if not _key_is_set(or_key):
         return {"status": "error", "message": "OpenRouter API key not configured"}
 
-    models = await _fetch_openrouter_models()
+    models = await _fetch_openrouter_models(or_key)
     if models is None:
         return {"status": "error", "message": "Failed to fetch models from OpenRouter"}
 
@@ -1568,8 +1575,12 @@ async def available_models(user: User = Depends(get_current_user)):
     vision = []
     text = []
 
-    # Always add the OpenRouter free auto-router at the top
-    if _key_is_set(settings.OPENROUTER_API_KEY):
+    us = await read_user_settings(user.id)
+    or_key = us.get("OPENROUTER_API_KEY") or ""
+    has_or_key = _key_is_set(or_key)
+
+    # Always add the OpenRouter free auto-router at the top (if the user has a key)
+    if has_or_key:
         _auto_speed = _estimate_speed("openrouter/free", "vision", True)
         _auto = {
             "id": "openrouter/free", "name": "Free Auto-Router",
@@ -1581,8 +1592,8 @@ async def available_models(user: User = Depends(get_current_user)):
         vision.append(dict(_auto))
         text.append({**_auto, **_estimate_speed("openrouter/free", "text", True)})
 
-    # Fetch OpenRouter models
-    all_models = await _fetch_openrouter_models() if _key_is_set(settings.OPENROUTER_API_KEY) else None
+    # Fetch OpenRouter models using the caller's key
+    all_models = await _fetch_openrouter_models(or_key) if has_or_key else None
 
     if all_models:
         for m in all_models:
@@ -1623,8 +1634,8 @@ async def available_models(user: User = Depends(get_current_user)):
                          "desc": f"{'FREE' if is_free else f'~${t_cost:.3f}/hr'} — {ctx:,} ctx",
                          **t_speed})
 
-    # Add direct provider models if keys are set
-    if _key_is_set(settings.ANTHROPIC_API_KEY):
+    # Add direct provider models if the caller has keys set
+    if _key_is_set(us.get("ANTHROPIC_API_KEY", "")):
         for m in _ANTHROPIC_MODELS:
             mid = m["id"]
             entry = {**m, "cost_per_hour": 0, "is_free": False,
@@ -1633,7 +1644,7 @@ async def available_models(user: User = Depends(get_current_user)):
                 vision.append({**entry, **_estimate_speed(mid, "vision", False)})
             text.append({**entry, **_estimate_speed(mid, "text", False)})
 
-    if _key_is_set(settings.GEMINI_API_KEY):
+    if _key_is_set(us.get("GEMINI_API_KEY", "")):
         for m in _GEMINI_MODELS:
             mid = m["id"]
             entry = {**m, "cost_per_hour": 0, "is_free": False,
@@ -1745,30 +1756,33 @@ async def available_models(user: User = Depends(get_current_user)):
     vision.sort(key=_sort_key)
     text.sort(key=_sort_key)
 
-    # Limit to top 100 per category to avoid overwhelming the UI
-    # Return current models based on which provider is primary.
-    # If Ollama is first in chain OR is in the chain and has models configured,
-    # return Ollama models so the UI shows what the user actually selected.
-    chain = settings.active_provider_chain
-    ollama_is_primary = chain and chain[0] == "ollama"
-    ollama_models_set = (
-        "ollama" in chain
-        and settings.OLLAMA_VISION_MODEL
-        and settings.OLLAMA_TEXT_MODEL
+    # Return current models based on the user's own chain + model selections.
+    chain_raw = us.get("AI_FALLBACK_CHAIN")
+    chain = (
+        [p.strip() for p in chain_raw.split(",") if p.strip()]
+        if isinstance(chain_raw, str) and chain_raw
+        else settings.active_provider_chain
     )
-    if ollama_is_primary or (ollama_models_set and not _key_is_set(settings.OPENROUTER_API_KEY)):
-        current_vision = f"ollama/{settings.OLLAMA_VISION_MODEL}"
-        current_text = f"ollama/{settings.OLLAMA_TEXT_MODEL}"
+    ollama_vision = us.get("OLLAMA_VISION_MODEL") or settings.OLLAMA_VISION_MODEL
+    ollama_text = us.get("OLLAMA_TEXT_MODEL") or settings.OLLAMA_TEXT_MODEL
+    or_vision = us.get("OPENROUTER_VISION_MODEL") or settings.OPENROUTER_VISION_MODEL
+    or_text = us.get("OPENROUTER_TEXT_MODEL") or settings.OPENROUTER_TEXT_MODEL
+
+    ollama_is_primary = chain and chain[0] == "ollama"
+    ollama_models_set = "ollama" in chain and ollama_vision and ollama_text
+    if ollama_is_primary or (ollama_models_set and not has_or_key):
+        current_vision = f"ollama/{ollama_vision}"
+        current_text = f"ollama/{ollama_text}"
     else:
-        current_vision = settings.OPENROUTER_VISION_MODEL
-        current_text = settings.OPENROUTER_TEXT_MODEL
+        current_vision = or_vision
+        current_text = or_text
 
     return {
         "transcript": transcript,
         "vision": vision[:100],
         "text": text[:100],
         "current": {
-            "transcript_model": settings.WHISPER_MODEL,
+            "transcript_model": us.get("WHISPER_MODEL") or settings.WHISPER_MODEL,
             "vision_model": current_vision,
             "text_model": current_text,
         },
