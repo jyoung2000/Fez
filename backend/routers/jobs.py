@@ -203,7 +203,8 @@ async def retranscribe_job_endpoint(
     """
     job = await _require_job_access(job_id, user)
 
-    if job.status in (JobStatus.QUEUED, JobStatus.PROCESSING, JobStatus.TRANSCRIBING):
+    terminal_statuses = {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.CANCELLED}
+    if job.status not in terminal_statuses:
         raise HTTPException(
             status_code=409,
             detail=(
