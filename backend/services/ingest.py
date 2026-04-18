@@ -263,7 +263,13 @@ async def ingest_video_from_path(
     # generator wired into the serve-file / share endpoints.
     try:
         from backend.services.browser_preview import ensure_browser_preview_async
-        asyncio.create_task(ensure_browser_preview_async(final_path))
+        # ``wait_for_peer=True`` — this is the task doing the work,
+        # so if another worker holds the lock it should wait rather
+        # than bail out. HTTP handlers default to False to avoid
+        # stalling the video element while this task churns.
+        asyncio.create_task(
+            ensure_browser_preview_async(final_path, wait_for_peer=True)
+        )
     except Exception as e:  # pragma: no cover — purely cosmetic warmup
         logger.debug("ingest: could not schedule preview warmup: %s", e)
 

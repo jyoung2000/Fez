@@ -451,7 +451,7 @@ def _run_ffmpeg(cmd: list[str], target_path: str) -> bool:
     return True
 
 
-def ensure_browser_preview(source_path: str) -> str:
+def ensure_browser_preview(source_path: str, *, wait_for_peer: bool = True) -> str:
     """Return a path the browser can actually play.
 
     * If ``source_path`` is already browser-compatible → returns
@@ -465,6 +465,13 @@ def ensure_browser_preview(source_path: str) -> str:
       falls back to the source so the endpoint still serves *some*
       bytes instead of 500-ing. The share page will render exactly
       as it did before this module existed.
+
+    ``wait_for_peer`` controls what happens when another worker is
+    already generating the preview. The ingest warm-up passes True
+    (it's the background task doing the work). HTTP request handlers
+    pass False so they don't stall the response for minutes while
+    FFmpeg churns on a big source — they return the source path
+    immediately and the next request will see the ready preview.
     """
     if not source_path or not os.path.isfile(source_path):
         return source_path
@@ -501,8 +508,18 @@ def ensure_browser_preview(source_path: str) -> str:
 
     lock_path = _lock_path_for(target_path)
     if not _acquire_lock(lock_path):
-        # Another worker is already generating — wait for them to
-        # finish and reuse the result.
+        # Another worker is already generating. For HTTP handlers we
+        # return the source path immediately so the ``<video>``
+        # element gets bytes to try playing right now instead of
+        # hanging for minutes; the browser will pick up the finished
+        # preview on a later request. The background warm-up path
+        # keeps the old wait semantics so it doesn't race itself.
+        if not wait_for_peer:
+            logger.info(
+                "browser_preview: peer generating %s — serving source this request",
+                target_path,
+            )
+            return source_path
         logger.info(
             "browser_preview: peer is generating %s, waiting", target_path,
         )
@@ -530,9 +547,21 @@ def ensure_browser_preview(source_path: str) -> str:
         _release_lock(lock_path)
 
 
-async def ensure_browser_preview_async(source_path: str) -> str:
+async def ensure_browser_preview_async(
+    source_path: str, *, wait_for_peer: bool = False,
+) -> str:
     """Async shim for FastAPI handlers — runs the blocking work on
     the default executor so the event loop isn't stalled while
-    FFmpeg churns."""
+    FFmpeg churns.
+
+    Defaults to ``wait_for_peer=False`` because the two callers
+    inside request handlers (``/api/files`` and the share route)
+    must not block for minutes when the background warm-up is still
+    generating the preview. The ingest warm-up explicitly passes
+    ``wait_for_peer=True`` so it does the work instead of bailing.
+    """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, ensure_browser_preview, source_path)
+    return await loop.run_in_executor(
+        None,
+        lambda: ensure_browser_preview(source_path, wait_for_peer=wait_for_peer),
+    )

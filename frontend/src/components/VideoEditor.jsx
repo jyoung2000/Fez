@@ -1240,9 +1240,23 @@ export default function VideoEditor({
   }, [onVideoRef]);
 
   // ── Video metadata & error ─────────────────────────
+  // Retry state lives outside the effect so the retry attempt count
+  // survives the canplay → error ping-pong that happens while the
+  // backend is still transcoding a browser-friendly preview of the
+  // source (big/odd-codec uploads take 30-60s to transcode, and the
+  // analysis page typically opens *during* that window).
+  const retryCountRef = useRef(0);
+  const retryTimerRef = useRef(null);
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    // Reset retry bookkeeping whenever the src changes — a new src
+    // deserves its own fresh retry budget.
+    retryCountRef.current = 0;
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
     const onMetadata = () => {
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
@@ -1254,18 +1268,42 @@ export default function VideoEditor({
     };
     const onCanPlay = () => {
       setVideoReady(true);
+      // A successful canplay means the source is good now — zero
+      // out the retry counter so a later transient hiccup gets the
+      // full retry budget again.
+      retryCountRef.current = 0;
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
       }
     };
     const onError = () => {
-      // Retry once on transient failures (partial content, stale range)
-      if (!video._retried) {
-        video._retried = true;
-        video.load();
+      // The browser-preview transcode on the backend is asynchronous:
+      // when the analysis page opens during upload/processing, the
+      // first few requests can return the raw source (which may not
+      // decode), but subsequent requests return the finished preview.
+      // So retry with exponential backoff instead of giving up after
+      // a single attempt — the preview typically becomes ready within
+      // the first minute.
+      //
+      // Schedule: 0.5s, 1s, 2s, 4s, 8s, 15s, 15s, 15s (max 8 tries,
+      // ~45s of retries). If it's still failing after that, the user
+      // sees the error card and can hit Retry manually.
+      const attempt = retryCountRef.current;
+      const MAX_ATTEMPTS = 8;
+      if (attempt >= MAX_ATTEMPTS) {
+        setVideoError(true);
         return;
       }
-      setVideoError(true);
+      const delays = [500, 1000, 2000, 4000, 8000, 15000, 15000, 15000];
+      const delay = delays[Math.min(attempt, delays.length - 1)];
+      retryCountRef.current = attempt + 1;
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = setTimeout(() => {
+        retryTimerRef.current = null;
+        if (videoRef.current) {
+          try { videoRef.current.load(); } catch { /* element gone */ }
+        }
+      }, delay);
     };
     const onDuration = () => {
       if (video.duration && isFinite(video.duration)) {
@@ -1293,6 +1331,10 @@ export default function VideoEditor({
       video.removeEventListener('canplay', onCanPlay);
       video.removeEventListener('durationchange', onDuration);
       video.removeEventListener('error', onError);
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
     };
   }, [src, clipStart]);
 
@@ -2836,7 +2878,17 @@ export default function VideoEditor({
     return (
       <div className="ve-error">
         <span>Failed to load video</span>
-        <button className="ve-error__retry" onClick={() => { setVideoError(false); videoRef.current?.load(); }}>
+        <button className="ve-error__retry" onClick={() => {
+          setVideoError(false);
+          // Reset auto-retry budget so a manual Retry gets another
+          // full round of backoff attempts, not just a single shot.
+          retryCountRef.current = 0;
+          if (retryTimerRef.current) {
+            clearTimeout(retryTimerRef.current);
+            retryTimerRef.current = null;
+          }
+          videoRef.current?.load();
+        }}>
           Retry
         </button>
       </div>
