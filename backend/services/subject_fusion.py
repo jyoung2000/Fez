@@ -26,7 +26,9 @@ from backend.services.appearance_signature import (
 
 logger = logging.getLogger(__name__)
 
-# Promotion gate thresholds
+# Promotion gate thresholds (legacy defaults, used when shot_profiles
+# is None). Fix 3.9 moves these per-content-type via _AR_BOUNDS /
+# _AREA_BOUNDS / _PERSISTENCE_BOUNDS below.
 MIN_PERSISTENCE_FRAMES = 5
 MIN_ASPECT_RATIO = 1.0           # h/w -- at least square
 MAX_ASPECT_RATIO = 1.8           # at most 1.8x taller than wide
@@ -39,6 +41,79 @@ PROMOTED_BASE_CONFIDENCE = 0.60
 CONFIRMED_BASE_CONFIDENCE = 0.95
 
 
+# ── Fix 3.9: per-content-type promotion bounds ────────────────────
+#
+# Face defaults (0.8..1.8 aspect, 0.005..0.20 area, 5-frame persistence)
+# reject anime characters (heavy stylization, non-standard proportions),
+# sports balls (square, tiny area), cars (horizontal, large area). The
+# spec calls these out explicitly; we pick per-content bounds here.
+#
+# Bounds are (min, max) for aspect (h/w) and area fraction.
+_AR_BOUNDS = {
+    "animation":          (0.6, 2.2),   # stylized characters
+    "animation_dialogue": (0.8, 1.8),
+    "sports_basketball":  (0.8, 1.2),   # balls are round-ish
+    "sports_racing":      (1.5, 4.0),   # cars horizontal in h/w → inverted
+    "music_video":        (0.6, 2.5),
+    "default":            (0.8, 1.8),
+}
+_AREA_BOUNDS = {
+    "animation":          (0.003, 0.30),
+    "sports_basketball":  (0.0005, 0.05),
+    "sports_racing":      (0.01, 0.35),
+    "default":            (0.005, 0.20),
+}
+_PERSISTENCE_BOUNDS = {
+    "animation":          4,
+    "sports_basketball":  3,
+    "sports_racing":      3,
+    "music_video":        4,
+    "default":            5,
+}
+
+
+def _shot_content_type_for_cluster(
+    cluster: list,
+    shot_profiles,
+) -> str:
+    """Return the shot content_type that covers the cluster midpoint,
+    or 'default' when shot_profiles is None / cluster straddles shots.
+    """
+    if not shot_profiles or not cluster:
+        return "default"
+    ts = sorted(r.timestamp for r in cluster)
+    midpoint = ts[len(ts) // 2]
+    # Reject straddle: first and last should fall in the same shot.
+    first_shot = None
+    for p in shot_profiles:
+        if p.start <= ts[0] <= p.end:
+            first_shot = p
+            break
+    last_shot = None
+    for p in shot_profiles:
+        if p.start <= ts[-1] <= p.end:
+            last_shot = p
+            break
+    if first_shot is None or last_shot is None:
+        return "default"
+    if first_shot.shot_idx != last_shot.shot_idx:
+        return "default"
+    return first_shot.content_type or "default"
+
+
+def _bounds_for_content(content_type: str):
+    """Return (ar_min, ar_max, area_min, area_max, persistence) for a
+    content_type. Falls back to default-family values on unknown keys."""
+    ar_min, ar_max = _AR_BOUNDS.get(content_type, _AR_BOUNDS["default"])
+    area_min, area_max = _AREA_BOUNDS.get(
+        content_type, _AREA_BOUNDS["default"],
+    )
+    persist = _PERSISTENCE_BOUNDS.get(
+        content_type, _PERSISTENCE_BOUNDS["default"],
+    )
+    return ar_min, ar_max, area_min, area_max, persist
+
+
 def build_subject_tracks(
     face_registry,
     dense_faces: list,
@@ -48,6 +123,7 @@ def build_subject_tracks(
     source_height: int,
     shot_cuts: list = None,
     job_id: str = "",
+    shot_profiles: list = None,
 ) -> list:
     """Build unified SubjectTracks from all available signals.
 
@@ -59,6 +135,10 @@ def build_subject_tracks(
         source_width, source_height: actual source dimensions
         shot_cuts: list[float] shot boundary timestamps for cross-shot matching
         job_id: logging correlation
+        shot_profiles: Fix 3.9. Optional list[ShotProfile] used to
+            pick per-content-type promotion bounds (aspect, area,
+            persistence). When None, default face-oriented bounds are
+            used (legacy behavior).
 
     Returns:
         list[SubjectTrack]
@@ -110,9 +190,14 @@ def build_subject_tracks(
     # -- Phase 3: Run promotion gate on each cluster --
     promoted_count = 0
     for cluster in saliency_clusters:
+        # Fix 3.9: look up the shot's content_type (if any) so the
+        # promotion gate uses per-content bounds. Clusters straddling
+        # shots fall back to "default".
+        content_type = _shot_content_type_for_cluster(cluster, shot_profiles)
         track = _promote_cluster(
             cluster, frame_lookup, source_width, source_height,
             next_track_id, job_id,
+            content_type=content_type,
         )
         if track is not None:
             tracks.append(track)
@@ -240,12 +325,25 @@ def _promote_cluster(
     source_height: int,
     track_id: int,
     job_id: str,
+    content_type: str = "default",
 ) -> Optional[SubjectTrack]:
     """Run the 4-test promotion gate on a saliency cluster.
 
+    Fix 3.9: aspect, area, and persistence bounds are content-type
+    dependent. Non-face subjects (anime characters, sports balls,
+    racing cars) use relaxed bounds that match their geometry.
+
     Returns a SubjectTrack if promoted, None otherwise.
     """
-    if len(cluster) < MIN_PERSISTENCE_FRAMES:
+    ar_min, ar_max, area_min, area_max, persist = _bounds_for_content(
+        content_type,
+    )
+
+    if len(cluster) < persist:
+        logger.debug(
+            "[%s] cluster rejected: persistence %d < %d (content=%s)",
+            job_id, len(cluster), persist, content_type,
+        )
         return None
 
     # Test 1: Persistence (already checked above)
@@ -254,17 +352,21 @@ def _promote_cluster(
     # Test 2: Aspect ratio (use cluster median)
     aspects = [r.h / r.w if r.w > 0 else 0 for r in cluster]
     median_aspect = float(np.median(aspects))
-    if not (MIN_ASPECT_RATIO <= median_aspect <= MAX_ASPECT_RATIO):
-        logger.debug("[%s] cluster rejected: aspect %.2f outside [%.1f, %.1f]",
-                     job_id, median_aspect, MIN_ASPECT_RATIO, MAX_ASPECT_RATIO)
+    if not (ar_min <= median_aspect <= ar_max):
+        logger.debug(
+            "[%s] cluster rejected: aspect %.2f outside [%.1f, %.1f] (content=%s)",
+            job_id, median_aspect, ar_min, ar_max, content_type,
+        )
         return None
 
     # Test 3: Size (median area ratio)
     areas = [(r.w * r.h) / 10000.0 for r in cluster]  # % * % / 10000 = fraction
     median_area = float(np.median(areas))
-    if not (MIN_AREA_RATIO <= median_area <= MAX_AREA_RATIO):
-        logger.debug("[%s] cluster rejected: area %.4f outside [%.4f, %.4f]",
-                     job_id, median_area, MIN_AREA_RATIO, MAX_AREA_RATIO)
+    if not (area_min <= median_area <= area_max):
+        logger.debug(
+            "[%s] cluster rejected: area %.4f outside [%.4f, %.4f] (content=%s)",
+            job_id, median_area, area_min, area_max, content_type,
+        )
         return None
 
     # Test 4: Face mesh validation (soft -- modulates confidence only)
