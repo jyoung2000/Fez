@@ -70,6 +70,19 @@ class Settings(BaseSettings):
     # out a lot of valid quiet speech; 0.5 catches it while the worker
     # hallucination filter cleans up any false positives.
     WHISPER_NO_SPEECH_THRESHOLD: float = 0.5
+    # ── Phase 2 coverage booster: recall-pass gap filling ──
+    # After the main Whisper pass, compare transcript coverage against
+    # an independent webrtcvad speech-presence mask. For any window >2s
+    # where VAD says "speech here" but the transcript is empty, re-run
+    # Whisper on just that slice with recall-first parameters
+    # (vad_filter=False, no_speech_threshold=0.2, no temperature
+    # fallback, no previous-text conditioning). Recovers speech that
+    # Whisper's internal gates and the main-pass VAD rejected.
+    # Bounded by WHISPER_GAP_FILL_MAX_GAPS and WHISPER_GAP_FILL_MAX_AUDIO_SEC.
+    WHISPER_GAP_FILL_ENABLED: bool = True
+    WHISPER_GAP_FILL_MIN_GAP_SEC: float = 2.0
+    WHISPER_GAP_FILL_MAX_GAPS: int = 40
+    WHISPER_GAP_FILL_MAX_AUDIO_SEC: float = 600.0
     # Auto-upgrade the Whisper model tier when the detected GPU has
     # spare VRAM. Existing logic already jumped ``small → large-v3-turbo``
     # on ≥6 GB cards; this flag extends the ladder so mid-tier GPUs

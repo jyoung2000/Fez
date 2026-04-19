@@ -1433,6 +1433,7 @@ async def transcribe_audio(
             _transcribe_sync, audio_path, language=language,
             task=task, initial_prompt=initial_prompt,
             progress_state=progress_state, progress_lock=lock,
+            is_animated=is_animated,
         )
     )
 
@@ -1670,6 +1671,7 @@ def _transcribe_sync(
     initial_prompt: str = "",
     progress_state: Optional[dict] = None,
     progress_lock: Optional[threading.Lock] = None,
+    is_animated: bool = False,
 ) -> list[TranscriptSegment]:
     model = _get_whisper_model()
     # Use VRAM-aware beam size if available (prevents silent CUDA OOM on ≤4GB GPUs)

@@ -2354,6 +2354,7 @@ async def _run_analysis_inner(job_id: str):
                     audio_path, language=job.language, task=whisper_task,
                     initial_prompt=initial_prompt, audio_duration=audio_duration,
                     progress_callback=_transcribe_progress,
+                    is_animated=_early_anime_hint,
                     cancel_check=cancel_check,
                 )
                 logger.info(
@@ -2383,6 +2384,7 @@ async def _run_analysis_inner(job_id: str):
                         audio_path, language=job.language, task=whisper_task,
                         initial_prompt=initial_prompt, audio_duration=audio_duration,
                         progress_callback=_transcribe_progress,
+                        is_animated=_early_anime_hint,
                         cancel_check=cancel_check,
                     )
                     logger.info(
@@ -2393,6 +2395,54 @@ async def _run_analysis_inner(job_id: str):
                     settings.WHISPER_MODEL = original_model
                     settings.WHISPER_BEAM_SIZE = original_beam
                     settings.GPU_ACCELERATION_ENABLED = original_gpu
+
+        # ── Phase 2 coverage booster: gap-fill recall pass ──
+        # Compare transcript coverage against an independent webrtcvad
+        # speech-presence mask. For any window >2s where VAD says speech
+        # is present but Whisper returned nothing, re-run Whisper on that
+        # slice with recall-first parameters. Additive only — never
+        # removes or mutates existing segments.
+        if (getattr(settings, "WHISPER_GAP_FILL_ENABLED", True)
+                and result and audio_duration > 30):
+            try:
+                from backend.services.transcription_gap_filler import (
+                    fill_transcript_gaps,
+                )
+                await _update_branch_progress(
+                    "transcription", 95, JobStatus.TRANSCRIBING,
+                    "Checking transcript coverage for missed speech...",
+                )
+                result_list, gap_stats = await fill_transcript_gaps(
+                    audio_path,
+                    list(result),
+                    audio_duration,
+                    language=job.language,
+                    task=whisper_task,
+                    is_animated=_early_anime_hint,
+                    initial_prompt=initial_prompt,
+                    max_gaps=int(getattr(settings, "WHISPER_GAP_FILL_MAX_GAPS", 40)),
+                    max_fill_audio_sec=float(getattr(settings, "WHISPER_GAP_FILL_MAX_AUDIO_SEC", 600.0)),
+                )
+                if gap_stats.segments_added > 0:
+                    logger.info(
+                        "[%s] gap-fill recovered %d segments across %d gaps "
+                        "(voiced coverage %.1f%% → %.1f%%)",
+                        job_id, gap_stats.segments_added, gap_stats.gaps_filled,
+                        gap_stats.coverage_before * 100,
+                        gap_stats.coverage_after * 100,
+                    )
+                    result = result_list
+                else:
+                    logger.info(
+                        "[%s] gap-fill: no new segments (gaps_found=%d, reason=%s)",
+                        job_id, gap_stats.gaps_found,
+                        gap_stats.skipped_reason or "empty_after_filter",
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[%s] gap-fill pass failed (%s) — continuing with main transcript",
+                    job_id, e,
+                )
 
         await database.update_job_status(job_id, transcript=list(result))
 
