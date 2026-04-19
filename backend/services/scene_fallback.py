@@ -201,6 +201,7 @@ def synthesize_key_scenes(
                 importance_score=6,    # neutral middle score
                 thumbnail_path=thumb,
                 subject_x=_pick_face_subject_x(face_results, ts),
+                description_source="heuristic_fallback",
             )
         )
     return out

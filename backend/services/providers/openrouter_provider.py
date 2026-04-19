@@ -1240,6 +1240,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                         thumbnail_path=frame_ref.path,
                         subject_x=sx,
                         active_speaker_x=active_sx,
+                        description_source="vlm_cloud",
                     ))
                 # ── Batch diversity validation ──
                 # When all subject_x in a batch are identical at exactly 50 (center default),

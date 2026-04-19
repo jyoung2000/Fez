@@ -65,6 +65,10 @@ class SceneDescription(BaseModel):
     fusion_source: Optional[str] = None             # "face_high_conf" | "blended" | "vlm_only" | "fallback_center" | None
     secondary_subjects: list[dict] = []             # [{box, confidence, label}]
     no_subject_reason: Optional[str] = None         # "empty_frame"|"abstract"|"transition"|"occluded"|None
+    description_source: Optional[str] = None
+    # One of: "vlm_cloud", "vlm_local", "transcript_fallback",
+    # "heuristic_fallback", "user_added", or None (legacy/unknown).
+    # Surfaces in the UI as a small badge. Does NOT affect is_synthetic_scene.
 
     @model_validator(mode='before')
     @classmethod

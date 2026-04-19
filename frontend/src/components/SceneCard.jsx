@@ -170,6 +170,26 @@ export default function SceneCard({ scene, sceneIndex, jobId, onClick, onUpdated
           >
             {Number(scene.importance_score) || 0}/10
           </span>
+          {scene.description_source && !['vlm_cloud', 'vlm_local'].includes(scene.description_source) && (
+            <span
+              title={
+                scene.description_source === 'transcript_fallback' ? 'Description generated from transcript (AI description unavailable)' :
+                scene.description_source === 'heuristic_fallback' ? 'Synthesized key moment (no AI description available)' :
+                scene.description_source === 'user_added' ? 'Added by you' :
+                'Legacy description'
+              }
+              style={{
+                fontSize: 9,
+                padding: '1px 4px',
+                borderRadius: 2,
+                background: 'var(--bg-elevated)',
+                color: 'var(--text-muted)',
+                fontFamily: 'var(--font-mono)',
+              }}
+            >
+              {scene.description_source === 'user_added' ? 'you' : 'auto'}
+            </span>
+          )}
         </div>
 
         {editing ? (

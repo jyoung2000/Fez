@@ -2939,6 +2939,40 @@ export default function Analysis() {
 
       {tab === 1 && (
         <div>
+          {/* AI coverage strip */}
+          {job.scene_coverage && (
+            <div style={{ marginBottom: 16, padding: '10px 12px', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)' }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                  <strong style={{ color: 'var(--accent-cyan)' }}>{job.scene_coverage.ai_coverage_percent}%</strong> of video understood by AI
+                  <span style={{ color: 'var(--text-muted)', margin: '0 6px' }}>·</span>
+                  {job.scene_coverage.real_scenes} AI-described
+                  {job.scene_coverage.synthetic_scenes > 0 && (
+                    <>
+                      <span style={{ color: 'var(--text-muted)', margin: '0 6px' }}>·</span>
+                      {job.scene_coverage.synthetic_scenes} transcript-derived
+                    </>
+                  )}
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                  {job.scene_coverage.frames_per_minute} fpm
+                </div>
+              </div>
+              <div style={{ height: 3, background: 'var(--bg-elevated)', marginTop: 6, borderRadius: 2, overflow: 'hidden' }}>
+                <div style={{
+                  width: `${Math.min(100, job.scene_coverage.ai_coverage_percent)}%`,
+                  height: '100%',
+                  background: job.scene_coverage.ai_coverage_percent > 70
+                    ? 'var(--accent-cyan)'
+                    : job.scene_coverage.ai_coverage_percent > 40
+                      ? 'var(--accent-amber)'
+                      : 'var(--text-muted)',
+                  transition: 'width 0.3s',
+                }} />
+              </div>
+            </div>
+          )}
+
           {/* Add Scene form */}
           <AddSceneForm jobId={jobId} duration={job.duration} onAdded={fetchJob} />
 

@@ -1781,6 +1781,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         importance_score=importance,
                         thumbnail_path=frame.path,
                         subject_x=subject_x,
+                        description_source="vlm_local",
                     )
                     stage2_consecutive_failures = 0
 

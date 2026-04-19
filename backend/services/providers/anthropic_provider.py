@@ -158,6 +158,7 @@ class AnthropicProvider(ChunkedClipDetectionMixin, AIProvider):
                             importance_score=max(1, min(10, int(item.get("importance_score", 5)))),
                             thumbnail_path=frame_ref.path,
                             subject_x=sx,
+                            description_source="vlm_cloud",
                         ))
                 except (json.JSONDecodeError, KeyError, IndexError) as e:
                     logger.warning(f"Failed to parse Anthropic frame analysis: {e}")

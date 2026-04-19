@@ -65,7 +65,41 @@ async def get_job(job_id: str, user: User = Depends(get_current_user)):
     # Safety: ensure status is always a plain string (not enum remnant)
     if "status" in data and not isinstance(data["status"], str):
         data["status"] = str(data["status"])
+    data["scene_coverage"] = _compute_scene_coverage(job)
     return data
+
+
+def _compute_scene_coverage(job):
+    """Compute AI-coverage + per-source breakdown for the Analysis UI.
+
+    Each AI-described scene covers a ±5s window; overlapping windows
+    are merged before being divided by the video duration so a dense
+    talking-head segment doesn't inflate coverage past 100%.
+    """
+    from backend.services.pipeline_helpers import is_synthetic_scene
+    scenes = job.scenes or []
+    duration = max(1.0, float(getattr(job, "duration", 0) or 0))
+    real = [s for s in scenes if not is_synthetic_scene(s)]
+    windows = sorted((max(0.0, s.timestamp - 5.0), min(duration, s.timestamp + 5.0)) for s in real)
+    merged = []
+    for a, b in windows:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    ai_covered = sum(b - a for a, b in merged)
+    by_source: dict = {}
+    for s in scenes:
+        src = getattr(s, "description_source", None) or "unknown"
+        by_source[src] = by_source.get(src, 0) + 1
+    return {
+        "total_scenes": len(scenes),
+        "real_scenes": len(real),
+        "synthetic_scenes": len(scenes) - len(real),
+        "ai_coverage_percent": round(100 * ai_covered / duration, 1),
+        "frames_per_minute": round(60 * len(scenes) / duration, 1) if duration > 0 else 0,
+        "by_source": by_source,
+    }
 
 
 # Per-job single-flight lock so a user can't fire ten concurrent
@@ -809,6 +843,7 @@ async def add_scene(job_id: str, req: AddSceneRequest):
         importance_score=max(1, min(10, req.importance_score)),
         thumbnail_path=thumbnail_path,
         subject_x=50,
+        description_source="user_added",
     )
 
     job.scenes.append(scene)
