@@ -67,6 +67,7 @@ from backend.services.motivated_zoom import (
     plan_motivated_zooms,
 )
 from backend.services.reframe_config import ReframeConfig, get_default_config
+from backend.services.shot_classifier import ShotProfile, classify_shots
 from backend.services.subject_kalman import (
     SubjectKalmanRegistry,
     build_registry_from_dense_faces,
@@ -86,6 +87,10 @@ class HumanReframePlan:
     genre: GenreRefinementResult
     kalman: SubjectKalmanRegistry
     notes: list[str] = field(default_factory=list)
+    # Fix 3.2: per-shot content classification. Empty when no shot
+    # boundaries were passed in. The adapter uses this to emit per-op
+    # content_type telemetry and (once wired) to pick per-op configs.
+    shot_profiles: list[ShotProfile] = field(default_factory=list)
 
 
 @dataclass
@@ -161,6 +166,24 @@ def run_human_reframe(
 ) -> HumanReframePlan:
     """Run the full human-reframe pipeline. Returns a plan."""
     config = (config or get_default_config()).for_content(inputs.content_type)
+
+    # 0. Fix 3.2: per-shot classification. Each shot gets its own
+    # ShotProfile that drives the downstream config choice. For now
+    # the 2-D solver still runs once over the full clip (stitching
+    # per-shot paths is a future task), but the per-shot information
+    # flows through HumanReframePlan.shot_profiles so the adapter
+    # and critic can read it.
+    from backend.services.content_classifier import ContentProfile
+    clip_prior = ContentProfile(
+        content_type=inputs.content_type or "unknown",
+        confidence=0.5,
+    )
+    shot_profiles = classify_shots(
+        shot_boundaries=inputs.shot_boundaries,
+        dense_faces=inputs.dense_faces,
+        duration_sec=inputs.duration_sec,
+        clip_profile=clip_prior,
+    )
 
     # 1. Kalman registry (predictive motion).
     registry = build_registry_from_dense_faces(
@@ -280,4 +303,5 @@ def run_human_reframe(
         genre=genre,
         kalman=registry,
         notes=notes,
+        shot_profiles=shot_profiles,
     )
