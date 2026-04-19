@@ -667,3 +667,178 @@ def _nearest_path_center(path: CameraPath2D, t: float) -> tuple[float, float]:
     idx = min(range(len(path.timestamps)),
               key=lambda i: abs(path.timestamps[i] - t))
     return (path.cx[idx], path.cy[idx])
+
+
+# ── Fix 3.7: repair-in-place coverage helpers ────────────────────
+
+
+def _clamp_rect(rect: Optional[Rect]) -> tuple[Optional[Rect], bool]:
+    """Clamp each of x, y, w, h into [0, 1]. Returns (new_rect, changed)."""
+    if rect is None:
+        return None, False
+    x = max(0.0, min(1.0, float(rect.x)))
+    y = max(0.0, min(1.0, float(rect.y)))
+    w = max(0.0, min(1.0, float(rect.w)))
+    h = max(0.0, min(1.0, float(rect.h)))
+    changed = not (
+        x == rect.x and y == rect.y and w == rect.w and h == rect.h
+    )
+    return Rect(x=x, y=y, w=w, h=h), changed
+
+
+def try_repair_coverage(
+    plan: RenderPlan,
+    report: "CoverageReport",
+    duration_sec: float,
+) -> Optional[RenderPlan]:
+    """Return a repaired :class:`RenderPlan` or ``None`` if repair fails.
+
+    Applies four fix-ups in order:
+      1. Absorb zero-duration ops into the next op.
+      2. Trim overlapping ops so the earlier op's end_sec meets the
+         later op's start_sec.
+      3. Fill gaps by extending the nearest preceding op (or, for a
+         leading gap, the first op's start to 0).
+      4. Clamp every out-of-range rect component into [0, 1].
+    """
+    if plan is None or not plan.ops:
+        return None
+
+    ops = list(plan.ops)
+
+    # 1. Drop zero-duration ops (absorb by extending the previous op
+    # or, for the first op, pull the next op's start back to 0).
+    repaired: list[RenderOp] = []
+    for op in ops:
+        if op.end_sec - op.start_sec < 1e-3:
+            if repaired:
+                repaired[-1].end_sec = max(
+                    repaired[-1].end_sec, op.end_sec,
+                )
+            # For a first-op zero-duration entry we just drop it; the
+            # next op's start will be adjusted in the gap pass.
+            continue
+        repaired.append(op)
+
+    if not repaired:
+        return None
+
+    # 2. Trim overlaps: force end_sec of op[i] = start_sec of op[i+1].
+    for i in range(len(repaired) - 1):
+        if repaired[i].end_sec > repaired[i + 1].start_sec:
+            repaired[i].end_sec = repaired[i + 1].start_sec
+
+    # 3. Fill gaps. Leading gap (first op starts after 0) and middle
+    # gaps both get absorbed by extending the neighbor.
+    if repaired[0].start_sec > 0.001:
+        repaired[0].start_sec = 0.0
+    for i in range(len(repaired) - 1):
+        gap = repaired[i + 1].start_sec - repaired[i].end_sec
+        if gap > 0.001:
+            mid = (repaired[i].end_sec + repaired[i + 1].start_sec) / 2.0
+            repaired[i].end_sec = mid
+            repaired[i + 1].start_sec = mid
+    # Trailing gap: extend last op's end_sec.
+    if duration_sec - repaired[-1].end_sec > 0.05:
+        repaired[-1].end_sec = duration_sec
+
+    # 4. Clamp out-of-range rects and annotate strategy.
+    for op in repaired:
+        any_changed = False
+        for attr in ("primary_rect", "secondary_rect", "tertiary_rect",
+                     "quaternary_rect"):
+            r = getattr(op, attr)
+            if r is None:
+                continue
+            new, changed = _clamp_rect(r)
+            if changed:
+                setattr(op, attr, new)
+                any_changed = True
+        if op.motion_path:
+            new_path = []
+            for kp in op.motion_path:
+                new_rect, changed = _clamp_rect(kp.rect)
+                if changed:
+                    any_changed = True
+                    new_path.append(MotionKeypoint(t=kp.t, rect=new_rect))
+                else:
+                    new_path.append(kp)
+            op.motion_path = new_path
+        if any_changed:
+            op.strategy_label = (op.strategy_label or "") + "|clamped"
+
+    return RenderPlan(
+        source_width=plan.source_width,
+        source_height=plan.source_height,
+        target_width=plan.target_width,
+        target_height=plan.target_height,
+        total_duration_sec=plan.total_duration_sec or duration_sec,
+        fps=plan.fps,
+        ops=repaired,
+        source_offset_sec=getattr(plan, "source_offset_sec", 0.0),
+    )
+
+
+def fill_gaps_with_blur(plan: RenderPlan, duration_sec: float) -> RenderPlan:
+    """Last-resort pass: for every remaining gap, splice in a BLUR_FILL
+    op between neighbors. Used when try_repair_coverage leaves gaps.
+    """
+    if plan is None or duration_sec <= 0:
+        return plan
+    ops = list(plan.ops or [])
+    if not ops:
+        ops = [RenderOp(
+            kind=RenderOpKind.BLUR_FILL,
+            start_sec=0.0, end_sec=duration_sec,
+            primary_rect=Rect(x=0.0, y=0.0, w=1.0, h=1.0),
+            strategy_label="coverage-repair:empty-plan",
+        )]
+        return RenderPlan(
+            source_width=plan.source_width,
+            source_height=plan.source_height,
+            target_width=plan.target_width,
+            target_height=plan.target_height,
+            total_duration_sec=duration_sec,
+            fps=plan.fps,
+            ops=ops,
+            source_offset_sec=getattr(plan, "source_offset_sec", 0.0),
+        )
+
+    filled: list[RenderOp] = []
+    # Leading gap.
+    if ops[0].start_sec > 0.001:
+        filled.append(RenderOp(
+            kind=RenderOpKind.BLUR_FILL,
+            start_sec=0.0, end_sec=ops[0].start_sec,
+            primary_rect=Rect(x=0.0, y=0.0, w=1.0, h=1.0),
+            strategy_label="coverage-repair:leading-gap",
+        ))
+    for i, op in enumerate(ops):
+        filled.append(op)
+        if i + 1 < len(ops):
+            nxt = ops[i + 1]
+            if nxt.start_sec - op.end_sec > 0.001:
+                filled.append(RenderOp(
+                    kind=RenderOpKind.BLUR_FILL,
+                    start_sec=op.end_sec, end_sec=nxt.start_sec,
+                    primary_rect=Rect(x=0.0, y=0.0, w=1.0, h=1.0),
+                    strategy_label="coverage-repair:mid-gap",
+                ))
+    # Trailing gap.
+    if duration_sec - filled[-1].end_sec > 0.05:
+        filled.append(RenderOp(
+            kind=RenderOpKind.BLUR_FILL,
+            start_sec=filled[-1].end_sec, end_sec=duration_sec,
+            primary_rect=Rect(x=0.0, y=0.0, w=1.0, h=1.0),
+            strategy_label="coverage-repair:trailing-gap",
+        ))
+    return RenderPlan(
+        source_width=plan.source_width,
+        source_height=plan.source_height,
+        target_width=plan.target_width,
+        target_height=plan.target_height,
+        total_duration_sec=duration_sec,
+        fps=plan.fps,
+        ops=filled,
+        source_offset_sec=getattr(plan, "source_offset_sec", 0.0),
+    )
