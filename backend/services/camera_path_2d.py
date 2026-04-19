@@ -361,12 +361,23 @@ def solve_2d_camera_path(
     target_w: int = 1080,
     target_h: int = 1920,
     config: Optional[ReframeConfig] = None,
+    predictor: "Optional[object]" = None,
+    primary_slot_by_t: Optional[dict] = None,
 ) -> CameraPath2D:
     """Solve a 2-D camera path for a segment of ``faces_by_frame``.
 
     ``timestamps`` and ``faces_by_frame`` must be the same length. Entries
     in ``faces_by_frame`` may be ``None`` for frames without a detection
     — bounds are held constant from the previous frame.
+
+    Fix 3.4: when ``predictor`` (a ``SubjectKalmanRegistry``) and
+    ``primary_slot_by_t`` (a ``dict[timestamp → slot_id]``) are
+    supplied, the per-frame ``tx[i] / ty[i]`` target is blended 70%
+    Kalman-predicted / 30% raw. The Kalman prediction is looked up
+    ``kalman_prediction_ms`` ahead of the current timestamp so the
+    camera LEADS the subject instead of reacting. When the Kalman
+    uncertainty exceeds 0.05 (filter widened by a no-observation
+    gap), we fall back to the raw target for that frame.
 
     Returns a :class:`CameraPath2D`.
     """
@@ -397,6 +408,40 @@ def solve_2d_camera_path(
                                    crop_w_frac=crop_w_frac, config=config)
     ty, loy, hiy = _build_y_bounds(faces_by_frame,
                                    crop_h_frac=crop_h_frac, config=config)
+
+    # Fix 3.4: blend Kalman-predicted targets with raw targets so the
+    # camera leads rather than reacts. Gated by uncertainty so a
+    # widening filter (no-observation gap) falls back to raw.
+    if predictor is not None:
+        _blend_w = 0.70
+        _uncert_gate = 0.05
+        for i, t_now in enumerate(timestamps):
+            slot_id = None
+            if primary_slot_by_t is not None:
+                # primary_slot_by_t keys may not exactly match timestamps
+                # due to floating-point — accept the nearest key within
+                # one frame-step.
+                if t_now in primary_slot_by_t:
+                    slot_id = primary_slot_by_t[t_now]
+                else:
+                    for k_t, k_slot in primary_slot_by_t.items():
+                        if abs(k_t - t_now) < 0.03:
+                            slot_id = k_slot
+                            break
+            if slot_id is None or slot_id < 0:
+                continue
+            pred = predictor.prediction_for_lead(slot_id, t_now)
+            if pred is None:
+                continue
+            pred_x, pred_y, unc = pred
+            if unc > _uncert_gate:
+                continue
+            # Clamp prediction into the existing per-frame bounds so
+            # the blend can't push the LP outside the feasible set.
+            pred_x_c = max(lox[i], min(hix[i], pred_x))
+            pred_y_c = max(loy[i], min(hiy[i], pred_y))
+            tx[i] = _blend_w * pred_x_c + (1.0 - _blend_w) * tx[i]
+            ty[i] = _blend_w * pred_y_c + (1.0 - _blend_w) * ty[i]
 
     # Fix 3.5: record no-face runs longer than kalman_prediction_ms*3
     # as y-uncertain windows. The adapter uses these to emit

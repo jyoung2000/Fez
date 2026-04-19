@@ -233,18 +233,24 @@ class SubjectKalmanRegistry:
     def predicted_positions(self, t: float) -> dict[int, tuple[float, float, float]]:
         return {sid: k.predict(t) for sid, k in self.filters.items()}
 
-    def prediction_for_lead(self, slot_id: int, t_now: float) -> Optional[tuple[float, float]]:
-        """Return the position the slot is expected to occupy
+    def prediction_for_lead(
+        self, slot_id: int, t_now: float,
+    ) -> Optional[tuple[float, float, float]]:
+        """Return ``(x, y, uncertainty)`` the slot is expected to occupy
         ``config.kalman_prediction_ms`` ahead of ``t_now``.
 
-        Used as the solver's data target so the camera leads the subject.
+        Used as the solver's data target so the camera leads the
+        subject. ``uncertainty`` is the trace of the position
+        covariance; callers should fall back to the raw observation
+        when ``uncertainty > 0.05`` (filter widened too much, e.g. a
+        no-observation gap).
         """
         k = self.filters.get(slot_id)
         if k is None or k.last_t is None:
             return None
         t_future = t_now + self.config.kalman_prediction_ms / 1000.0
-        x, y, _ = k.predict(t_future)
-        return (x, y)
+        x, y, u = k.predict(t_future)
+        return (x, y, u)
 
 
 # ── Integration helper: feed dense faces into a registry ──────────

@@ -196,12 +196,24 @@ def run_human_reframe(
         inputs.dense_faces,
         active_speaker_events=inputs.active_speaker_events,
     )
+    # Fix 3.4: build a primary-slot map keyed on timestamp so the
+    # solver can pull the right Kalman-predicted lead per frame.
+    primary_slot_by_t: dict[float, int] = {}
+    for ev in inputs.active_speaker_events or []:
+        slot = getattr(ev, "slot_id", -1)
+        if slot < 0:
+            continue
+        for t in timestamps:
+            if ev.start <= t <= ev.end:
+                primary_slot_by_t[t] = slot
     path = solve_2d_camera_path(
         faces_2d,
         timestamps=timestamps,
         source_w=inputs.source_w,
         source_h=inputs.source_h,
         config=config,
+        predictor=registry,
+        primary_slot_by_t=primary_slot_by_t or None,
     )
 
     # 3. Genre refinements (produces zoom candidates + HUD exclusions).
