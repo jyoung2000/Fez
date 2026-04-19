@@ -103,13 +103,39 @@ def _shot_content_type_for_cluster(
 
 def _bounds_for_content(content_type: str):
     """Return (ar_min, ar_max, area_min, area_max, persistence) for a
-    content_type. Falls back to default-family values on unknown keys."""
-    ar_min, ar_max = _AR_BOUNDS.get(content_type, _AR_BOUNDS["default"])
-    area_min, area_max = _AREA_BOUNDS.get(
+    content_type.
+
+    Fix 3.10: single source of truth is reframe_config._CONTENT_OVERRIDES
+    via ReframeConfig.for_content(). When a content type has explicit
+    fusion_* overrides there, those win. The module-local tables below
+    act as a backing store for content types the config doesn't know
+    about (e.g. "default"). A caller that mutates _CONTENT_OVERRIDES
+    at runtime sees the change on the next call without touching this
+    file.
+    """
+    try:
+        from backend.services.reframe_config import get_default_config
+        overrides = get_default_config().content_overrides.get(
+            content_type or "default", {}
+        )
+    except Exception:
+        overrides = {}
+
+    ar_min_default, ar_max_default = _AR_BOUNDS.get(
+        content_type, _AR_BOUNDS["default"],
+    )
+    area_min_default, area_max_default = _AREA_BOUNDS.get(
         content_type, _AREA_BOUNDS["default"],
     )
-    persist = _PERSISTENCE_BOUNDS.get(
+    persist_default = _PERSISTENCE_BOUNDS.get(
         content_type, _PERSISTENCE_BOUNDS["default"],
+    )
+    ar_min = float(overrides.get("fusion_aspect_min", ar_min_default))
+    ar_max = float(overrides.get("fusion_aspect_max", ar_max_default))
+    area_min = float(overrides.get("fusion_area_min", area_min_default))
+    area_max = float(overrides.get("fusion_area_max", area_max_default))
+    persist = int(
+        overrides.get("fusion_min_persistence_frames", persist_default)
     )
     return ar_min, ar_max, area_min, area_max, persist
 

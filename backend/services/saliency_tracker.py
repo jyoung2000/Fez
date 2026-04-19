@@ -56,27 +56,21 @@ COLOR_WEIGHT = 0.2
 def _get_fusion_weights(content_type) -> tuple:
     """Return (spatial, temporal, color) fusion weights for a content type.
 
-    Non-gaming content types get tuned weights; gameplay and None fall
-    through to the legacy 0.3/0.5/0.2 defaults so existing behaviour is
+    Fix 3.10: reads from ReframeConfig.for_content(content_type) so
+    the per-content table lives in one place. Gaming still falls
+    through to the legacy module defaults so the gaming pipeline is
     unchanged.
     """
     if content_type is None or _is_gaming_mode(content_type):
         return (SPATIAL_WEIGHT, TEMPORAL_WEIGHT, COLOR_WEIGHT)
-    val = getattr(content_type, "value", content_type)
-    _TABLE = {
-        "talking_head":          (0.45, 0.30, 0.25),
-        "cinematic_dialogue":    (0.45, 0.30, 0.25),
-        "multi_speaker_panel":   (0.45, 0.30, 0.25),
-        "animation_dialogue":    (0.45, 0.30, 0.25),
-        "animation":             (0.30, 0.50, 0.20),
-        "music_video":           (0.30, 0.45, 0.25),
-        "stream":                (0.40, 0.40, 0.20),
-        "sports":                (0.25, 0.55, 0.20),
-        "sports_basketball":     (0.25, 0.55, 0.20),
-        "sports_racing":         (0.25, 0.55, 0.20),
-        "generic":               (0.30, 0.50, 0.20),
-    }
-    return _TABLE.get(val, (SPATIAL_WEIGHT, TEMPORAL_WEIGHT, COLOR_WEIGHT))
+    # Lazy import to avoid a circular import at module load time.
+    from backend.services.reframe_config import get_default_config
+    cfg = get_default_config().for_content(content_type)
+    return (
+        float(cfg.saliency_spatial_weight),
+        float(cfg.saliency_temporal_weight),
+        float(cfg.saliency_color_weight),
+    )
 
 
 def _compute_adaptive_center_bias(
