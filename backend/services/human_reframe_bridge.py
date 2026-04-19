@@ -39,7 +39,9 @@ from backend.services.human_reframe import (
 )
 from backend.services.human_render_plan_adapter import (
     CoverageReport,
+    fill_gaps_with_blur,
     render_plan_from_human_plan,
+    try_repair_coverage,
     verify_frame_coverage,
 )
 from backend.services.reframe_config import (
@@ -145,12 +147,45 @@ def maybe_override_render_plan(
                        job_id, e)
         return legacy_rp
 
-    # Gap / OOR / zero-duration check. If anything fails, keep legacy.
+    # Fix 3.8: local critic + auto-repair pass on the new plan. Local
+    # heuristics only; no network. Budget-limited by config.
+    try:
+        from backend.services.reframe_critic import auto_repair_plan
+        if getattr(config, "critic_mode", "learned") != "off":
+            new_rp, fixes, _ = auto_repair_plan(
+                new_rp, dense_faces=list(dense_faces or []), config=config,
+            )
+            if fixes:
+                logger.info(
+                    "[%s] human-reframe critic: applied %d fixes (%s)",
+                    job_id, len(fixes),
+                    ", ".join(sorted({f.reason for f in fixes}))[:120],
+                )
+    except Exception as e:
+        logger.warning("[%s] critic auto-repair failed (%s); continuing", job_id, e)
+
+    # Fix 3.7: coverage is now a repair-in-place cascade. Only fall
+    # back to the legacy plan when every repair attempt fails.
     coverage: CoverageReport = verify_frame_coverage(new_rp)
     if not coverage.ok:
-        logger.warning(
-            "[%s] human-reframe plan failed coverage check "
-            "(gaps=%d overlaps=%d oor=%d zero=%d); keeping legacy",
+        repaired = try_repair_coverage(new_rp, coverage, float(duration_sec))
+        if repaired is not None:
+            new_rp = repaired
+            coverage = verify_frame_coverage(new_rp)
+            logger.info(
+                "[%s] human-reframe: repaired coverage (%d gaps, %d oor)",
+                job_id, len(coverage.gaps), len(coverage.out_of_range_rects),
+            )
+    if not coverage.ok:
+        # Last resort before legacy fallback: fill remaining gaps with
+        # blur_fill from the new plan's timeline. Still preserves the
+        # new plan's shot/speaker decisions for the segments that work.
+        new_rp = fill_gaps_with_blur(new_rp, float(duration_sec))
+        coverage = verify_frame_coverage(new_rp)
+    if not coverage.ok:
+        logger.error(
+            "[%s] human-reframe: unrecoverable coverage failure "
+            "(gaps=%d overlaps=%d oor=%d zero=%d); reverting to legacy",
             job_id,
             len(coverage.gaps), len(coverage.overlaps),
             len(coverage.out_of_range_rects), coverage.zero_duration_ops,

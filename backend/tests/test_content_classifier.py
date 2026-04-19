@@ -115,18 +115,44 @@ class TestContentClassifier:
         )
         assert result.content_type == "gaming"
 
-    def test_user_override_takes_priority(self):
-        """User-specified content_type overrides all signals."""
+    def test_user_override_as_hint_still_routes_on_empty_inputs(self):
+        """Fix 3.1: hint still wins on degenerate inputs (no cuts, no faces,
+        no scenes). On a truly empty clip there's nothing to classify
+        against, so trust the user."""
         result = classify_content(
-            shot_cuts=[i * 3.0 for i in range(80)],  # would be narrative
+            shot_cuts=[],
             face_registry=_FaceRegistry(),
             dense_faces=[],
             scenes=[],
-            video_duration=240.0,
+            video_duration=60.0,
             metadata={"content_type": "podcast"},
         )
         assert result.content_type == "podcast"
         assert result.confidence == 1.0
+        assert result.user_hint == "podcast"
+
+    def test_user_hint_biases_but_geometry_can_win(self):
+        """Fix 3.1: with real heuristic signals, geometry that
+        disagrees with the hint by >=2.5 should win."""
+        # Clip with strong podcast geometry (2 stable slots, avg 2
+        # faces) but the user picked 'narrative' as a hint. Geometry
+        # should still land on podcast.
+        registry = _FaceRegistry(slots=[
+            _FaceSlot(0, 25, 23, 27, frame_count=180),
+            _FaceSlot(1, 75, 73, 77, frame_count=180),
+        ])
+        dense = [_FrameFaces(t, [_FaceInfo(0, 25), _FaceInfo(1, 75)])
+                 for t in range(0, 600)]
+        result = classify_content(
+            shot_cuts=[],
+            face_registry=registry,
+            dense_faces=dense,
+            scenes=[],
+            video_duration=600.0,
+            metadata={"content_type_override": "narrative"},
+        )
+        assert result.content_type == "podcast"
+        assert result.user_hint == "narrative"
 
     def test_letterbox_source_classifies_narrative(self):
         """Wide aspect ratio (cinematic 2.35:1) → narrative."""

@@ -140,6 +140,40 @@ def _target_cx_for_face(
 # ── Y-axis bounds from headroom + chin rules ──────────────────────
 
 
+def _first_face_bounds_y(
+    faces_by_frame: list[Optional[FaceFrame2D]],
+    *,
+    crop_h_frac: float,
+    config: ReframeConfig,
+) -> Optional[tuple[float, float, float]]:
+    """Fix 3.5: pre-pass scan for the first non-None face, compute the
+    same (target_cy, lo_cy, hi_cy) triple we'd compute inline, and use
+    it to initialize prev_* so leading no-face frames don't pin to 0.5.
+    """
+    for face in faces_by_frame:
+        if face is None:
+            continue
+        category = _infer_framing_category(face.height)
+        h_min, h_max = _headroom_bounds_for_category(category, config)
+        face_top_src = face.nose_y - face.height * 0.5
+        face_bot_src = face.nose_y + face.height * 0.5
+        cy_at_hmin = face_top_src - (h_min - 0.5) * crop_h_frac
+        cy_at_hmax = face_top_src - (h_max - 0.5) * crop_h_frac
+        range_lo = min(cy_at_hmin, cy_at_hmax)
+        range_hi = max(cy_at_hmin, cy_at_hmax)
+        chin_margin = 0.02
+        chin_upper_cy = face_bot_src + chin_margin - crop_h_frac / 2.0
+        range_hi = min(range_hi, 1.0 - crop_h_frac / 2.0)
+        range_lo = max(range_lo, chin_upper_cy)
+        range_lo = max(range_lo, crop_h_frac / 2.0)
+        if range_lo > range_hi:
+            range_lo = range_hi = 0.5 * (range_lo + range_hi)
+        target = _target_cy_for_face(face, crop_h_frac=crop_h_frac, config=config)
+        target = max(range_lo, min(range_hi, target))
+        return target, range_lo, range_hi
+    return None
+
+
 def _build_y_bounds(
     faces_by_frame: list[Optional[FaceFrame2D]],
     *,
@@ -148,20 +182,25 @@ def _build_y_bounds(
 ) -> tuple[list[float], list[float], list[float]]:
     """Return ``(target_cy, lo_cy, hi_cy)`` lists, length ``n_frames``.
 
-    When a frame has no face detection we fall back to the previous
-    frame's bounds (held constant), or the middle of the frame when no
-    history exists. This mirrors the x-axis behavior in
-    ``required_regions.build_required_regions``.
+    Fix 3.5: when a frame has no face, hold the last-known-good bounds
+    (prev_target/lo/hi). The initial prev_* values come from a pre-pass
+    that finds the first real face — not from a hardcoded 0.5 center —
+    so leading no-face frames don't pin to frame center and produce
+    chin/head clips when the face appears.
     """
     targets: list[float] = []
     lo: list[float] = []
     hi: list[float] = []
 
-    fallback_t = 0.5
-    fallback_lo = crop_h_frac / 2.0
-    fallback_hi = 1.0 - crop_h_frac / 2.0
-
-    prev_target, prev_lo, prev_hi = fallback_t, fallback_lo, fallback_hi
+    init = _first_face_bounds_y(
+        faces_by_frame, crop_h_frac=crop_h_frac, config=config,
+    )
+    if init is not None:
+        prev_target, prev_lo, prev_hi = init
+    else:
+        prev_target = 0.5
+        prev_lo = crop_h_frac / 2.0
+        prev_hi = 1.0 - crop_h_frac / 2.0
 
     for face in faces_by_frame:
         if face is None:
@@ -211,6 +250,29 @@ def _build_y_bounds(
 # ── X-axis bounds from face visibility + lead-room ────────────────
 
 
+def _first_face_bounds_x(
+    faces_by_frame: list[Optional[FaceFrame2D]],
+    *,
+    crop_w_frac: float,
+    config: ReframeConfig,
+) -> Optional[tuple[float, float, float]]:
+    """Fix 3.5: pre-pass for x-axis — same idea as y-axis. Returns the
+    first real face's (target_cx, lo_cx, hi_cx) triple."""
+    for face in faces_by_frame:
+        if face is None:
+            continue
+        face_l = face.nose_x - face.width * 0.5 - 0.01
+        face_r = face.nose_x + face.width * 0.5 + 0.01
+        range_lo = max(crop_w_frac / 2.0, face_r - crop_w_frac / 2.0)
+        range_hi = min(1.0 - crop_w_frac / 2.0, face_l + crop_w_frac / 2.0)
+        if range_lo > range_hi:
+            range_lo = range_hi = 0.5 * (range_lo + range_hi)
+        target = _target_cx_for_face(face, crop_w_frac=crop_w_frac, config=config)
+        target = max(range_lo, min(range_hi, target))
+        return target, range_lo, range_hi
+    return None
+
+
 def _build_x_bounds(
     faces_by_frame: list[Optional[FaceFrame2D]],
     *,
@@ -221,16 +283,23 @@ def _build_x_bounds(
 
     Per-frame bounds enforce face containment: the face bbox (expanded
     by a small safety padding) must be fully inside the crop.
+
+    Fix 3.5: prev_* is initialized from the first real face via a
+    pre-pass so leading no-face frames don't snap to 0.5.
     """
     targets: list[float] = []
     lo: list[float] = []
     hi: list[float] = []
 
-    fallback = 0.5
-    fallback_lo = crop_w_frac / 2.0
-    fallback_hi = 1.0 - crop_w_frac / 2.0
-
-    prev_t, prev_lo, prev_hi = fallback, fallback_lo, fallback_hi
+    init = _first_face_bounds_x(
+        faces_by_frame, crop_w_frac=crop_w_frac, config=config,
+    )
+    if init is not None:
+        prev_t, prev_lo, prev_hi = init
+    else:
+        prev_t = 0.5
+        prev_lo = crop_w_frac / 2.0
+        prev_hi = 1.0 - crop_w_frac / 2.0
 
     for face in faces_by_frame:
         if face is None:
@@ -272,6 +341,15 @@ class CameraPath2D:
     cy: list[float]
     crop_w_frac: float
     crop_h_frac: float
+    # Fix 3.5: windows where we had no face for longer than
+    # ``kalman_prediction_ms * 3`` (~1s). The adapter widens the crop
+    # to WIDE_MASTER there so stale y-centers don't clip a re-appearing
+    # face above or below the crop edge.
+    y_uncertain_windows: list[tuple[float, float]] = None
+
+    def __post_init__(self):
+        if self.y_uncertain_windows is None:
+            self.y_uncertain_windows = []
 
 
 def solve_2d_camera_path(
@@ -283,12 +361,23 @@ def solve_2d_camera_path(
     target_w: int = 1080,
     target_h: int = 1920,
     config: Optional[ReframeConfig] = None,
+    predictor: "Optional[object]" = None,
+    primary_slot_by_t: Optional[dict] = None,
 ) -> CameraPath2D:
     """Solve a 2-D camera path for a segment of ``faces_by_frame``.
 
     ``timestamps`` and ``faces_by_frame`` must be the same length. Entries
     in ``faces_by_frame`` may be ``None`` for frames without a detection
     — bounds are held constant from the previous frame.
+
+    Fix 3.4: when ``predictor`` (a ``SubjectKalmanRegistry``) and
+    ``primary_slot_by_t`` (a ``dict[timestamp → slot_id]``) are
+    supplied, the per-frame ``tx[i] / ty[i]`` target is blended 70%
+    Kalman-predicted / 30% raw. The Kalman prediction is looked up
+    ``kalman_prediction_ms`` ahead of the current timestamp so the
+    camera LEADS the subject instead of reacting. When the Kalman
+    uncertainty exceeds 0.05 (filter widened by a no-observation
+    gap), we fall back to the raw target for that frame.
 
     Returns a :class:`CameraPath2D`.
     """
@@ -319,6 +408,65 @@ def solve_2d_camera_path(
                                    crop_w_frac=crop_w_frac, config=config)
     ty, loy, hiy = _build_y_bounds(faces_by_frame,
                                    crop_h_frac=crop_h_frac, config=config)
+
+    # Fix 3.4: blend Kalman-predicted targets with raw targets so the
+    # camera leads rather than reacts. Gated by uncertainty so a
+    # widening filter (no-observation gap) falls back to raw.
+    if predictor is not None:
+        _blend_w = 0.70
+        _uncert_gate = 0.05
+        for i, t_now in enumerate(timestamps):
+            slot_id = None
+            if primary_slot_by_t is not None:
+                # primary_slot_by_t keys may not exactly match timestamps
+                # due to floating-point — accept the nearest key within
+                # one frame-step.
+                if t_now in primary_slot_by_t:
+                    slot_id = primary_slot_by_t[t_now]
+                else:
+                    for k_t, k_slot in primary_slot_by_t.items():
+                        if abs(k_t - t_now) < 0.03:
+                            slot_id = k_slot
+                            break
+            if slot_id is None or slot_id < 0:
+                continue
+            pred = predictor.prediction_for_lead(slot_id, t_now)
+            if pred is None:
+                continue
+            pred_x, pred_y, unc = pred
+            if unc > _uncert_gate:
+                continue
+            # Clamp prediction into the existing per-frame bounds so
+            # the blend can't push the LP outside the feasible set.
+            pred_x_c = max(lox[i], min(hix[i], pred_x))
+            pred_y_c = max(loy[i], min(hiy[i], pred_y))
+            tx[i] = _blend_w * pred_x_c + (1.0 - _blend_w) * tx[i]
+            ty[i] = _blend_w * pred_y_c + (1.0 - _blend_w) * ty[i]
+
+    # Fix 3.5: record no-face runs longer than kalman_prediction_ms*3
+    # as y-uncertain windows. The adapter uses these to emit
+    # WIDE_MASTER instead of a tight crop while the subject is lost.
+    uncertain_thresh_sec = max(
+        0.5, getattr(config, "kalman_prediction_ms", 350) / 1000.0 * 3.0
+    )
+    y_uncertain: list[tuple[float, float]] = []
+    run_start: Optional[float] = None
+    run_start_idx = 0
+    for i, face in enumerate(faces_by_frame):
+        if face is None:
+            if run_start is None:
+                run_start = timestamps[i]
+                run_start_idx = i
+        else:
+            if run_start is not None:
+                run_end = timestamps[i]
+                if (run_end - run_start) >= uncertain_thresh_sec:
+                    y_uncertain.append((run_start, run_end))
+                run_start = None
+    if run_start is not None:
+        run_end = timestamps[-1]
+        if (run_end - run_start) >= uncertain_thresh_sec:
+            y_uncertain.append((run_start, run_end))
 
     # LP wants pixel-ish scalars. We solve in normalized [0, 1] space
     # scaled by 1000 so the cost weights don't collapse into rounding
@@ -354,6 +502,7 @@ def solve_2d_camera_path(
         cy=cam_y,
         crop_w_frac=crop_w_frac,
         crop_h_frac=crop_h_frac,
+        y_uncertain_windows=y_uncertain,
     )
 
 
@@ -369,21 +518,53 @@ def faces_from_dense(
     faces, ready for ``solve_2d_camera_path``. Picks the active speaker
     when one is available in the frame, else the largest face.
 
+    Fix 3.6: events with ``slot_id == -1`` (detected speaker whose face
+    hasn't been mapped to a registry slot yet) no longer fall through
+    to "largest face". Instead:
+
+      1. Pick the face with the highest ``lip_aperture`` when any is
+         >= 0.05 — that's the one actually speaking in this frame.
+      2. If no face has ``lip_aperture >= 0.05`` and the event carries
+         an ``audio_peak_x`` hint (0..1), pick the face nearest that x.
+      3. Only then fall back to the largest face.
+
     ``nose_x/y/width/height`` on ``FrameFaces.faces`` entries are in
     percent (0-100) per existing convention in the codebase; this helper
     normalizes to 0-1.
     """
-    def _active_slot_at(t: float) -> int:
+    def _event_at(t: float):
+        """Return the active SpeakerEvent (any slot) at time t, or None."""
         if not active_speaker_events:
-            return -1
+            return None
         for ev in active_speaker_events:
-            if ev.start <= t <= ev.end and getattr(ev, "slot_id", -1) >= 0:
-                return ev.slot_id
-        return -1
+            if ev.start <= t <= ev.end:
+                return ev
+        return None
+
+    def _pick_for_unresolved(faces: list, ev) -> object:
+        """Fix 3.6: unresolved-slot speaker → lip/audio → largest fallback."""
+        best_lip_face = None
+        best_lip = 0.0
+        for f in faces:
+            lip = float(getattr(f, "lip_aperture", 0.0) or 0.0)
+            if lip > best_lip:
+                best_lip = lip
+                best_lip_face = f
+        if best_lip_face is not None and best_lip >= 0.05:
+            return best_lip_face
+        audio_peak_x = getattr(ev, "audio_peak_x", None)
+        if audio_peak_x is not None:
+            try:
+                target = float(audio_peak_x) * 100.0  # nose_x is 0-100
+                return min(faces, key=lambda f: abs(f.nose_x - target))
+            except (TypeError, ValueError):
+                pass
+        return max(faces, key=lambda f: f.width * f.height)
 
     out: list[Optional[FaceFrame2D]] = []
     for ff in dense_faces:
-        active_slot = _active_slot_at(ff.timestamp)
+        event = _event_at(ff.timestamp)
+        active_slot = getattr(event, "slot_id", -1) if event is not None else -1
         faces = [f for f in ff.faces if getattr(f, "is_human", True)]
         if not faces:
             out.append(None)
@@ -395,6 +576,11 @@ def faces_from_dense(
                 if getattr(f, "identity_id", -1) == active_slot:
                     chosen = f
                     break
+        # Fix 3.6: a speaker event exists but its slot is unresolved
+        # (slot_id == -1). Don't silently fall through to largest — use
+        # lip-aperture / audio-peak hints.
+        if chosen is None and event is not None and active_slot < 0:
+            chosen = _pick_for_unresolved(faces, event)
         if chosen is None and slot_preference is not None:
             for f in faces:
                 if getattr(f, "identity_id", -1) == slot_preference:

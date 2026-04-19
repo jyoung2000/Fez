@@ -179,6 +179,25 @@ class ReframeConfig:
     critic_budget_per_clip: int = 20
     critic_cache_dir: str = "/tmp/clipai_critic_cache"
 
+    # ── Saliency fusion weights (Fix 3.10) ────────────────────────
+    # (spatial, temporal, color) weights for the 3-channel saliency
+    # fusion. Must sum to 1.0. Per-content overrides live in the
+    # _CONTENT_OVERRIDES table below; saliency_tracker.py reads
+    # config.saliency_* instead of keeping its own duplicate table.
+    saliency_spatial_weight: float = 0.30
+    saliency_temporal_weight: float = 0.50
+    saliency_color_weight: float = 0.20
+
+    # ── Subject-fusion promotion bounds (Fix 3.9 + 3.10) ──────────
+    # Per-content bounds for the saliency→SubjectTrack promotion gate.
+    # subject_fusion.py reads from config when available instead of
+    # its own tables.
+    fusion_aspect_min: float = 0.8
+    fusion_aspect_max: float = 1.8
+    fusion_area_min: float = 0.005
+    fusion_area_max: float = 0.20
+    fusion_min_persistence_frames: int = 5
+
     # Extra knobs — per-content overrides stored as a dict so the
     # per-type table can live in one place.
     content_overrides: dict = field(default_factory=dict)
@@ -209,44 +228,91 @@ _CONTENT_OVERRIDES = {
         "headroom_min": 0.08,
         "headroom_max": 0.14,
         "zoom_push_in_max_scale": 1.10,
+        # Saliency weights tuned for face-dominant scenes
+        "saliency_spatial_weight": 0.45,
+        "saliency_temporal_weight": 0.30,
+        "saliency_color_weight": 0.25,
     },
     "cinematic_dialogue": {
         "headroom_min": 0.08,
         "headroom_max": 0.14,
+        "saliency_spatial_weight": 0.45,
+        "saliency_temporal_weight": 0.30,
+        "saliency_color_weight": 0.25,
     },
     "multi_speaker_panel": {
-        # Panels: eye-line alignment matters more than motivated zoom.
-        "zoom_push_in_max_scale": 1.00,      # disabled
-        "zoom_pull_out_max_scale": 1.00,     # disabled
+        "zoom_push_in_max_scale": 1.00,
+        "zoom_pull_out_max_scale": 1.00,
         "eye_line_y": 0.38,
-        "thirds_sigma": 0.16,                # softer pull
+        "thirds_sigma": 0.16,
+        "saliency_spatial_weight": 0.45,
+        "saliency_temporal_weight": 0.30,
+        "saliency_color_weight": 0.25,
     },
     "animation_dialogue": {
-        "headroom_max": 0.20,                # anime: more negative space
+        "headroom_max": 0.20,
+        "saliency_spatial_weight": 0.45,
+        "saliency_temporal_weight": 0.30,
+        "saliency_color_weight": 0.25,
+        "fusion_aspect_min": 0.8,
+        "fusion_aspect_max": 1.8,
     },
     "animation": {
         "headroom_max": 0.22,
-        "saccade_ease_ms": 100,              # anime cuts are snappier
+        "saccade_ease_ms": 100,
+        "saliency_spatial_weight": 0.30,
+        "saliency_temporal_weight": 0.50,
+        "saliency_color_weight": 0.20,
+        "fusion_aspect_min": 0.6,
+        "fusion_aspect_max": 2.2,
+        "fusion_area_min": 0.003,
+        "fusion_area_max": 0.30,
+        "fusion_min_persistence_frames": 4,
     },
     "music_video": {
-        "lp_lambda_v": 10.0,                  # follow choreography
-        "zoom_push_in_max_scale": 1.00,       # beat-locked only (Phase 9)
+        "lp_lambda_v": 10.0,
+        "zoom_push_in_max_scale": 1.00,
+        "saliency_spatial_weight": 0.30,
+        "saliency_temporal_weight": 0.45,
+        "saliency_color_weight": 0.25,
+        "fusion_aspect_min": 0.6,
+        "fusion_aspect_max": 2.5,
+        "fusion_min_persistence_frames": 4,
     },
     "sports": {
         "lp_lambda_v_y": 60.0,
         "lead_room_gain": 0.12,
         "zoom_push_in_max_scale": 1.15,
+        "saliency_spatial_weight": 0.25,
+        "saliency_temporal_weight": 0.55,
+        "saliency_color_weight": 0.20,
     },
     "sports_basketball": {
         "lead_room_gain": 0.14,
         "eye_line_y": 0.40,
+        "saliency_spatial_weight": 0.25,
+        "saliency_temporal_weight": 0.55,
+        "saliency_color_weight": 0.20,
+        "fusion_aspect_min": 0.8,
+        "fusion_aspect_max": 1.2,
+        "fusion_area_min": 0.0005,
+        "fusion_area_max": 0.05,
+        "fusion_min_persistence_frames": 3,
     },
     "sports_racing": {
-        "eye_line_y": 0.55,                   # car sits below midframe
+        "eye_line_y": 0.55,
         "lp_lambda_v_y": 80.0,
+        "saliency_spatial_weight": 0.25,
+        "saliency_temporal_weight": 0.55,
+        "saliency_color_weight": 0.20,
+        "fusion_aspect_min": 1.5,
+        "fusion_aspect_max": 4.0,
+        "fusion_area_min": 0.01,
+        "fusion_area_max": 0.35,
+        "fusion_min_persistence_frames": 3,
     },
     "gameplay": {
-        "zoom_push_in_max_scale": 1.00,       # no zoom in chaos
+        "zoom_push_in_max_scale": 1.00,
         "deadzone_frac": 0.025,
     },
     "gameplay_moba": {
@@ -261,6 +327,11 @@ _CONTENT_OVERRIDES = {
         "zoom_push_in_max_scale": 1.00,
         "deadzone_frac": 0.030,
     },
+    "stream": {
+        "saliency_spatial_weight": 0.40,
+        "saliency_temporal_weight": 0.40,
+        "saliency_color_weight": 0.20,
+    },
     "vlog": {
         "headroom_min": 0.08,
         "headroom_max": 0.14,
@@ -268,6 +339,11 @@ _CONTENT_OVERRIDES = {
     },
     "narrative": {
         "zoom_push_in_max_scale": 1.15,
+    },
+    "generic": {
+        "saliency_spatial_weight": 0.30,
+        "saliency_temporal_weight": 0.50,
+        "saliency_color_weight": 0.20,
     },
 }
 
