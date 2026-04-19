@@ -568,6 +568,14 @@ export default function VideoEditor({
   const timecodeInputRef = useRef(null);
   const [videoReady, setVideoReady] = useState(false);
   const [videoError, setVideoError] = useState(false);
+  // While the backend is still transcoding the browser preview
+  // (typical for large 4K / VP9 / MKV uploads) the ``<video>``
+  // element fires ``error`` on every retry until the preview is
+  // ready. We show a friendlier "Preparing preview..." card during
+  // that window instead of the hard "Failed to load video" error,
+  // which is reserved for the case where we've exhausted the whole
+  // retry budget.
+  const [videoPreparing, setVideoPreparing] = useState(false);
 
   // Volume: 0-200 (percentage)
   const [volume, setVolume] = useState(100);
@@ -1257,6 +1265,7 @@ export default function VideoEditor({
       clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
     }
+    setVideoPreparing(false);
     const onMetadata = () => {
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
@@ -1268,6 +1277,7 @@ export default function VideoEditor({
     };
     const onCanPlay = () => {
       setVideoReady(true);
+      setVideoPreparing(false);
       // A successful canplay means the source is good now — zero
       // out the retry counter so a later transient hiccup gets the
       // full retry budget again.
@@ -1277,25 +1287,32 @@ export default function VideoEditor({
       }
     };
     const onError = () => {
-      // The browser-preview transcode on the backend is asynchronous:
-      // when the analysis page opens during upload/processing, the
-      // first few requests can return the raw source (which may not
-      // decode), but subsequent requests return the finished preview.
-      // So retry with exponential backoff instead of giving up after
-      // a single attempt — the preview typically becomes ready within
-      // the first minute.
+      // The browser-preview transcode on the backend is asynchronous
+      // and can take several minutes on large 4K / VP9 / MKV sources.
+      // While it's in flight, ``/api/files/.../video.*`` returns 503
+      // (Retry-After: 5) so the ``<video>`` element fires ``error``
+      // on every attempt until the preview lands. We retry with
+      // exponential backoff for long enough to cover a realistic
+      // transcode of a multi-hundred-MB source — ~10 minutes total —
+      // and surface a friendly "Preparing preview..." card during
+      // that window instead of the hard error.
       //
-      // Schedule: 0.5s, 1s, 2s, 4s, 8s, 15s, 15s, 15s (max 8 tries,
-      // ~45s of retries). If it's still failing after that, the user
-      // sees the error card and can hit Retry manually.
+      // Schedule: 0.5s, 1s, 2s, 4s, 8s, then 10s steady. 60 tries ≈
+      // 10 minutes. After that the hard "Failed to load video" card
+      // shows and the user can hit Retry manually.
       const attempt = retryCountRef.current;
-      const MAX_ATTEMPTS = 8;
+      const MAX_ATTEMPTS = 60;
       if (attempt >= MAX_ATTEMPTS) {
         setVideoError(true);
+        setVideoPreparing(false);
         return;
       }
-      const delays = [500, 1000, 2000, 4000, 8000, 15000, 15000, 15000];
-      const delay = delays[Math.min(attempt, delays.length - 1)];
+      // After the first couple of instant retries, show the
+      // "Preparing preview..." indicator so the user knows it's
+      // still working rather than staring at a blank viewport.
+      if (attempt >= 2) setVideoPreparing(true);
+      const delays = [500, 1000, 2000, 4000, 8000];
+      const delay = attempt < delays.length ? delays[attempt] : 10000;
       retryCountRef.current = attempt + 1;
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
       retryTimerRef.current = setTimeout(() => {
@@ -2880,6 +2897,7 @@ export default function VideoEditor({
         <span>Failed to load video</span>
         <button className="ve-error__retry" onClick={() => {
           setVideoError(false);
+          setVideoPreparing(false);
           // Reset auto-retry budget so a manual Retry gets another
           // full round of backoff attempts, not just a single shot.
           retryCountRef.current = 0;
@@ -2989,6 +3007,25 @@ export default function VideoEditor({
           className={`ve-stage${isFullscreen ? ' ve-stage--fullscreen' : ''}`}
           style={isFullscreen ? { '--ve-target-ratio': targetRatio } : undefined}
         >
+        {/* Preview-transcode overlay. The backend returns 503 while
+            the browser-playable preview is still being built (common
+            for large 4K / VP9 / MKV uploads). The ``<video>`` element
+            fires ``error`` on every retry in that window; rather than
+            showing a hard "Failed to load video" card (which would
+            unmount the player and stall the retry loop), we overlay a
+            friendly status message and let the retry timer keep
+            ticking in the background. */}
+        {videoPreparing && (
+          <div className="ve-preparing-overlay">
+            <span className="ve-preparing-overlay__title">
+              Preparing video preview…
+            </span>
+            <span className="ve-preparing-overlay__hint">
+              Large or high-resolution uploads can take a few minutes
+              to transcode for in-browser playback.
+            </span>
+          </div>
+        )}
         {/* Subject tracking status indicator */}
         {trackingStatus && (
           <div style={{

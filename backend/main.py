@@ -678,8 +678,24 @@ async def serve_file(
     _is_source_video = _basename.startswith("video.") and "/clips/" not in path
     if _is_source_video:
         try:
-            from backend.services.browser_preview import ensure_browser_preview_async
-            file_path = await ensure_browser_preview_async(file_path)
+            from backend.services.browser_preview import (
+                ensure_browser_preview_status_async,
+            )
+            file_path, _preview_ready = await ensure_browser_preview_status_async(
+                file_path,
+            )
+            if not _preview_ready:
+                # Transcode is still in flight (or just failed). Serving
+                # the source here would feed the browser bytes it can't
+                # decode (e.g. 4K VP9-in-MP4), which fires a cascade of
+                # HTML5 error events. Signal the client to wait a bit
+                # and try again instead.
+                return Response(
+                    status_code=503,
+                    content="preview still being prepared",
+                    headers={"Retry-After": "5"},
+                    media_type="text/plain",
+                )
         except Exception as e:  # pragma: no cover — fallback path
             logger.warning("serve_file: browser_preview generation failed: %s", e)
 

@@ -397,8 +397,23 @@ async def public_share_video(token: str, request: Request):
     # Idempotent + cached: first hit blocks for FFmpeg, later hits
     # serve the cached ``browser_preview.mp4`` instantly.
     try:
-        from backend.services.browser_preview import ensure_browser_preview_async
-        file_path = await ensure_browser_preview_async(file_path)
+        from backend.services.browser_preview import (
+            ensure_browser_preview_status_async,
+        )
+        file_path, _preview_ready = await ensure_browser_preview_status_async(
+            file_path,
+        )
+        if not _preview_ready:
+            # Transcode is still in flight. Serving raw source here
+            # would feed the browser unplayable bytes; tell it to
+            # retry shortly instead. The background warm-up task is
+            # already doing the work.
+            return Response(
+                status_code=503,
+                content="preview still being prepared",
+                headers={"Retry-After": "5"},
+                media_type="text/plain",
+            )
     except Exception as e:  # pragma: no cover — fallback path
         logger.warning("share: browser_preview generation failed: %s", e)
 

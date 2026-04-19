@@ -1455,6 +1455,33 @@ input.ve-timecode--input {
   background: var(--ve-btn-active);
 }
 
+.ve-preparing-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  color: #f4f4f5;
+  text-align: center;
+  pointer-events: none;
+}
+.ve-preparing-overlay__title {
+  font-size: 14px;
+  font-weight: 500;
+}
+.ve-preparing-overlay__hint {
+  font-size: 11px;
+  opacity: 0.8;
+  max-width: 420px;
+  line-height: 1.4;
+}
+
 /* ═══════════════════════════════════════════════════════
    Multi-Track Editor Panels
    ═══════════════════════════════════════════════════════ */

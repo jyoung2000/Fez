@@ -451,30 +451,24 @@ def _run_ffmpeg(cmd: list[str], target_path: str) -> bool:
     return True
 
 
-def ensure_browser_preview(source_path: str, *, wait_for_peer: bool = True) -> str:
-    """Return a path the browser can actually play.
+def ensure_browser_preview_status(
+    source_path: str, *, wait_for_peer: bool = True,
+) -> tuple[str, bool]:
+    """Same as :func:`ensure_browser_preview` but also reports whether
+    the returned path is the final playable artifact.
 
-    * If ``source_path`` is already browser-compatible → returns
-      ``source_path`` unchanged.
-    * If a cached ``browser_preview.mp4`` already exists next to the
-      source → returns the cached path.
-    * Otherwise probes the source, builds the preview, and returns
-      the new path. Blocks for the duration of FFmpeg on first call;
-      subsequent calls for the same source are instant.
-    * On any failure (probe error, FFmpeg failure, missing binary)
-      falls back to the source so the endpoint still serves *some*
-      bytes instead of 500-ing. The share page will render exactly
-      as it did before this module existed.
-
-    ``wait_for_peer`` controls what happens when another worker is
-    already generating the preview. The ingest warm-up passes True
-    (it's the background task doing the work). HTTP request handlers
-    pass False so they don't stall the response for minutes while
-    FFmpeg churns on a big source — they return the source path
-    immediately and the next request will see the ready preview.
+    Returns ``(path, ready)``:
+      * ``ready=True`` — ``path`` is safe to hand to ``<video>``: either
+        the finished preview, or a source that's already browser-
+        compatible (``_needs_preview`` returned False), or an unprobable
+        source we can't do better with.
+      * ``ready=False`` — ``path`` is the source file but the source is
+        known to be unplayable in-browser (needs a preview) and the
+        preview isn't available yet. Callers in HTTP handlers should
+        signal the client to retry rather than serve unplayable bytes.
     """
     if not source_path or not os.path.isfile(source_path):
-        return source_path
+        return source_path, True
 
     target_path = _preview_path_for(source_path)
 
@@ -484,7 +478,7 @@ def ensure_browser_preview(source_path: str, *, wait_for_peer: bool = True) -> s
     if os.path.isfile(target_path):
         try:
             if os.path.getmtime(target_path) >= os.path.getmtime(source_path):
-                return target_path
+                return target_path, True
             # Source was replaced — invalidate.
             logger.info(
                 "browser_preview: source newer than cached preview, rebuilding %s",
@@ -495,39 +489,40 @@ def ensure_browser_preview(source_path: str, *, wait_for_peer: bool = True) -> s
             except OSError:
                 pass
         except OSError:
-            return target_path
+            return target_path, True
 
     probe = _probe(source_path)
     if probe is None:
         # Can't probe — fall back to the source so the player at least
         # attempts playback. This keeps the endpoint working on
         # deployments without ffprobe available.
-        return source_path
+        return source_path, True
     if not _needs_preview(source_path, probe):
-        return source_path
+        return source_path, True
 
     lock_path = _lock_path_for(target_path)
     if not _acquire_lock(lock_path):
         # Another worker is already generating. For HTTP handlers we
-        # return the source path immediately so the ``<video>``
-        # element gets bytes to try playing right now instead of
-        # hanging for minutes; the browser will pick up the finished
-        # preview on a later request. The background warm-up path
-        # keeps the old wait semantics so it doesn't race itself.
+        # don't want to stall the response for minutes, so we bail
+        # out and signal ``ready=False``; the handler will translate
+        # that into a 503 + Retry-After, and the browser will pick
+        # up the finished preview on a later request. The background
+        # warm-up path keeps the old wait semantics so it doesn't
+        # race itself.
         if not wait_for_peer:
             logger.info(
-                "browser_preview: peer generating %s — serving source this request",
+                "browser_preview: peer generating %s — signalling not-ready",
                 target_path,
             )
-            return source_path
+            return source_path, False
         logger.info(
             "browser_preview: peer is generating %s, waiting", target_path,
         )
         if _wait_for_peer(target_path, lock_path):
-            return target_path
+            return target_path, True
         # Peer failed or timed out — fall back to source rather than
         # blocking the recipient forever.
-        return source_path
+        return source_path, False
 
     try:
         cmd = _build_ffmpeg_cmd(source_path, target_path, probe)
@@ -538,13 +533,41 @@ def ensure_browser_preview(source_path: str, *, wait_for_peer: bool = True) -> s
         t0 = time.time()
         ok = _run_ffmpeg(cmd, target_path)
         if not ok:
-            return source_path
+            return source_path, False
         logger.info(
             "browser_preview: built %s in %.1fs", target_path, time.time() - t0,
         )
-        return target_path
+        return target_path, True
     finally:
         _release_lock(lock_path)
+
+
+def ensure_browser_preview(source_path: str, *, wait_for_peer: bool = True) -> str:
+    """Return a path the browser can actually play.
+
+    Thin wrapper around :func:`ensure_browser_preview_status` for
+    callers that don't need the readiness flag.
+    """
+    path, _ready = ensure_browser_preview_status(
+        source_path, wait_for_peer=wait_for_peer,
+    )
+    return path
+
+
+async def ensure_browser_preview_status_async(
+    source_path: str, *, wait_for_peer: bool = False,
+) -> tuple[str, bool]:
+    """Async variant of :func:`ensure_browser_preview_status` — runs
+    the blocking work on the default executor so the event loop isn't
+    stalled while FFmpeg churns.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: ensure_browser_preview_status(
+            source_path, wait_for_peer=wait_for_peer,
+        ),
+    )
 
 
 async def ensure_browser_preview_async(
@@ -560,8 +583,7 @@ async def ensure_browser_preview_async(
     generating the preview. The ingest warm-up explicitly passes
     ``wait_for_peer=True`` so it does the work instead of bailing.
     """
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None,
-        lambda: ensure_browser_preview(source_path, wait_for_peer=wait_for_peer),
+    path, _ready = await ensure_browser_preview_status_async(
+        source_path, wait_for_peer=wait_for_peer,
     )
+    return path
