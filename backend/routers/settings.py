@@ -2568,8 +2568,17 @@ def _save_site_config(cfg: dict):
 
 
 @router.get("/site-config")
-async def get_site_config(user: User = Depends(get_current_user)):
-    """Return site customisation (title, favicon URL, logo URL)."""
+async def get_site_config():
+    """Return site customisation (title, favicon URL, logo URL).
+
+    Public so the SPA can render the /login page with the right
+    branding before the user has authenticated. ``AuthMiddleware``
+    bypasses GETs against this path for the same reason; without
+    that pairing the SPA's login splash 401s, the global fetch
+    interceptor force-redirects to /login, the Login page detects
+    the still-valid session cookie and bounces back to /settings,
+    and the user sees a redirect loop.
+    """
     return _load_site_config()
 
 

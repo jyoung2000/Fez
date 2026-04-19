@@ -51,11 +51,19 @@ SESSION_COOKIE = "clipai_session"
 _PUBLIC_EXACT = {
     "/",
     "/login",
-    "/api/site-config",
     "/api/auth/login",
     "/api/auth/bootstrap",
     "/health",
     "/healthz",
+}
+
+# Paths that are public only on GET. Site-config carries branding
+# (title / favicon / logo URLs) that the SPA needs to render the
+# /login page itself, before the user can possibly be authenticated.
+# Mutating verbs on the same path stay protected — they're handled
+# below in ``dispatch`` and re-enter the auth flow.
+_PUBLIC_GET_EXACT = {
+    "/api/site-config",
 }
 
 _PUBLIC_PREFIXES = (
@@ -82,8 +90,10 @@ _SPA_ROUTE_RE = re.compile(
 )
 
 
-def _is_public_path(path: str) -> bool:
+def _is_public_path(path: str, method: str = "GET") -> bool:
     if path in _PUBLIC_EXACT:
+        return True
+    if method == "GET" and path in _PUBLIC_GET_EXACT:
         return True
     for p in _PUBLIC_PREFIXES:
         if path.startswith(p):
@@ -120,7 +130,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if _is_public_path(path):
+        if _is_public_path(path, request.method):
             return await call_next(request)
 
         token = request.cookies.get(SESSION_COOKIE)

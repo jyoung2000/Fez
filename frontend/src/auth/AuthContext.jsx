@@ -88,21 +88,78 @@ export function AuthProvider({ children }) {
   // Listen for 401 responses from anywhere in the app and bounce to
   // login. We patch the global fetch so any component (legacy pages,
   // dropzones, etc.) benefits automatically.
+  //
+  // Defensive design: a single 401 does NOT immediately yank the
+  // user to /login. Some endpoints (e.g. anything Settings.jsx polls
+  // on mount) can 401 for reasons unrelated to the session being
+  // dead — a misconfigured route, a per-resource permission, a race.
+  // If we redirect on every 401, those can trigger a loop with the
+  // Login page (which navigates back as soon as it sees ``user``
+  // populated from a still-valid cookie). So when a 401 fires, we
+  // re-verify against ``/api/auth/me`` and only force the redirect
+  // when the session truly is gone.
   useEffect(() => {
     const originalFetch = window.fetch.bind(window);
+    let verifyPromise = null;
+    let lastRedirectAt = 0;
     window.fetch = async (input, init) => {
       const merged = init ? { credentials: 'include', ...init } : { credentials: 'include' };
       const resp = await originalFetch(input, merged);
       try {
         const url = typeof input === 'string' ? input : input?.url || '';
-        // Only react to 401 from our own API; don't hijack external fetches.
-        if (resp.status === 401 && url.includes('/api/') && !url.includes('/api/auth/login')) {
-          setUser(null);
-          setStatus('unauthenticated');
-          // Only redirect if we're not already on the login page.
-          if (!window.location.pathname.startsWith('/login')) {
-            const here = window.location.pathname + window.location.search;
-            window.location.href = `/login?next=${encodeURIComponent(here)}`;
+        const isOurApi = url.includes('/api/');
+        // Skip auth endpoints themselves: ``/api/auth/login`` 401s on
+        // bad credentials (handled by the form), and ``/api/auth/me``
+        // is the verify probe — recursing would loop forever.
+        const isAuthEndpoint = url.includes('/api/auth/login')
+          || url.includes('/api/auth/me');
+        if (resp.status === 401 && isOurApi && !isAuthEndpoint) {
+          // Coalesce concurrent 401s onto a single verify probe so a
+          // page that fans out 5+ requests doesn't fire 5+ /api/auth/me
+          // calls (and 5+ navigations) when the session really did
+          // expire.
+          if (!verifyPromise) {
+            verifyPromise = (async () => {
+              try {
+                const probe = await originalFetch('/api/auth/me', {
+                  credentials: 'include',
+                });
+                return probe.status === 401;
+              } catch {
+                // Network error on the probe — don't bounce; the
+                // original failure will surface to the caller.
+                return false;
+              } finally {
+                // Clear after a beat so subsequent 401s re-probe
+                // (the user might have just signed out in another tab).
+                setTimeout(() => { verifyPromise = null; }, 500);
+              }
+            })();
+          }
+          const sessionDead = await verifyPromise;
+          if (sessionDead) {
+            setUser(null);
+            setStatus('unauthenticated');
+            // Cooldown: even after we decide the session is gone,
+            // don't fire ``window.location.href`` more than once
+            // per second. Multiple awaiters of the same probe
+            // could otherwise stack navigations.
+            const now = Date.now();
+            if (
+              now - lastRedirectAt > 1000
+              && !window.location.pathname.startsWith('/login')
+            ) {
+              lastRedirectAt = now;
+              const here = window.location.pathname + window.location.search;
+              window.location.href = `/login?next=${encodeURIComponent(here)}`;
+            }
+          } else if (typeof console !== 'undefined') {
+            // Session is still valid but a specific endpoint 401'd —
+            // log so a developer can track down the offending route
+            // instead of silently dropping the user to /login.
+            console.warn(
+              `[auth] 401 from ${url} but /api/auth/me still authenticated; not redirecting.`,
+            );
           }
         }
       } catch {}
