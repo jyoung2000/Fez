@@ -98,6 +98,13 @@ class Settings(BaseSettings):
     SUBJECT_TRACKING_ENABLED: bool = True
     DENSE_FACE_SAMPLE_RATE: float = 0.5  # seconds between dense face detection frames (0.5 = 2fps)
 
+    # ── Scene-analysis VLM budget reallocation ─────────────────
+    # When True, reorder VLM batches so semantically novel frames are
+    # analyzed first. If the vision provider hits rate limits mid-job,
+    # the most distinctive frames still get real descriptions.
+    SCENE_NOVELTY_REWEIGHT_ENABLED: bool = False
+    SCENE_NOVELTY_DISTANCE_THRESHOLD: float = 0.35
+
     # FFmpeg encoding settings
     FFMPEG_PRESET: str = "fast"       # ultrafast|superfast|veryfast|faster|fast|medium|slow
     FFMPEG_CRF: int = 23             # 0-51, lower=better quality, 23=default

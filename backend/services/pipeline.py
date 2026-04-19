@@ -2630,6 +2630,35 @@ async def _run_analysis_inner(job_id: str):
                 )
                 vlm_frames = frames
 
+        # ── Phase 2: novelty-weighted VLM budget reallocation ──
+        # Opt-in; reorders vlm_frames so semantically distinct frames are
+        # analyzed first. If the provider hits rate limits mid-job or the
+        # orchestrator aborts early, the most novel frames still get real
+        # descriptions. Downstream re-sorts scenes_result by timestamp so
+        # the UI timeline remains chronological.
+        if settings.SCENE_NOVELTY_REWEIGHT_ENABLED and len(vlm_frames) > 20:
+            try:
+                from backend.services.frame_novelty import rank_frames_by_novelty
+                _fc_timeline = [
+                    (fr.timestamp, max((f.confidence for f in fr.faces), default=0.0))
+                    for fr in (dense_face_results or face_results or [])
+                ]
+                ranked_idx = await asyncio.to_thread(
+                    rank_frames_by_novelty,
+                    vlm_frames,
+                    scene_cuts=list(scene_cut_timestamps or []),
+                    face_conf_timeline=_fc_timeline,
+                    audio_energy_timeline=None,
+                    distance_threshold=settings.SCENE_NOVELTY_DISTANCE_THRESHOLD,
+                )
+                vlm_frames = [vlm_frames[i] for i in ranked_idx]
+                logger.info(
+                    "[%s] Novelty reweight: reordered %d VLM frames (distinctive first)",
+                    job_id, len(vlm_frames),
+                )
+            except Exception as e:
+                logger.warning("[%s] Novelty reweight skipped: %s", job_id, e)
+
         # ── Encode ONLY the frames the VLM will actually see ──
         # On a 1h 4K clip with 50 % adaptive reduction this saves
         # ~1 minute of CPU vs encoding every uniform frame upfront.
@@ -2743,6 +2772,15 @@ async def _run_analysis_inner(job_id: str):
                 )
             scenes_result = []
             provider = "none"
+
+        # ── Phase 2: restore chronological order after novelty reweight ──
+        # Upstream VLM ingestion may have been novelty-reordered, which
+        # preserves distinctive-frame coverage under rate limits but would
+        # leave the Key Scenes timeline shuffled. Re-sort BEFORE any
+        # downstream consumer (face-registry check, slot snapper, clip
+        # selector) touches the list.
+        if scenes_result:
+            scenes_result = sorted(scenes_result, key=lambda s: s.timestamp)
 
         # ── Face registry consistency check ──
         # After AI + face fusion produces subject_x values, validate every
