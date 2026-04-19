@@ -1109,6 +1109,21 @@ async def _run_analysis_inner(job_id: str):
 
     # Adaptive timeouts based on video duration + provider type + tier
     _EXTRACTION_TIMEOUT = max(600, int(vid_minutes * 60))
+    # Inner Whisper subprocess timeout (must stay in sync with
+    # ``_whisper_timeout`` in _branch_transcription): covers CPU
+    # fallback at ~0.5-1x real-time with safety margin. Factor this
+    # out so the outer ``_trans_scene_timeout`` below can derive
+    # from it — they MUST satisfy outer >= inner + overhead, else
+    # the outer wait_for cancels an in-flight subprocess that was
+    # still well within its own budget (which is exactly the
+    # failure mode we hit in production: outer=1800s fired while
+    # inner=3030s was still running).
+    _INNER_WHISPER_TIMEOUT = max(1800, int(vid_minutes * 60 * 5))
+    # Fixed overhead we budget on top of the inner Whisper timeout:
+    # preflight model load + Ollama evict + HuggingFace metadata
+    # fetch + scene-analysis work that shares this wait_for. 15
+    # minutes is comfortably above what we've observed in the wild.
+    _TRANS_OUTER_OVERHEAD = 900
     if is_ollama_primary:
         est_windows = max(1, int(metadata["duration"] / tier.window_duration)) if tier.window_duration > 0 else 1
         # Ollama timeouts: generous because local inference is slow but reliable
@@ -1117,13 +1132,12 @@ async def _run_analysis_inner(job_id: str):
             est_windows * tier.per_call_timeout_base + 900
         )
         _B64_ENCODE_TIMEOUT = max(300, int(vid_minutes * 10))
-        # Parent timeout for transcription+scene: scale with video length.
-        # GPU Whisper runs ~10-30x real-time, but CPU fallback (int8 small)
-        # can be ~0.5-1x real-time. Use generous multiplier to avoid killing
-        # long transcriptions that fell back to CPU.
+        # Outer transcription+scene timeout. Must strictly exceed
+        # the inner Whisper subprocess timeout so CPU-fallback
+        # transcriptions finish instead of being killed mid-run.
         _trans_scene_timeout = max(
-            1800,  # Minimum 30 minutes
-            int(vid_minutes * 150)  # ~2.5min per min of video (covers CPU fallback + vision)
+            1800,
+            _INNER_WHISPER_TIMEOUT + _TRANS_OUTER_OVERHEAD,
         )
         logger.info(
             "[%s] Ollama-scaled timeouts: extraction=%ds, summary_clip=%ds, "
@@ -1134,8 +1148,11 @@ async def _run_analysis_inner(job_id: str):
     else:
         _SUMMARY_CLIP_TIMEOUT = max(900, int(vid_minutes * 120))
         _B64_ENCODE_TIMEOUT = max(300, int(vid_minutes * 10))
-        # Scale generously to handle CPU Whisper fallback (0.5-1x real-time)
-        _trans_scene_timeout = max(3600, int(vid_minutes * 300))
+        # Same invariant: outer must cover inner Whisper + overhead.
+        _trans_scene_timeout = max(
+            3600,
+            _INNER_WHISPER_TIMEOUT + _TRANS_OUTER_OVERHEAD,
+        )
     logger.info(
         "[%s] Adaptive timeouts: extraction=%ds, summary_clip=%ds, b64=%ds (%.1f min video)",
         job_id, _EXTRACTION_TIMEOUT, _SUMMARY_CLIP_TIMEOUT, _B64_ENCODE_TIMEOUT, vid_minutes,
@@ -2279,7 +2296,15 @@ async def _run_analysis_inner(job_id: str):
 
             # Timeout: audio_duration * 5 — accommodates CPU fallback (0.5-1x real-time)
             # GPU: ~10-30x real-time, CPU: ~0.5-1x real-time. Use 5x for safety.
-            _whisper_timeout = max(1800, int(audio_duration * 5)) if audio_duration > 0 else 3600
+            # Derived from the same formula as ``_INNER_WHISPER_TIMEOUT`` above
+            # so the outer ``_trans_scene_timeout`` is guaranteed to cover us.
+            _whisper_timeout = (
+                max(1800, int(audio_duration * 5)) if audio_duration > 0 else 3600
+            )
+            # Clamp to the outer-scope computed value so the inner and outer
+            # stay perfectly aligned even if future edits touch one formula
+            # and miss the other.
+            _whisper_timeout = min(_whisper_timeout, _INNER_WHISPER_TIMEOUT)
             logger.info("[%s] Whisper subprocess timeout: %ds for %.0fs audio", job_id, _whisper_timeout, audio_duration)
             try:
                 result = await asyncio.wait_for(
