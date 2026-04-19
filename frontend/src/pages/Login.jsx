@@ -53,13 +53,70 @@ export default function Login() {
   }, []);
 
   // Already logged in? Bounce to the ``next`` redirect target (or home).
+  //
+  // Safety net for redirect loops: if a protected page (e.g. /settings)
+  // makes a fetch that 401s for a reason unrelated to the session
+  // being dead, the global fetch interceptor force-navigates to
+  // /login?next=that-page. This effect would then auto-bounce back,
+  // the page would 401 again, and the user would see /login and the
+  // target flash back and forth indefinitely. Track recent bounces
+  // per ``next`` value in sessionStorage and stop auto-navigating
+  // once we've bounced 3+ times within 5 seconds — surface a
+  // friendly error instead so the user isn't trapped.
   useEffect(() => {
-    if (user) {
+    if (!user) return;
+    const params = new URLSearchParams(location.search);
+    const next = params.get('next') || '/';
+
+    let blocked = false;
+    try {
+      const key = `__clipai_loop_${next}`;
+      const now = Date.now();
+      let count = 0;
+      let firstAt = now;
+      const stored = sessionStorage.getItem(key);
+      if (stored) {
+        try {
+          const parsed = JSON.parse(stored);
+          if (now - parsed.firstAt < 5000) {
+            count = parsed.count;
+            firstAt = parsed.firstAt;
+          }
+        } catch { /* corrupt entry — ignore */ }
+      }
+      count += 1;
+      sessionStorage.setItem(key, JSON.stringify({ count, firstAt }));
+      if (count >= 3) {
+        blocked = true;
+        console.warn(
+          `[auth] redirect loop to ${next} detected (${count} bounces in `
+          + `${now - firstAt}ms); not auto-navigating. Look for a /api/* `
+          + `endpoint that returns 401 while you are signed in.`,
+        );
+      }
+    } catch { /* sessionStorage unavailable — fall through and navigate */ }
+
+    if (blocked) {
+      setError(
+        `Couldn't open ${next} — it kept redirecting back to the sign-in `
+        + `page. Try a different page from the menu, or sign in again.`,
+      );
+      return;
+    }
+    navigate(next, { replace: true });
+  }, [user, location.search, navigate]);
+
+  // Clear the loop counter for this ``next`` once the user submits a
+  // fresh login — they've explicitly chosen to retry, give them a
+  // clean slate.
+  useEffect(() => {
+    if (!submitting) return;
+    try {
       const params = new URLSearchParams(location.search);
       const next = params.get('next') || '/';
-      navigate(next, { replace: true });
-    }
-  }, [user, location.search, navigate]);
+      sessionStorage.removeItem(`__clipai_loop_${next}`);
+    } catch { /* sessionStorage unavailable */ }
+  }, [submitting, location.search]);
 
   async function handleSubmit(e) {
     e.preventDefault();
