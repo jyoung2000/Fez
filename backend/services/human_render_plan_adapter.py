@@ -277,22 +277,38 @@ def _overlay_segment(spine: list[_Segment], overlay: _Segment) -> list[_Segment]
 
 
 def _drop_tiny_segments(segments: list[_Segment]) -> list[_Segment]:
+    """Fix §4.3: tiny-segment absorption respects subject continuity.
+
+    A sub-``_MIN_OP_DURATION`` segment is absorbed into the previous
+    segment ONLY when the two share a target_slot (or both have None).
+    If the slots differ we preserve the tiny segment — a 0.25s
+    speaker-change isn't floating-point drift, it's an intentional
+    saccade and must ship as its own op.
+    """
     if not segments:
         return []
     out: list[_Segment] = [segments[0]]
     for s in segments[1:]:
         if s.end - s.start < _MIN_OP_DURATION:
-            out[-1].end = s.end
+            # Only absorb when slots match. Differing slots = intentional cut.
+            if s.target_slot == out[-1].target_slot:
+                out[-1].end = s.end
+                continue
+            # Slot changed — keep the tiny segment as a distinct op so
+            # the renderer emits a real cut to the new speaker instead
+            # of silently glueing to the previous slot.
+            out.append(s)
             continue
         if out[-1].end - out[-1].start < _MIN_OP_DURATION:
-            # previous was tiny; replace with current extended backward
-            out[-1] = _Segment(
-                start=out[-1].start, end=s.end,
-                kind=s.kind, target_slot=s.target_slot,
-                ease_ms=s.ease_ms, reason=s.reason,
-                zoom_scale=s.zoom_scale,
-            )
-            continue
+            if out[-1].target_slot == s.target_slot:
+                out[-1] = _Segment(
+                    start=out[-1].start, end=s.end,
+                    kind=s.kind, target_slot=s.target_slot,
+                    ease_ms=s.ease_ms, reason=s.reason,
+                    zoom_scale=s.zoom_scale,
+                )
+                continue
+            # Previous tiny + different slot — keep both.
         out.append(s)
     return out
 
@@ -328,6 +344,17 @@ def _segment_to_op(
     return _fallback_blur_fill(seg)
 
 
+def _segment_overlaps_uncertain(
+    seg: _Segment, y_uncertain_windows: list
+) -> bool:
+    """Fix §4.2: return True if the segment overlaps any
+    y_uncertain window from :class:`CameraPath2D`."""
+    for u_start, u_end in y_uncertain_windows or []:
+        if seg.start < u_end and seg.end > u_start:
+            return True
+    return False
+
+
 def _op_tracking_or_crop(
     seg: _Segment,
     human: HumanReframePlan,
@@ -339,7 +366,23 @@ def _op_tracking_or_crop(
     """TRACKING_CROP for a segment, collapsing to CROP when the path
     inside the segment is essentially still, and degrading further to
     WIDE_MASTER / BLUR_FILL when the crop can't contain the subject.
+
+    Fix §4.2: when the segment overlaps a y_uncertain_window, emit
+    WIDE_MASTER (wider crop) for that segment instead of a tight
+    TRACKING_CROP. Stale y-centers in uncertain windows produce chin/
+    head clips when the face reappears at an unexpected y.
     """
+    # Fix §4.2: widen on uncertain windows.
+    if _segment_overlaps_uncertain(seg, human.path.y_uncertain_windows):
+        return RenderOp(
+            kind=RenderOpKind.WIDE_MASTER,
+            start_sec=seg.start, end_sec=seg.end,
+            primary_rect=Rect(x=0.0, y=0.0, w=1.0, h=1.0),
+            ease_in_ms=seg.ease_ms,
+            strategy_label=f"wide:uncertain|{seg.reason}",
+            content_type=content_type,
+            speaker_slot=seg.target_slot,
+        )
     path = human.path
     if not path.timestamps:
         return _fallback_blur_fill(seg)
