@@ -1142,7 +1142,7 @@ export default function Upload() {
             htmlFor="content-type-select"
             style={{ display: 'block', fontSize: 13, color: 'var(--text-secondary)', marginBottom: 6 }}
           >
-            Content type (helps tracking accuracy)
+            Content hint (optional — auto-detected per shot)
           </label>
           <select
             id="content-type-select"
@@ -1195,6 +1195,9 @@ export default function Upload() {
               <option value="sports_racing">Racing / Motorsport</option>
             </optgroup>
           </select>
+          <p style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
+            Leave on auto for best results. The pipeline classifies each shot independently.
+          </p>
         </div>
       )}
 

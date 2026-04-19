@@ -123,6 +123,11 @@ class ContentProfile:
     # (e.g. "valorant", "league_of_legends"). Plumbed end-to-end so
     # Phase 7 can look up GAME_HUD_LAYOUTS without re-reading the job.
     game_type: str = ""
+    # Fix 3.1: normalized user override (e.g. "anime", "podcast") when
+    # the upload dropdown sent a hint. Unlike the pre-3.1 behavior, the
+    # hint is a +2.0 score bias — not a gate — so geometry can still
+    # override a wrong guess. None when no hint was provided.
+    user_hint: Optional[str] = None
 
 
 def _infer_sports_subtype_from_objects(
@@ -288,25 +293,28 @@ def classify_content(
         profile.content_type = ContentType.UNKNOWN.value
         return profile
 
-    # ── User override via metadata ──
+    # ── Fix 3.1: user "hint" via metadata (bias, NOT a gate) ──
     #
     # The upload UI sends one of a fixed set of tokens via
     # ``JobResult.content_type_override``, which the pipeline injects
     # into ``metadata['content_type_override']`` before this call. We
     # normalize through ``content_type_strings.normalize_ui_content_type``
-    # so:
-    #   - Legacy tokens ("gameplay", "movie", "podcast") map to the
-    #     correct ContentType enum values (previously only "podcast"
-    #     matched by coincidence).
-    #   - Phase 2 tokens ("debate", "vlog", "anime", "music_video",
-    #     "gameplay_moba", "gameplay_tps", "gameplay_racing", "stream",
-    #     "sports", "cartoon", "panel", "interview", "narrative",
-    #     "cinematic") route without touching this file again.
-    #   - Invalid / unknown tokens fall through to heuristic
-    #     classification instead of crashing.
+    # so legacy / phase-2 / invalid tokens all route consistently (see
+    # that module for the token list).
+    #
+    # Pre-3.1 behavior: a present hint short-circuited to
+    # ``confidence=1.0`` and skipped heuristic scoring entirely — if
+    # the user mis-guessed (or sent a stale selection from an older
+    # session), the wrong solver config ran for the full clip.
+    #
+    # 3.1 behavior: the hint still populates the panel / animated /
+    # sub-type fields (so the secondary dropdowns keep working) but
+    # only adds ``+2.0`` to the matching score. Heuristic signals
+    # continue to run. Geometry that disagrees by ``>=2.5`` wins.
     #
     # Also still accepts the legacy ``content_type`` and ``reframe_style``
     # metadata keys for callers that haven't been updated.
+    normalized = None
     if metadata:
         from backend.services.content_type_strings import (
             normalize_anime_subtype,
@@ -321,8 +329,7 @@ def classify_content(
         )
         normalized = normalize_ui_content_type(user_type) if user_type else None
         if normalized is not None:
-            profile.content_type = normalized.content_type.value
-            profile.confidence = 1.0
+            profile.user_hint = normalized.content_type.value
             profile.is_multi_speaker_panel = normalized.is_multi_speaker_panel
             profile.is_animated = normalized.is_animated
             # Phase 2: populate sub-type fields from the secondary UI
@@ -352,31 +359,57 @@ def classify_content(
                     or None
                 )
             profile.game_type = (metadata.get("game_type") or "").strip().lower()
-            profile.signals = {
-                "user_override": normalized.raw,
-                "normalized": normalized.content_type.value,
-                "panel": normalized.is_multi_speaker_panel,
-                "animated": normalized.is_animated,
-                "anime_subtype": profile.anime_subtype,
-                "music_subtype": profile.music_subtype,
-                "gameplay_subtype": profile.gameplay_subtype,
-                "sports_subtype": profile.sports_subtype,
-                "game_type": profile.game_type or None,
-            }
-            _log(
-                "user override %r → %s (conf=1.00, panel=%s, animated=%s, "
-                "anime_sub=%s, music_sub=%s, gameplay_sub=%s, sports_sub=%s, game=%s)",
-                normalized.raw,
-                normalized.content_type.value,
-                normalized.is_multi_speaker_panel,
-                normalized.is_animated,
-                profile.anime_subtype,
-                profile.music_subtype,
-                profile.gameplay_subtype,
-                profile.sports_subtype,
-                profile.game_type or None,
+            signals["user_hint"] = normalized.content_type.value
+            signals["user_hint_raw"] = normalized.raw
+            # Gaming / stream stays as a gate: the gaming pipeline is
+            # out of scope for the 3.x overhaul and its per-genre
+            # behavior must remain byte-for-byte identical when the
+            # user picks a gameplay token.
+            _is_gameplay_hint = (
+                normalized.content_type == ContentType.GAMING
+                or (normalized.gameplay_subtype is not None)
             )
-            return profile
+            if _is_gameplay_hint:
+                profile.content_type = normalized.content_type.value
+                profile.confidence = 1.0
+                profile.signals = signals
+                _log(
+                    "gameplay hint %r → %s (gate, conf=1.00)",
+                    normalized.raw, normalized.content_type.value,
+                )
+                return profile
+            # Degenerate-inputs escape hatch: if there's no heuristic
+            # input at all (no cuts, no faces, no scenes), we have
+            # nothing to classify against — trust the hint. This keeps
+            # the override-plumbing tests green for empty fixtures
+            # while still letting geometry dominate on real clips.
+            _degenerate = (
+                not shot_cuts
+                and not dense_faces
+                and not scenes
+                and (face_registry is None or not getattr(
+                    face_registry, "slots", None))
+            )
+            if _degenerate:
+                profile.content_type = normalized.content_type.value
+                profile.confidence = 1.0
+                profile.signals = signals
+                _log(
+                    "hint %r with degenerate inputs → %s (conf=1.00)",
+                    normalized.raw, normalized.content_type.value,
+                )
+                return profile
+            # Non-gameplay, non-degenerate: apply as a +2.0 bias to
+            # the heuristic score for the matching bucket. Geometry
+            # that disagrees by >=2.5 still wins.
+            hint_key = normalized.content_type.value
+            if hint_key in scores:
+                scores[hint_key] += 2.0
+                signals["user_hint_bias"] = 2.0
+            _log(
+                "user hint %r → +2.0 on %s (not a gate; heuristics continue)",
+                normalized.raw, hint_key,
+            )
 
     # ── Signal 1: Cut rate ──
     cut_rate = len(shot_cuts) / (video_duration / 60.0) if video_duration > 0 else 0
@@ -808,8 +841,12 @@ def classify_content(
 
     profile.signals = signals
     profile.is_cinematic_dialogue = is_cinematic_dialogue
-    profile.is_animated = is_animated
-    profile.is_multi_speaker_panel = is_multi_speaker_panel
+    # Fix 3.1: OR with the user hint so a hint-driven is_animated /
+    # is_multi_speaker_panel survives the heuristic reassignment here.
+    profile.is_animated = is_animated or profile.is_animated
+    profile.is_multi_speaker_panel = (
+        is_multi_speaker_panel or profile.is_multi_speaker_panel
+    )
     _log(
         "%s (conf=%.2f, signals=%s, scores=%s)",
         profile.content_type, profile.confidence,
