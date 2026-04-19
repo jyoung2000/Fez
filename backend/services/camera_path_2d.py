@@ -473,21 +473,53 @@ def faces_from_dense(
     faces, ready for ``solve_2d_camera_path``. Picks the active speaker
     when one is available in the frame, else the largest face.
 
+    Fix 3.6: events with ``slot_id == -1`` (detected speaker whose face
+    hasn't been mapped to a registry slot yet) no longer fall through
+    to "largest face". Instead:
+
+      1. Pick the face with the highest ``lip_aperture`` when any is
+         >= 0.05 — that's the one actually speaking in this frame.
+      2. If no face has ``lip_aperture >= 0.05`` and the event carries
+         an ``audio_peak_x`` hint (0..1), pick the face nearest that x.
+      3. Only then fall back to the largest face.
+
     ``nose_x/y/width/height`` on ``FrameFaces.faces`` entries are in
     percent (0-100) per existing convention in the codebase; this helper
     normalizes to 0-1.
     """
-    def _active_slot_at(t: float) -> int:
+    def _event_at(t: float):
+        """Return the active SpeakerEvent (any slot) at time t, or None."""
         if not active_speaker_events:
-            return -1
+            return None
         for ev in active_speaker_events:
-            if ev.start <= t <= ev.end and getattr(ev, "slot_id", -1) >= 0:
-                return ev.slot_id
-        return -1
+            if ev.start <= t <= ev.end:
+                return ev
+        return None
+
+    def _pick_for_unresolved(faces: list, ev) -> object:
+        """Fix 3.6: unresolved-slot speaker → lip/audio → largest fallback."""
+        best_lip_face = None
+        best_lip = 0.0
+        for f in faces:
+            lip = float(getattr(f, "lip_aperture", 0.0) or 0.0)
+            if lip > best_lip:
+                best_lip = lip
+                best_lip_face = f
+        if best_lip_face is not None and best_lip >= 0.05:
+            return best_lip_face
+        audio_peak_x = getattr(ev, "audio_peak_x", None)
+        if audio_peak_x is not None:
+            try:
+                target = float(audio_peak_x) * 100.0  # nose_x is 0-100
+                return min(faces, key=lambda f: abs(f.nose_x - target))
+            except (TypeError, ValueError):
+                pass
+        return max(faces, key=lambda f: f.width * f.height)
 
     out: list[Optional[FaceFrame2D]] = []
     for ff in dense_faces:
-        active_slot = _active_slot_at(ff.timestamp)
+        event = _event_at(ff.timestamp)
+        active_slot = getattr(event, "slot_id", -1) if event is not None else -1
         faces = [f for f in ff.faces if getattr(f, "is_human", True)]
         if not faces:
             out.append(None)
@@ -499,6 +531,11 @@ def faces_from_dense(
                 if getattr(f, "identity_id", -1) == active_slot:
                     chosen = f
                     break
+        # Fix 3.6: a speaker event exists but its slot is unresolved
+        # (slot_id == -1). Don't silently fall through to largest — use
+        # lip-aperture / audio-peak hints.
+        if chosen is None and event is not None and active_slot < 0:
+            chosen = _pick_for_unresolved(faces, event)
         if chosen is None and slot_preference is not None:
             for f in faces:
                 if getattr(f, "identity_id", -1) == slot_preference:
