@@ -91,7 +91,10 @@ def extract_description_fallback(raw: str) -> str:
     text = re.sub(r'<(?:think|reasoning)>.*?</(?:think|reasoning)>', '', raw, flags=re.DOTALL)
     m = re.search(r'"description"\s*:\s*"', text)
     if not m:
-        return text[:500] if text else ""
+        # Do NOT return raw model output. Caller is responsible for
+        # generating a transcript-aware or timestamp-only fallback when
+        # the response can't be parsed.
+        return ""
     start = m.end()
     # Walk forward to find the unescaped closing quote
     i = start

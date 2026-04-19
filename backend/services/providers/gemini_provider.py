@@ -17,6 +17,9 @@ from backend.services.providers.base import (
     build_fallback_summary, has_real_summary_content, build_summary_from_transcript,
     CLIP_JSON_SCHEMA_FOUR_AXIS, parse_clip_dict,
 )
+from backend.services.scene_description_validator import (
+    sanitize_description, is_valid_description,
+)
 from backend.services.prompts import DEFAULT_FRAME_ANALYSIS_PROMPT, DEFAULT_VIRAL_CLIP_PROMPT, DEFAULT_SEO_PROMPT, DEFAULT_SUMMARY_PROMPT
 from backend.services.transcript_utils import analyze_transcript_energy, correlate_scenes_with_transcript, derive_content_guidance
 
@@ -352,20 +355,26 @@ class GeminiProvider(ChunkedClipDetectionMixin, AIProvider):
                             sx = 50
                         else:
                             sx = max(0, min(100, int(sx)))
+                        _gem_desc = sanitize_description(item.get("description", ""))
+                        if not is_valid_description(_gem_desc)[0]:
+                            _gem_desc = ""
                         batch_results[batch_idx].append(SceneDescription(
                             timestamp=item.get("timestamp", frame_ref.timestamp),
-                            description=item.get("description", ""),
+                            description=_gem_desc,
                             importance_score=max(1, min(10, int(item.get("importance_score", 5)))),
                             thumbnail_path=frame_ref.path,
                             subject_x=sx,
                         ))
                 except (json.JSONDecodeError, KeyError, IndexError) as e:
                     logger.warning(f"Failed to parse Gemini frame analysis: {e}")
-                    fallback_desc = extract_description_fallback(raw) if raw else "Analysis failed"
+                    fallback_desc = extract_description_fallback(raw) if raw else ""
+                    clean_fb = sanitize_description(fallback_desc)
+                    if not is_valid_description(clean_fb)[0]:
+                        clean_fb = ""
                     for frame in batch:
                         batch_results[batch_idx].append(SceneDescription(
                             timestamp=frame.timestamp,
-                            description=fallback_desc[:200],
+                            description=clean_fb,
                             importance_score=5,
                             thumbnail_path=frame.path,
                             subject_x=50,

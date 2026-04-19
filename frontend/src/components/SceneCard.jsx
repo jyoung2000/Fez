@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { renderDescription } from '../utils/sceneDescription';
 
 function formatTime(seconds) {
   const m = Math.floor(seconds / 60);
@@ -241,7 +242,7 @@ export default function SceneCard({ scene, sceneIndex, jobId, onClick, onUpdated
           </div>
         ) : (
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.4 }}>
-            {String(scene.description || '')}
+            {renderDescription(scene.description, scene.timestamp, sceneIndex)}
           </p>
         )}
       </div>

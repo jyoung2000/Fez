@@ -73,7 +73,8 @@ _SYNTHETIC_SCENE_MARKERS: tuple[str, ...] = (
 
 
 def is_synthetic_scene(scene) -> bool:
-    """Return True iff ``scene.description`` is an error placeholder.
+    """Return True iff ``scene.description`` is an error placeholder OR
+    structurally invalid (dict repr, JSON leak, refusal, too short).
 
     Used by the pipeline's ``real_scenes`` filter, the warning logic
     that recommends "switch vision providers" when 0 real descriptions
@@ -89,7 +90,14 @@ def is_synthetic_scene(scene) -> bool:
     if low.startswith("frame at "):
         # Ollama's "Frame at 12.5s (vision unavailable — CLIP on CPU)"
         return True
-    return any(marker in low for marker in _SYNTHETIC_SCENE_MARKERS)
+    if any(marker in low for marker in _SYNTHETIC_SCENE_MARKERS):
+        return True
+    # Structural check — catches JSON dict reprs, refusals, unparsed
+    # model output that doesn't match any known marker phrase.
+    # Import inside the function to avoid circular imports at load.
+    from backend.services.scene_description_validator import is_valid_description
+    ok, _ = is_valid_description(desc)
+    return not ok
 
 
 def _record_pipeline_warning(job_id: str, message: str) -> None:

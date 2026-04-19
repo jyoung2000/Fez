@@ -18,6 +18,9 @@ from backend.services.providers.base import (
     build_fallback_summary, has_real_summary_content, build_summary_from_transcript,
     CLIP_JSON_SCHEMA_FOUR_AXIS, parse_clip_dict,
 )
+from backend.services.scene_description_validator import (
+    sanitize_description, is_valid_description,
+)
 from backend.services.prompts import DEFAULT_FRAME_ANALYSIS_PROMPT, DEFAULT_VIRAL_CLIP_PROMPT, DEFAULT_SEO_PROMPT, DEFAULT_SUMMARY_PROMPT
 from backend.services.transcript_utils import analyze_transcript_energy, correlate_scenes_with_transcript, derive_content_guidance
 from backend.services.hot_zone_scorer import format_hot_zones_for_prompt
@@ -1730,16 +1733,11 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     _prev_sx = subject_x
 
                     # ── Quality validation ──
-                    if description:
-                        # Strip JSON fragments from non-JSON-parsed descriptions
-                        if not json_parsed_ok:
-                            if description.startswith('{') or description.startswith('['):
-                                description = re.sub(r'[{}\[\]":]', ' ', description)
-                                description = re.sub(r'\s+', ' ', description).strip()
-
-                        # Strip markdown code fences
-                        if description.startswith('```'):
-                            description = description.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
+                    # Shared validator handles code fences, control chars,
+                    # dict reprs, refusals, and JSON leaks consistently
+                    # across every provider. Replaces the ad-hoc strip
+                    # block that used to live here.
+                    description = sanitize_description(description)
 
                     # Generate fallback description when empty/bad
                     if not description or len(description) < 3 or description.lower() in (

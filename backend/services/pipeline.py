@@ -2920,6 +2920,40 @@ async def _run_analysis_inner(job_id: str):
                 len(scenes_result) - ch_used,
             )
 
+        # ── Phase 1.5: Final description sanitization ──
+        # Guarantees no raw VLM junk (dict reprs, JSON leaks, refusals)
+        # escapes to storage or the UI regardless of which provider path
+        # produced the scene. Runs after every provider-side cleanup so
+        # this is the last line of defense before persistence.
+        from backend.services.scene_description_validator import (
+            sanitize_description as _p15_sanitize,
+            is_valid_description as _p15_is_valid,
+            fallback_description_for_scene as _p15_fallback,
+        )
+        _cleaned = _replaced = 0
+        for _i, _scene in enumerate(scenes_result):
+            _original = _scene.description or ""
+            _clean = _p15_sanitize(_original)
+            _ok, _reason = _p15_is_valid(_clean)
+            if _ok:
+                if _clean != _original:
+                    _scene.description = _clean
+                    _cleaned += 1
+            else:
+                _scene.description = _p15_fallback(
+                    timestamp=_scene.timestamp,
+                    transcript_segments=None,
+                    scene_index=_i + 1,
+                )
+                if hasattr(_scene, "description_source"):
+                    _scene.description_source = "transcript_fallback"
+                _replaced += 1
+        if _cleaned or _replaced:
+            logger.info(
+                "[%s] Description sanitization: cleaned=%d, replaced=%d, total=%d",
+                job_id, _cleaned, _replaced, len(scenes_result),
+            )
+
         await database.update_job_status(
             job_id,
             scenes=list(scenes_result),
@@ -3345,6 +3379,32 @@ async def _run_analysis_inner(job_id: str):
                 "[%s] Heuristic key-scene enrichment failed (non-fatal): %s",
                 job_id, enrich_err,
             )
+
+    # ── Phase 1.5 transcript upgrade pass ────────────────────────
+    # Upgrade any "Key moment N at X.Xs" timestamp-only fallbacks (emitted
+    # by the scene-branch sanitization pass BEFORE transcription finished)
+    # with transcript excerpts now that transcript_segments is available.
+    import re as _p15_re
+    from backend.services.scene_description_validator import (
+        fallback_description_for_scene as _p15_fb,
+    )
+    _p15_ts_only = _p15_re.compile(r"^Key moment \d+ at [\d.]+s$")
+    _p15_upgraded = 0
+    for _i, _scene in enumerate(scenes or []):
+        if _p15_ts_only.match(_scene.description or ""):
+            _up = _p15_fb(
+                timestamp=_scene.timestamp,
+                transcript_segments=list(transcript or []) or None,
+                scene_index=_i + 1,
+            )
+            if _up != _scene.description:
+                _scene.description = _up
+                _p15_upgraded += 1
+    if _p15_upgraded:
+        logger.info(
+            "[%s] Transcript enrichment: upgraded %d timestamp-only fallbacks",
+            job_id, _p15_upgraded,
+        )
 
     # ── Last-resort fallback: scenes still empty after the join ──
     # Covers the case where ``_branch_scene_analysis`` raised mid-flight
