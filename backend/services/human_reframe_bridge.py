@@ -147,6 +147,23 @@ def maybe_override_render_plan(
                        job_id, e)
         return legacy_rp
 
+    # Fix 3.8: local critic + auto-repair pass on the new plan. Local
+    # heuristics only; no network. Budget-limited by config.
+    try:
+        from backend.services.reframe_critic import auto_repair_plan
+        if getattr(config, "critic_mode", "learned") != "off":
+            new_rp, fixes, _ = auto_repair_plan(
+                new_rp, dense_faces=list(dense_faces or []), config=config,
+            )
+            if fixes:
+                logger.info(
+                    "[%s] human-reframe critic: applied %d fixes (%s)",
+                    job_id, len(fixes),
+                    ", ".join(sorted({f.reason for f in fixes}))[:120],
+                )
+    except Exception as e:
+        logger.warning("[%s] critic auto-repair failed (%s); continuing", job_id, e)
+
     # Fix 3.7: coverage is now a repair-in-place cascade. Only fall
     # back to the legacy plan when every repair attempt fails.
     coverage: CoverageReport = verify_frame_coverage(new_rp)
