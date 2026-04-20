@@ -133,6 +133,20 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if _is_public_path(path, request.method):
             return await call_next(request)
 
+        # Signed-URL fast path: GET /api/files/{job_id}/{path}?exp=&sig=
+        # lets HTML5 <video> / <img> elements load media without the
+        # session cookie. The signature itself is the credential; the
+        # handler re-verifies it before serving bytes. Any other
+        # method, or a request missing either query param, falls
+        # through to the normal cookie path.
+        if (
+            request.method == "GET"
+            and path.startswith("/api/files/")
+            and request.query_params.get("exp")
+            and request.query_params.get("sig")
+        ):
+            return await call_next(request)
+
         token = request.cookies.get(SESSION_COOKIE)
         if not token:
             return JSONResponse(

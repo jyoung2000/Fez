@@ -20,6 +20,7 @@ import { computeClipSubjectX } from '../utils/subjectTracking';
 import useTimelineStore from '../stores/timelineStore';
 import { buildOverlayPayload, buildVideoEffectsPayload, mapSubtitleSettings } from '../utils/buildExportPayload';
 import { DEFAULT_CLIP_SETTINGS, DEFAULT_GEN_SETTINGS } from '../utils/defaultSettings';
+import { useSignedMediaUrl, getSignedMediaUrl } from '../utils/signedMediaUrl';
 
 // Speaker color palette (must match SubtitleOverlay / ClipSettingsPanel / VideoEditor)
 const DEFAULT_SPEAKER_PALETTE = [
@@ -288,6 +289,14 @@ export default function Analysis() {
   const { jobId } = useParams();
   const navigate = useNavigate();
   const [job, setJob] = useState(null);
+  // Signed preview URL for /api/files/<jobId>/video.<ext>. ``videoSrc``
+  // is null until the first sign() round-trip completes; downstream
+  // <VideoEditor> call-sites must tolerate that (they already do — the
+  // loading placeholder shows until a canplay event fires anyway).
+  const videoPathForHook = job?.file_path
+    ? `video.${job.file_path.split('.').pop() || 'mp4'}`
+    : null;
+  const { url: videoSrc } = useSignedMediaUrl(jobId, videoPathForHook);
   const [tab, setTab] = useState(0);
   const prevTabRef = useRef(0);
   const [transcriptInitTime, setTranscriptInitTime] = useState(null);
@@ -963,7 +972,7 @@ export default function Analysis() {
     }
   }, [tab]);
 
-  const handleClipPreview = (clip) => {
+  const handleClipPreview = async (clip) => {
     // Save current clip's editor state before switching
     if (clipPreview) {
       clipSegmentsMapRef.current[clipPreview.id] = editorSegments;
@@ -1005,8 +1014,12 @@ export default function Analysis() {
     const fullTranscript = job.translated_transcript?.length
       ? job.translated_transcript
       : (job.transcript || []);
+    const _clipVideoSrc = await getSignedMediaUrl(
+      jobId,
+      `video.${job.file_path?.split('.').pop() || 'mp4'}`,
+    ).catch(() => `/api/files/${jobId}/video.${job.file_path?.split('.').pop() || 'mp4'}`);
     useTimelineStore.getState().initFromClip({
-      src: `/api/files/${jobId}/video.${job.file_path?.split('.').pop() || 'mp4'}`,
+      src: _clipVideoSrc,
       clipStart: clip.start_time,
       clipEnd: clip.end_time,
       subtitleSegments: fullTranscript,
@@ -1671,7 +1684,7 @@ export default function Analysis() {
       sourceDims = { w: parts[0], h: parts[1] };
     }
   }
-  const videoSrc = `/api/files/${jobId}/video.${job.file_path?.split('.').pop() || 'mp4'}`;
+  const videoRelPath = `video.${job.file_path?.split('.').pop() || 'mp4'}`;
   const bestClipId = job.clips?.length ? job.clips.reduce((best, c) => c.viral_score > best.viral_score ? c : best, job.clips[0])?.id : null;
 
   // Compute subject_x from scenes (with boundary interpolation for clips between scene timestamps)
@@ -2378,7 +2391,7 @@ export default function Analysis() {
                 const fvStart = fullVideoRange ? fullVideoRange.start : 0;
                 const fvEnd = fullVideoRange ? fullVideoRange.end : (job.duration || 0);
                 useTimelineStore.getState().initFromClip({
-                  src: `/api/files/${jobId}/video.${job.file_path?.split('.').pop() || 'mp4'}`,
+                  src: videoSrc || `/api/files/${jobId}/video.${job.file_path?.split('.').pop() || 'mp4'}`,
                   clipStart: fvStart,
                   clipEnd: fvEnd,
                   subtitleSegments: fvTranscript,

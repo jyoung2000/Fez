@@ -12,6 +12,7 @@ import sanitizeJob, { sanitizeSubtitleSettings } from '../utils/sanitizeJob';
 import useTimelineStore from '../stores/timelineStore';
 import { buildOverlayPayload, buildVideoEffectsPayload, mapSubtitleSettings } from '../utils/buildExportPayload';
 import { DEFAULT_CLIP_SETTINGS } from '../utils/defaultSettings';
+import { useSignedMediaUrl } from '../utils/signedMediaUrl';
 
 function formatDuration(seconds) {
   if (!seconds) return '-';
@@ -512,6 +513,13 @@ export default function ViralClips() {
   const [editingClip, setEditingClip] = useState(null);
   const [previewClip, setPreviewClip] = useState(null);
   const [previewKey, setPreviewKey] = useState(0); // Incremented to force ClipPreview remount
+  // Signed URL for the currently-previewed clip's source video — lets
+  // the <video> element fetch range bytes without a session cookie, so
+  // reverse-proxy header flakes don't kill playback mid-transcode.
+  const { url: previewVideoSrc } = useSignedMediaUrl(
+    previewClip?.jobId || null,
+    previewClip ? `video.${previewClip.fileExt || 'mp4'}` : null,
+  );
   const [centerSubjectState, setCenterSubjectState] = useState('idle'); // idle | centering | done
   const [trackingApplied, setTrackingApplied] = useState(false); // flash when tracking updates
   // Staged aspect ratio: pendingAR is what user selected, activeAR is what
@@ -1994,7 +2002,7 @@ export default function ViralClips() {
           >
           <ClipPreview
             key={`preview-${previewClip.jobId}-${previewClip.id}-${previewKey}`}
-            src={`/api/files/${previewClip.jobId}/video.${previewClip.fileExt || 'mp4'}`}
+            src={previewVideoSrc || `/api/files/${previewClip.jobId}/video.${previewClip.fileExt || 'mp4'}`}
             clipStart={previewClip.start_time}
             clipEnd={previewClip.end_time}
             title={previewClip.title || `Clip ${previewClip.id}`}
