@@ -2905,7 +2905,71 @@ async def _run_analysis_inner(job_id: str):
         # resolve to exactly x=50. This kills the TF2 / Marvel
         # Rivals-style regression where a stale or noisy detection
         # would pull the crop off-axis on cartoon FPS content.
-        if _is_gameplay and scenes_result and not _early_anime_hint:
+        #
+        # Anime veto refresh: ``_early_anime_hint`` is set ONCE at
+        # pipeline init (line ~1481), *before* the dense face pass
+        # runs. The dense pass uses lbpcascade_animeface and can flip
+        # ``face_detector.ANIME_MODE_DETECTED`` to True after seeing
+        # >100 verified anime faces. Without re-reading that flag
+        # here, an anime video with a generic filename
+        # (``episode_01.mkv``, ``demon_slayer_S01E01.mkv``, etc.)
+        # that triggered early pre-detect ``_is_gameplay=True`` on
+        # sparse-face-ratio heuristics falls through the
+        # ``not _early_anime_hint`` guard below and gets every
+        # scene's subject_x slammed to 50 — producing a static
+        # center crop on animated content. Also consults the
+        # dense-face anime ratio as a secondary signal for short
+        # clips where the dense pass didn't cross the 100-face
+        # threshold but still saw majority-anime faces.
+        _anime_veto = _early_anime_hint
+        if not _anime_veto:
+            try:
+                # Re-import to get the freshest module-level flag —
+                # the dense pass writes to it during execution.
+                from backend.services.face_detector import (
+                    ANIME_MODE_DETECTED as _amd_now,
+                )
+                if _amd_now:
+                    _anime_veto = True
+                    logger.info(
+                        "[%s] Gameplay override veto: "
+                        "ANIME_MODE_DETECTED flipped True after dense "
+                        "pass — treating as animated, not gameplay",
+                        job_id,
+                    )
+            except Exception:
+                pass
+        if not _anime_veto and dense_face_results:
+            # Secondary signal for short clips (<100 faces): if the
+            # dense pass tagged a majority of its faces as anime
+            # (lbpcascade_animeface contributions), veto even if the
+            # module-level threshold hasn't flipped yet. Each dense
+            # face result may carry an ``is_anime`` boolean or an
+            # ``anime_source`` tag depending on detector build — we
+            # accept either.
+            try:
+                _total = 0
+                _anime_n = 0
+                for _fr in dense_face_results:
+                    for _f in getattr(_fr, "faces", None) or []:
+                        _total += 1
+                        if (
+                            getattr(_f, "is_anime", False)
+                            or getattr(_f, "anime_source", "")
+                            or getattr(_f, "source", "") == "anime"
+                        ):
+                            _anime_n += 1
+                if _total >= 30 and _anime_n / _total >= 0.5:
+                    _anime_veto = True
+                    logger.info(
+                        "[%s] Gameplay override veto: dense-face "
+                        "anime ratio %d/%d (≥0.5) — treating as "
+                        "animated, not gameplay",
+                        job_id, _anime_n, _total,
+                    )
+            except Exception:
+                pass
+        if _is_gameplay and scenes_result and not _anime_veto:
             try:
                 from backend.services.l1_camera_path import (
                     GAMING_CROSSHAIR_CONF_THRESHOLD,
