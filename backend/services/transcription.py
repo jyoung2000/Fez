@@ -2290,6 +2290,71 @@ async def extract_word_timestamps(
     )
 
 
+def _split_segments_on_word_boundaries(
+    raw_segments: list[dict],
+    word_split_gap: float,
+    rate_change_threshold: float,
+) -> list[dict]:
+    """Split Whisper segments at strong intra-segment speaker boundaries.
+
+    A Whisper segment can cover multiple speakers when the pause
+    between them is short enough that VAD merged them into one
+    block. When ``seg.words`` is present we can look at word-to-word
+    gaps; a gap ≥ ``word_split_gap`` that also straddles a
+    word-rate change ≥ ``rate_change_threshold`` is treated as a
+    speaker boundary and the segment is split in two.
+
+    No-op when ``words`` is missing. Preserves all non-word fields;
+    copies them to both halves. The main pass (``_assign_speakers``)
+    then sees independent segments and can attribute each to a
+    different speaker.
+    """
+    def _wps(words):
+        if not words:
+            return 3.0
+        dur = (words[-1]["end"] - words[0]["start"]) or 0.0
+        if dur <= 0.5:
+            return 3.0
+        return len(words) / dur
+
+    out: list[dict] = []
+    for seg in raw_segments:
+        words = seg.get("words") or []
+        if len(words) < 4:
+            out.append(seg)
+            continue
+        # Find the first internal gap that qualifies as a boundary.
+        split_idx = -1
+        for i in range(1, len(words) - 1):
+            gap = float(words[i]["start"]) - float(words[i - 1]["end"])
+            if gap < word_split_gap:
+                continue
+            left_rate = _wps(words[:i])
+            right_rate = _wps(words[i:])
+            denom = max(left_rate, right_rate, 0.1)
+            if abs(left_rate - right_rate) / denom >= rate_change_threshold:
+                split_idx = i
+                break
+        if split_idx < 0:
+            out.append(seg)
+            continue
+        left_words = words[:split_idx]
+        right_words = words[split_idx:]
+        left_text = " ".join((w.get("word", "") or "").strip() for w in left_words).strip()
+        right_text = " ".join((w.get("word", "") or "").strip() for w in right_words).strip()
+        left_seg = dict(seg)
+        left_seg["end"] = float(left_words[-1]["end"])
+        left_seg["text"] = left_text or seg.get("text", "")
+        left_seg["words"] = left_words
+        right_seg = dict(seg)
+        right_seg["start"] = float(right_words[0]["start"])
+        right_seg["text"] = right_text or seg.get("text", "")
+        right_seg["words"] = right_words
+        out.append(left_seg)
+        out.append(right_seg)
+    return out
+
+
 def _assign_speakers(
     raw_segments: list[dict],
     removed_intervals: list[tuple[float, float]] | None = None,
@@ -2316,14 +2381,33 @@ def _assign_speakers(
         2,
         settings.DIARIZATION_MAX_SPEAKERS if settings.DIARIZATION_MAX_SPEAKERS > 0 else 20,
     )
-    TURN_GAP = 1.2
-    NEW_SPEAKER_GAP = 5.0
+    # Thresholds tightened for V2. Whisper large-v3 with VAD produces
+    # 0.4-1.0 s intra-speaker gaps and 2-4 s inter-speaker gaps on
+    # typical conversational content. The previous 1.2 s / 5.0 s
+    # cutoffs meant fast back-and-forth never crossed either
+    # threshold, which is the dominant path to the "every speaker is
+    # Speaker 1" bug in the heuristic-fallback tier.
+    TURN_GAP = 0.6
+    NEW_SPEAKER_GAP = 2.5
+    # Word-level split threshold: when seg.words is present, a gap >=
+    # WORD_SPLIT_GAP inside a single Whisper segment AND a word-rate
+    # change >= RATE_CHANGE_THRESHOLD produces an intra-segment
+    # speaker boundary. Biggest accuracy win for conversational clips
+    # where Whisper merges two speakers into one segment.
+    WORD_SPLIT_GAP = 0.5
     MONOLOGUE_DURATION = 15.0
     INTERJECTION_WORDS = 4
     RATE_CHANGE_THRESHOLD = 0.4
 
     if not raw_segments:
         return []
+
+    # Pre-pass: split any Whisper segment that has a large intra-gap
+    # AND a rate change between the halves. Operates on a flat list
+    # of virtual segments so the main loop stays unchanged.
+    raw_segments = _split_segments_on_word_boundaries(
+        raw_segments, WORD_SPLIT_GAP, RATE_CHANGE_THRESHOLD,
+    )
 
     # Pre-sort the removed-intervals list so we can compute "removed
     # duration inside (gap_start, gap_end)" in O(log n) per segment.
@@ -2351,7 +2435,20 @@ def _assign_speakers(
     current_speaker = 1
     speakers_seen = 1
     speaker_history: list[int] = [1]
+    # Seed Speaker 1's rate with the first segment so
+    # ``_most_likely_existing_speaker`` has a meaningful rate to
+    # compare against on segment 2. Previously the dict started
+    # empty → every rate-match call degenerated to ``current_speaker
+    # == 1`` and every subsequent segment inherited the label.
     speaker_rates: dict[int, list[float]] = {1: []}
+    if raw_segments:
+        _first_dur = raw_segments[0]["end"] - raw_segments[0]["start"]
+        _first_words = (
+            len(raw_segments[0]["text"].split())
+            if raw_segments[0].get("text") else 0
+        )
+        if _first_dur > 0.5 and _first_words > 0:
+            speaker_rates[1].append(_first_words / _first_dur)
 
     def _words_per_sec(seg: dict) -> float:
         duration = seg["end"] - seg["start"]
@@ -2396,9 +2493,20 @@ def _assign_speakers(
             prev_rate = _words_per_sec(raw_segments[i - 1])
 
             if gap >= NEW_SPEAKER_GAP:
+                # On a NEW_SPEAKER_GAP crossing, prefer to MINT a new
+                # speaker. Only route back to an existing speaker
+                # when there is a different one whose rate is a
+                # strong match — not the current one, which is the
+                # bug path: on segment 2 with only Speaker 1 in
+                # ``speaker_rates``, the old code always matched
+                # Speaker 1 and collapsed every subsequent segment.
                 rate_match = _most_likely_existing_speaker(seg_rate)
                 rate_diff = abs(seg_rate - _avg_rate(rate_match))
-                if rate_diff < RATE_CHANGE_THRESHOLD and rate_match != current_speaker:
+                strong_match = (
+                    rate_match != current_speaker
+                    and rate_diff < RATE_CHANGE_THRESHOLD
+                )
+                if strong_match:
                     current_speaker = rate_match
                 elif speakers_seen < MAX_HEURISTIC_SPEAKERS:
                     speakers_seen += 1
