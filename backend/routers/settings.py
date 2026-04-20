@@ -1566,6 +1566,20 @@ async def available_models(user: User = Depends(get_current_user)):
     text = []
 
     us = await read_user_settings(user.id)
+
+    # ── Per-user fallback chain ──
+    # The Ollama toggle writes to *this user's* settings file, never to
+    # the install-wide `Settings` singleton, so we have to read from
+    # `us` here. Fall back to the global chain only when the user
+    # hasn't saved one yet — matches the pattern used at the bottom of
+    # this function for resolving `current_vision` / `current_text`.
+    _chain_raw_user = us.get("AI_FALLBACK_CHAIN")
+    user_chain = (
+        [p.strip() for p in _chain_raw_user.split(",") if p.strip()]
+        if isinstance(_chain_raw_user, str) and _chain_raw_user
+        else settings.active_provider_chain
+    )
+
     or_key = us.get("OPENROUTER_API_KEY") or ""
     has_or_key = _key_is_set(or_key)
 
@@ -1645,7 +1659,7 @@ async def available_models(user: User = Depends(get_current_user)):
 
     # Add Ollama local models if Ollama is in the chain and reachable
     _VISION_FAMILIES = {"llava", "moondream", "bakllava", "minicpm-v", "llava-llama3", "llava-phi3", "nanollava"}
-    if "ollama" in settings.active_provider_chain:
+    if "ollama" in user_chain:
         _ollama_seen_ids: set[str] = set()
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -1701,12 +1715,12 @@ async def available_models(user: User = Depends(get_current_user)):
         except Exception as e:
             logger.warning("Failed to fetch Ollama models for available list: %s", e)
 
-        # Always show the configured default models even if they haven't been
-        # pulled yet (e.g. Ollama was just toggled on and pulls are in progress).
-        # This lets the user select them in the dropdown immediately.
+        # Prefer the user's saved picks so a user who switched to e.g.
+        # llava:7b sees *their* model show up in the dropdown while it
+        # pulls, not the install-wide default.
         _defaults = [
-            (settings.OLLAMA_VISION_MODEL, True),   # (model_name, is_vision)
-            (settings.OLLAMA_TEXT_MODEL, False),
+            (us.get("OLLAMA_VISION_MODEL") or settings.OLLAMA_VISION_MODEL, True),   # (model_name, is_vision)
+            (us.get("OLLAMA_TEXT_MODEL") or settings.OLLAMA_TEXT_MODEL, False),
         ]
         for _def_name, _def_is_vision in _defaults:
             if not _def_name:
@@ -1747,12 +1761,8 @@ async def available_models(user: User = Depends(get_current_user)):
     text.sort(key=_sort_key)
 
     # Return current models based on the user's own chain + model selections.
-    chain_raw = us.get("AI_FALLBACK_CHAIN")
-    chain = (
-        [p.strip() for p in chain_raw.split(",") if p.strip()]
-        if isinstance(chain_raw, str) and chain_raw
-        else settings.active_provider_chain
-    )
+    # `user_chain` was computed at the top of this function — reuse it.
+    chain = user_chain
     # STRICT per-user — no fallback to global. A brand-new account sees
     # blank "current" so the UI shows placeholder text in the dropdowns
     # instead of prepopulating another user's saved pick.
