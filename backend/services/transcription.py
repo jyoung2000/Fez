@@ -3430,21 +3430,102 @@ def _merge_undersized_subsegments(
 
 _diarization_pipeline = None
 _diarization_lock = threading.Lock()
+# One-word status string updated on every pipeline load attempt so
+# callers (and the surfaced API response) can tell WHY diarization
+# fell back to the heuristic path. Values:
+#
+#   "ok"           — pyannote pipeline is loaded and ready.
+#   "no_token"     — HF_AUTH_TOKEN is empty; pyannote can't download
+#                    the gated model so the heuristic path runs.
+#   "load_failed"  — token was present but Pipeline.from_pretrained
+#                    raised (network error, revoked token, missing
+#                    torch build). Heuristic path runs.
+#   "disabled"     — settings.DIARIZATION_ENABLED is False or the
+#                    top-level ``CLIPAI_USE_DIARIZATION`` flag is
+#                    off. No attempt is made.
+#   "unknown"      — the loader has not been asked yet.
+#
+# This is used by ``get_diarization_status()`` which is surfaced on
+# the /jobs/{id}/diarize response so the frontend can warn users
+# when the heuristic fallback is in play.
+_diarization_status: str = "unknown"
+
+
+def _token_present() -> bool:
+    """True when any of the three HF-auth env names is set, or the
+    on-disk HF cache already stores a token from ``huggingface-cli
+    login``. Matches the probe used by
+    ``speaker_diarization._pyannote_available``."""
+    return bool(
+        settings.HF_AUTH_TOKEN
+        or os.environ.get("HUGGINGFACE_TOKEN")
+        or os.environ.get("HF_TOKEN")
+        or os.path.exists(os.path.expanduser("~/.cache/huggingface/token"))
+    )
+
+
+def get_diarization_status() -> dict:
+    """Report the current diarization tier + reason string.
+
+    Callers: the ``/jobs/{id}/diarize`` route surfaces this in the
+    response so the frontend can distinguish pyannote-backed results
+    from the heuristic fallback (accuracy degraded). Pure read
+    operation — does not touch the pipeline.
+
+    Returns a dict with:
+
+      * ``pipeline_ready`` — ``True`` when pyannote is loaded.
+      * ``reason`` — current ``_diarization_status`` value.
+      * ``token_present`` — whether any HF token source is visible.
+      * ``backend`` — ``"pyannote"`` / ``"mfcc"`` / ``"heuristic"``.
+    """
+    reason = _diarization_status
+    token_present = _token_present()
+    if not settings.DIARIZATION_ENABLED:
+        backend = "heuristic"
+    elif reason == "ok" and _diarization_pipeline is not None:
+        backend = "pyannote"
+    else:
+        backend = "heuristic"
+    return {
+        "pipeline_ready": (reason == "ok" and _diarization_pipeline is not None),
+        "reason": reason,
+        "token_present": token_present,
+        "backend": backend,
+    }
 
 
 def _get_diarization_pipeline():
-    """Load pyannote speaker diarization pipeline (lazy init)."""
-    global _diarization_pipeline
+    """Load pyannote speaker diarization pipeline (lazy init).
+
+    Also updates the module-level ``_diarization_status`` so callers
+    (and ``get_diarization_status()``) can tell whether the fallback
+    path ran because of a missing token, a failed load, or an
+    intentionally disabled setting.
+    """
+    global _diarization_pipeline, _diarization_status
+    if not settings.DIARIZATION_ENABLED:
+        _diarization_status = "disabled"
+        return None
     with _diarization_lock:
         if _diarization_pipeline is None:
             try:
                 from pyannote.audio import Pipeline
-                token = settings.HF_AUTH_TOKEN
-                if not token:
+                token = (
+                    settings.HF_AUTH_TOKEN
+                    or os.environ.get("HUGGINGFACE_TOKEN")
+                    or os.environ.get("HF_TOKEN")
+                )
+                if not token and not os.path.exists(
+                    os.path.expanduser("~/.cache/huggingface/token")
+                ):
                     logger.warning(
-                        "HF_AUTH_TOKEN not set — pyannote diarization unavailable. "
-                        "Falling back to pause-based speaker detection."
+                        "HF_AUTH_TOKEN not set — pyannote diarization "
+                        "unavailable. Falling back to pause-based speaker "
+                        "detection. Set HF_AUTH_TOKEN in settings for "
+                        "proper speaker labels."
                     )
+                    _diarization_status = "no_token"
                     return None
                 _diarization_pipeline = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
@@ -3457,8 +3538,10 @@ def _get_diarization_pipeline():
                     logger.info("pyannote diarization loaded on CUDA")
                 else:
                     logger.info("pyannote diarization loaded on CPU")
+                _diarization_status = "ok"
             except Exception as e:
                 logger.warning("Failed to load pyannote diarization: %s", e)
+                _diarization_status = "load_failed"
                 return None
     return _diarization_pipeline
 
@@ -3562,16 +3645,27 @@ async def diarize_transcript_post(
                 if speaker_map:
                     result = _assign_speakers_from_diarization(raw_segments, speaker_map)
                     num_detected = len(set(s.speaker for s in result))
+                    status = get_diarization_status()
                     logger.info(
                         "Post-processing diarization (pyannote): %d speakers detected "
-                        "(requested: %s)",
+                        "(requested: %s, status=%s)",
                         num_detected, num_speakers if num_speakers > 0 else "auto",
+                        status.get("reason"),
                     )
                     return result
             except Exception as e:
                 logger.warning("Post-processing pyannote diarization failed: %s", e)
 
-    # Fallback: heuristic speaker assignment
+    # Fallback: heuristic speaker assignment. This is where every
+    # audit bug converges; leave a loud warning so the ops log shows
+    # exactly why the pyannote tier was skipped.
+    status = get_diarization_status()
+    logger.warning(
+        "Post-processing diarization falling back to heuristic "
+        "(reason=%s, token_present=%s). Speaker accuracy will be "
+        "degraded — set HF_AUTH_TOKEN in settings to enable pyannote.",
+        status.get("reason"), status.get("token_present"),
+    )
     result = _assign_speakers(raw_segments)
     num_detected = len(set(s.speaker for s in result))
     logger.info(

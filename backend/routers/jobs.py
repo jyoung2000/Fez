@@ -773,7 +773,10 @@ async def diarize_job(job_id: str, req: DiarizeRequest):
             detail="Audio file not found — re-upload the video to enable diarization"
         )
 
-    from backend.services.transcription import diarize_transcript_post
+    from backend.services.transcription import (
+        diarize_transcript_post,
+        get_diarization_status,
+    )
 
     try:
         diarized = await diarize_transcript_post(
@@ -785,11 +788,18 @@ async def diarize_job(job_id: str, req: DiarizeRequest):
         await database.update_job_status(job_id, transcript=list(diarized))
 
         speaker_set = set(s.speaker for s in diarized)
+        # Surface which backend actually ran so the frontend can show
+        # a "pyannote" badge vs. a "heuristic fallback, accuracy
+        # degraded" warning. Status string values are stable ("ok",
+        # "no_token", "load_failed", "disabled").
+        diar_status = get_diarization_status()
         return {
             "status": "ok",
             "speakers_detected": len(speaker_set),
             "speakers_requested": req.num_speakers if req.num_speakers > 0 else "auto",
             "segments_updated": len(diarized),
+            "diarization_backend": diar_status.get("backend"),
+            "diarization_status_reason": diar_status.get("reason"),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Diarization failed: {str(e)[:200]}")
