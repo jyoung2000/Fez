@@ -141,6 +141,10 @@ def _diarize_pyannote(
 ) -> list:
     """Run pyannote speaker-diarization-3.1 against ``audio_path``.
 
+    Uses the shared singleton in ``backend.services._pyannote_loader``
+    so this path and the transcription post-processing path always
+    see the same ``Pipeline`` instance.
+
     Returns ``[]`` on any failure — caller falls through to the MFCC
     tier. ``num_speakers`` here is a NOISY LOWER BOUND from the face
     registry, not ground truth: face detection misses off-screen
@@ -153,22 +157,14 @@ def _diarize_pyannote(
     saw one face.
     """
     try:
-        from pyannote.audio import Pipeline
-        import torch
-
-        token = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1", use_auth_token=token,
-        )
-        device = _resolve_device()
-        if device == "cuda":
-            pipeline.to(torch.device("cuda"))
+        from backend.services._pyannote_loader import get_pipeline
+        pipeline, reason = get_pipeline()
+        if pipeline is None:
             logger.info(
-                "[Diarization] pyannote loaded on CUDA (%.0f MB free)",
-                _cuda_free_mb() or 0,
+                "[Diarization] pyannote unavailable (reason=%s) — falling back",
+                reason,
             )
-        else:
-            logger.info("[Diarization] pyannote loaded on CPU")
+            return []
 
         kwargs = _pyannote_bound_kwargs(num_speakers)
         diarization = pipeline(audio_path, **kwargs)
