@@ -39,6 +39,42 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+# Short-lived cache of ``_probe`` results keyed on ``(path, mtime)``.
+# Every HTML5 ``<video>`` range request flows through
+# ``ensure_browser_preview_status``. For sources that don't need a
+# preview (already browser-friendly MP4s — the common case) the fast
+# path at ``isfile(target_path)`` misses, we fall through to ``_probe``,
+# which forks ``ffprobe``. Heavy scrubbing spawns dozens of ffprobes
+# per second. Caching by ``(path, mtime)`` keeps us correct when the
+# source is replaced (the mtime invalidates the entry) while avoiding
+# the subprocess storm during a single scrub session.
+_probe_cache: dict[tuple[str, float], "_ProbeResult"] = {}
+_PROBE_CACHE_TTL = 300.0  # seconds
+_probe_cache_expiry: dict[tuple[str, float], float] = {}
+_PROBE_CACHE_MAX = 256
+
+
+def _probe_cache_get(path: str, mtime: float) -> Optional["_ProbeResult"]:
+    key = (path, mtime)
+    exp = _probe_cache_expiry.get(key)
+    if exp is None or exp <= time.monotonic():
+        _probe_cache.pop(key, None)
+        _probe_cache_expiry.pop(key, None)
+        return None
+    return _probe_cache.get(key)
+
+
+def _probe_cache_put(path: str, mtime: float, result: "_ProbeResult") -> None:
+    key = (path, mtime)
+    _probe_cache[key] = result
+    _probe_cache_expiry[key] = time.monotonic() + _PROBE_CACHE_TTL
+    # Opportunistic eviction — FIFO-ish by dict insertion order.
+    if len(_probe_cache) > _PROBE_CACHE_MAX:
+        for _k in list(_probe_cache.keys())[:32]:
+            _probe_cache.pop(_k, None)
+            _probe_cache_expiry.pop(_k, None)
+
+
 # Audio codecs an HTML5 ``<video>`` / ``<audio>`` element can decode
 # reliably across Chrome/Edge/Safari/Firefox. Anything else needs to
 # be transcoded to AAC before the browser can hear it.
@@ -124,7 +160,19 @@ def _probe(source_path: str) -> Optional[_ProbeResult]:
     Returns ``None`` on any probe failure — the caller treats that as
     "don't touch the source" and serves it as-is, which preserves the
     pre-fix behaviour instead of hard-failing the share endpoint.
+
+    Results are cached by ``(source_path, mtime)`` with a 5-minute TTL
+    so the hot HTML5 range-request path doesn't fork ``ffprobe`` per
+    seek. A replaced source invalidates the cache via the mtime
+    component of the key.
     """
+    try:
+        mtime = os.path.getmtime(source_path)
+    except OSError:
+        mtime = 0.0
+    cached = _probe_cache_get(source_path, mtime)
+    if cached is not None:
+        return cached
     try:
         proc = subprocess.run(
             [
@@ -179,7 +227,7 @@ def _probe(source_path: str) -> Optional[_ProbeResult]:
         elif kind == "audio" and not a_codec:
             a_codec = name
             has_audio = True
-    return _ProbeResult(
+    result = _ProbeResult(
         video_codec=v_codec,
         audio_codec=a_codec,
         has_audio=has_audio,
@@ -188,6 +236,8 @@ def _probe(source_path: str) -> Optional[_ProbeResult]:
         fps=fps,
         bitrate_kbps=bitrate_kbps,
     )
+    _probe_cache_put(source_path, mtime, result)
+    return result
 
 
 def _needs_preview(source_path: str, probe: _ProbeResult) -> bool:
@@ -256,6 +306,24 @@ def _should_copy_video(probe: _ProbeResult) -> bool:
     return True
 
 
+def _tmp_path_for(target_path: str) -> str:
+    """Scratch path FFmpeg writes to before the atomic rename.
+
+    FFmpeg writes bytes directly to its output argument as it
+    encodes — the file exists on disk (with a fresh mtime) during
+    the entire encode, not just at the end. Without writing through
+    a temp name, a concurrent request hitting :func:`ensure_browser_preview_status`
+    passes the ``isfile(target) and mtime(target) >= mtime(source)``
+    fast-path check mid-encode and ``serve_file`` streams partial
+    bytes to the browser.
+
+    Using ``target + ".tmp"`` keeps the scratch file in the same
+    directory so the final ``os.rename`` is a same-filesystem
+    rename (atomic on POSIX) and not a cross-device copy.
+    """
+    return target_path + ".tmp"
+
+
 def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult) -> list[str]:
     """Build the FFmpeg command that produces the browser preview.
 
@@ -275,6 +343,11 @@ def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult) -
       * ``+faststart`` moves the moov atom up front so the
         ``<video>`` element can start playback before the whole
         file is buffered.
+      * Output is directed at :func:`_tmp_path_for` (``<target>.tmp``)
+        so the final ``target_path`` only appears once the encode
+        is complete and has been atomically renamed into place. This
+        closes the partial-file race where a concurrent request
+        could read a half-written MP4.
     """
     video_opts: list[str]
     video_filters: list[str] = []
@@ -350,7 +423,10 @@ def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult) -
         # is deliberately *not* added — fragmented MP4 plays back
         # fine but some older Safari builds scrub poorly on it.
         "-movflags", "+faststart",
-        target_path,
+        # Write through a scratch path — _run_ffmpeg atomically
+        # renames onto target_path only after a successful exit.
+        # See _tmp_path_for for the partial-file race this closes.
+        _tmp_path_for(target_path),
     ]
     return cmd
 
@@ -423,7 +499,23 @@ def _wait_for_peer(target_path: str, lock_path: str, timeout_sec: float = 300.0)
 
 
 def _run_ffmpeg(cmd: list[str], target_path: str) -> bool:
-    """Run FFmpeg and return True on a non-empty successful output."""
+    """Run FFmpeg and return True on a non-empty successful output.
+
+    FFmpeg writes to :func:`_tmp_path_for` (``target_path + ".tmp"``)
+    and we atomically ``os.rename`` into ``target_path`` on success.
+    That way the final path only ever exists as a complete, playable
+    file — closing the partial-file race where concurrent HTTP
+    requests could hit the ``isfile(target_path)`` fast path mid-encode
+    and stream half-written MP4 bytes to the browser.
+    """
+    tmp_path = _tmp_path_for(target_path)
+    # Clear any stale scratch file from a previous crashed encode so
+    # ffmpeg's ``-y`` doesn't spend time truncating a multi-GB leftover.
+    try:
+        if os.path.isfile(tmp_path):
+            os.remove(tmp_path)
+    except OSError:
+        pass
     try:
         proc = subprocess.run(
             cmd,
@@ -433,6 +525,11 @@ def _run_ffmpeg(cmd: list[str], target_path: str) -> bool:
         )
     except (subprocess.SubprocessError, OSError) as e:
         logger.warning("browser_preview: ffmpeg launch failed: %s", e)
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
         return False
     if proc.returncode != 0:
         logger.warning(
@@ -440,13 +537,33 @@ def _run_ffmpeg(cmd: list[str], target_path: str) -> bool:
             proc.returncode, (proc.stderr or "")[:500],
         )
         try:
-            if os.path.isfile(target_path):
-                os.remove(target_path)
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
         except OSError:
             pass
         return False
-    if not os.path.isfile(target_path) or os.path.getsize(target_path) == 0:
-        logger.warning("browser_preview: ffmpeg produced empty output at %s", target_path)
+    if not os.path.isfile(tmp_path) or os.path.getsize(tmp_path) == 0:
+        logger.warning("browser_preview: ffmpeg produced empty output at %s", tmp_path)
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+    # Atomic swap — same filesystem so os.rename is a single
+    # directory-entry update, never observable as a partial file.
+    try:
+        os.replace(tmp_path, target_path)
+    except OSError as e:
+        logger.warning(
+            "browser_preview: rename %s -> %s failed: %s",
+            tmp_path, target_path, e,
+        )
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
         return False
     return True
 
