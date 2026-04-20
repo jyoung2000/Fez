@@ -104,23 +104,25 @@ def normalize_ip(ip_raw: Optional[str]) -> str:
 
 
 def compute_fingerprint(ip: str, user_agent: str) -> str:
-    """Return a short hex digest binding the session to IP + UA.
+    """Return a short hex digest binding the session to User-Agent.
 
-    Stable across requests from the same browser AND the same /24
-    (IPv4) or /48 (IPv6) network, so a tab reload after the ISP
-    re-leased the dynamic IP doesn't invalidate the session. Set the
-    env var ``CLIPAI_BIND_SESSION_TO_IP=false`` to disable the IP
-    component entirely (recommended for installs behind a load
-    balancer that rewrites the client IP per request).
+    V2 (UA-only). The IP component was dropped: behind any reverse
+    proxy (Swag / Traefik / nginx / Cloudflare) ``X-Forwarded-For``
+    can legitimately change between requests from the same browser
+    (CGNAT, ISP re-lease, WiFi → mobile, v4 ↔ v6 dual-stack hops).
+    Killing a session on IP change caused chunk uploads and media
+    range requests to 401 mid-flight. The UA-only fingerprint is
+    still a useful speed-bump against a stolen cookie being used
+    from a completely different browser or device.
+
+    The ``ip`` argument is accepted for call-site compatibility
+    (``create_session`` still stores the IP on the session record
+    for audit) but does not contribute to the hash.
     """
-    bind_ip = os.environ.get("CLIPAI_BIND_SESSION_TO_IP", "true").lower() not in (
-        "0", "false", "no", "off",
-    )
-    norm_ip = normalize_ip(ip) if bind_ip else ""
+    del ip  # ignored in V2 — see docstring
     norm_ua = (user_agent or "").strip()
     h = hashlib.sha256()
-    h.update(norm_ip.encode("utf-8"))
-    h.update(b"|")
+    h.update(b"ua-v2|")
     h.update(norm_ua.encode("utf-8"))
     return h.hexdigest()[:32]
 

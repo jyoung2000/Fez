@@ -64,10 +64,12 @@ def test_fingerprint_is_stable_same_ip_ua():
     assert a == b
 
 
-def test_fingerprint_changes_on_ip_change():
+def test_fingerprint_ignores_ip_change_v2():
+    """V2 fingerprint: UA only, so IP flux behind a reverse proxy
+    no longer kills sessions mid-upload."""
     a = security.compute_fingerprint("192.168.1.10", "Mozilla/5.0")
     b = security.compute_fingerprint("10.0.0.1", "Mozilla/5.0")
-    assert a != b
+    assert a == b
 
 
 def test_fingerprint_changes_on_ua_change():
@@ -76,14 +78,14 @@ def test_fingerprint_changes_on_ua_change():
     assert a != b
 
 
-def test_fingerprint_normalizes_xff_and_ipv6():
+def test_fingerprint_independent_of_ipv6():
+    """IPv6 flux no longer changes the fingerprint in V2."""
     a = security.compute_fingerprint(
         "2001:db8:85a3::8a2e:370:7334", "Safari",
     )
     b = security.compute_fingerprint(
-        "2001:db8:85a3::abcd:1234:5678", "Safari",
+        "abcd::1", "Safari",
     )
-    # Same /64 prefix → same fingerprint.
     assert a == b
 
 
@@ -276,9 +278,10 @@ def test_login_rejects_wrong_password(client):
     assert r.json()["detail"] == "invalid credentials"
 
 
-def test_new_ip_rotates_session(client):
-    """Requests from a different IP with the same cookie must 401 and
-    clear the cookie so the browser is forced to re-login."""
+def test_ip_change_alone_does_not_invalidate_session(client):
+    """V2 fingerprint: IP flux is tolerated because reverse proxies
+    legitimately change X-Forwarded-For between requests. UA change
+    still forces a re-login."""
     async def _seed():
         await auth_store.create_user("alice", "supersecret")
     asyncio.run(_seed())
@@ -292,18 +295,16 @@ def test_new_ip_rotates_session(client):
     token = r.cookies.get("clipai_session") or client.cookies.get("clipai_session")
     assert token
 
-    # Same cookie, DIFFERENT IP.
+    # Same cookie, DIFFERENT IP — V2 accepts it.
     r2 = client.get(
         "/api/auth/me",
         headers={"x-forwarded-for": "9.9.9.9", "user-agent": "BrowserA/1.0"},
         cookies={"clipai_session": token},
     )
-    assert r2.status_code == 401, r2.text
-    # The server tells the browser to drop the cookie.
-    set_cookie = r2.headers.get("set-cookie", "")
-    assert "clipai_session" in set_cookie
+    assert r2.status_code == 200, r2.text
 
-    # Same cookie on original IP but a different User-Agent also rotates.
+    # Same cookie on original IP but a different User-Agent still
+    # fails the fingerprint check.
     r3 = client.get(
         "/api/auth/me",
         headers={"x-forwarded-for": "1.1.1.1", "user-agent": "OtherBrowser/2.0"},

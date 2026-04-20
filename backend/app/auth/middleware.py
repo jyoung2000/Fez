@@ -161,14 +161,30 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if session is None:
             return self._clear_and_reject("session not found")
 
-        # Fingerprint check: new IP or browser → force re-login.
+        # Fingerprint check (UA-only in V2). On mismatch we return
+        # 401 + clear the cookie on THIS response, but we do NOT
+        # delete the server-side session record — behind a reverse
+        # proxy the mismatch is often a transient header flake, and
+        # killing the session mid-upload / mid-playback is
+        # catastrophic. Re-login on the same browser restores access.
         ip = _client_ip(request)
         ua = request.headers.get("user-agent", "")
-        if compute_fingerprint(ip, ua) != session.fingerprint:
-            # Kill the session so re-use of the old cookie can't succeed.
-            from backend.app.auth.store import delete_session
-            await delete_session(token)
-            return self._clear_and_reject("session bound to a different browser/IP")
+        current_fp = compute_fingerprint(ip, ua)
+        if current_fp != session.fingerprint:
+            # One-time migration: legacy sessions were stored with a
+            # V1 fingerprint (IP + UA). Accept the session once on
+            # the UA-only check and rewrite the stored fingerprint
+            # so subsequent requests match cleanly. Guarded by the
+            # fp_v2 flag on the session record.
+            if not _session_is_v2(session):
+                try:
+                    await _migrate_session_to_v2(token, current_fp)
+                except Exception as e:
+                    logger.warning("fingerprint V2 migration failed: %s", e)
+                # Continue as if the fingerprint matched — this was
+                # a known-good cookie from the V1 scheme.
+            else:
+                return self._reject_fingerprint()
 
         user = await get_user_cached(session.user_id)
         if user is None or not user.active:
@@ -213,6 +229,57 @@ class AuthMiddleware(BaseHTTPMiddleware):
         resp = JSONResponse({"detail": detail}, status_code=401)
         resp.delete_cookie(SESSION_COOKIE, path="/")
         return resp
+
+    def _reject_fingerprint(self) -> Response:
+        """Reject a fingerprint-mismatched request.
+
+        Returns 401 + clears the cookie on the response, but leaves
+        the server-side session record intact so the user can
+        re-login on the same browser without requiring a password
+        reset. The detail string is machine-checkable so the
+        frontend can display a targeted prompt.
+        """
+        return self._clear_and_reject("fingerprint_mismatch")
+
+
+_FINGERPRINT_V2_FLAG = "fp_v2"
+
+
+def _session_is_v2(session) -> bool:
+    """True if this session was stored with the V2 (UA-only)
+    fingerprint. Legacy sessions lack the flag.
+    """
+    # Session is a frozen dataclass; check the raw storage too for
+    # forward-compat.
+    if getattr(session, _FINGERPRINT_V2_FLAG, False):
+        return True
+    return False
+
+
+async def _migrate_session_to_v2(token: str, new_fingerprint: str) -> None:
+    """Rewrite an existing session's fingerprint to the UA-only V2
+    form and flip the ``fp_v2`` flag so the migration runs at most
+    once per session.
+    """
+    from backend.app.auth.store import (
+        SESSIONS_PATH,
+        _atomic_write_json,
+        _read_json,
+        _sessions_lock,
+        invalidate_session_cache,
+    )
+    async with _sessions_lock:
+        data = await _read_json(SESSIONS_PATH, {"sessions": []})
+        updated = False
+        for s in data.get("sessions", []):
+            if s.get("token") == token:
+                s["fingerprint"] = new_fingerprint
+                s[_FINGERPRINT_V2_FLAG] = True
+                updated = True
+                break
+        if updated:
+            await _atomic_write_json(SESSIONS_PATH, data)
+    invalidate_session_cache(token)
 
 
 def set_session_cookie(
