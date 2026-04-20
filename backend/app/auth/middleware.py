@@ -32,7 +32,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from backend.app.auth.security import compute_fingerprint
-from backend.app.auth.store import get_session, get_user, touch_session
+from backend.app.auth.store import (
+    get_session_cached,
+    get_user_cached,
+    touch_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +157,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 {"detail": "not authenticated"}, status_code=401,
             )
 
-        session = await get_session(token)
+        session = await get_session_cached(token)
         if session is None:
             return self._clear_and_reject("session not found")
 
@@ -166,7 +170,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             await delete_session(token)
             return self._clear_and_reject("session bound to a different browser/IP")
 
-        user = await get_user(session.user_id)
+        user = await get_user_cached(session.user_id)
         if user is None or not user.active:
             return self._clear_and_reject("user not found or deactivated")
 
