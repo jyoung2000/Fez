@@ -5,6 +5,7 @@ import ReframeDebugOverlay from './ReframeDebugOverlay';
 import useTimelineStore from '../stores/timelineStore';
 import { outlineTextShadow } from '../utils/textOutline';
 import useResponsive from '../hooks/useResponsive';
+import useVideoLoadRetry from '../hooks/useVideoLoadRetry';
 import { SPEED_OPTIONS as SHARED_SPEED_OPTIONS } from '../utils/defaultSettings';
 
 // --- Constants replicated from backend ---
@@ -549,17 +550,15 @@ export default function ClipPreview({
       }
     };
 
-    const onError = () => {
-      // Retry once on load error (handles transient partial content failures)
-      if (!video._retried) {
-        video._retried = true;
-        video.load();
-      }
-    };
+    // NOTE: the ``error`` event is intentionally NOT handled here.
+    // useVideoLoadRetry (attached below) owns ``error`` for the
+    // foreground video and retries with exponential backoff while
+    // the backend browser-preview transcode is in flight (503 +
+    // Retry-After). Attaching a second one-shot listener here would
+    // race with that retry loop.
     video.addEventListener('loadedmetadata', onMetadata);
     video.addEventListener('canplay', onCanPlay);
     video.addEventListener('timeupdate', onTimeUpdate);
-    video.addEventListener('error', onError);
     if (video.readyState >= 3) {
       setVideoReady(true);
       onCanPlay();
@@ -571,9 +570,21 @@ export default function ClipPreview({
       video.removeEventListener('loadedmetadata', onMetadata);
       video.removeEventListener('canplay', onCanPlay);
       video.removeEventListener('timeupdate', onTimeUpdate);
-      video.removeEventListener('error', onError);
     };
   }, [clipStart, clipEnd]);
+
+  // Retry loader for the 503 + Retry-After window while the backend
+  // browser-preview transcode is in flight. Without this, a user who
+  // opens a clip before transcode finishes (typical for large 4K / VP9
+  // / MKV uploads) sees a dead <video>. The split-view bottom <video>
+  // and the fullscreen single <video> share the same src so retrying
+  // the foreground element re-drives the backend preview build for
+  // both.
+  const {
+    preparing: fgPreparing,
+    error: fgLoadError,
+    reset: retryFgLoad,
+  } = useVideoLoadRetry(fgVideoRef, src);
 
   // --- Sync volume from settings ---
   useEffect(() => {
@@ -1208,6 +1219,60 @@ export default function ClipPreview({
   const renderVideoArea = () => {
     const srcRatioLocal = sourceWidth / sourceHeight;
 
+    // Shared overlay for the 503 + Retry-After preview-transcode window
+    // (see useVideoLoadRetry + backend/services/browser_preview.py).
+    // Injected into both split and single layout containers — both
+    // layouts hang <video> off fgVideoRef, so one overlay covers both.
+    const previewLoadOverlay = (fgPreparing || fgLoadError) ? (
+      <div style={{
+        position: 'absolute',
+        inset: 0,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flexDirection: 'column',
+        gap: 10,
+        background: fgLoadError ? 'rgba(0,0,0,0.7)' : 'rgba(0,0,0,0.55)',
+        color: '#fff',
+        fontSize: 13,
+        fontFamily: 'var(--font-mono, monospace)',
+        zIndex: 16,
+        pointerEvents: fgLoadError ? 'auto' : 'none',
+      }}>
+        {fgLoadError ? (
+          <>
+            <div>Failed to load video</div>
+            <button
+              onClick={retryFgLoad}
+              style={{
+                padding: '4px 12px',
+                background: 'var(--accent-amber, #FF9F0A)',
+                color: '#000',
+                border: 0,
+                borderRadius: 4,
+                cursor: 'pointer',
+                fontSize: 12,
+              }}
+            >
+              Retry
+            </button>
+          </>
+        ) : (
+          <>
+            <div style={{
+              width: 18, height: 18,
+              border: '2px solid rgba(255,255,255,0.3)',
+              borderTopColor: '#fff',
+              borderRadius: '50%',
+              animation: 'cp-preview-spin 0.9s linear infinite',
+            }} />
+            <div>Preparing preview…</div>
+            <style>{`@keyframes cp-preview-spin { to { transform: rotate(360deg); } }`}</style>
+          </>
+        )}
+      </div>
+    ) : null;
+
     // Layout-aware rendering: SPLIT mode shows two video instances stacked
     if (activeLayoutMode === 'split' && isCrop && faceRegistry?.slots?.length >= 2) {
       const sortedSlots = [...(faceRegistry.slots || [])].sort((a, b) => a.x - b.x);
@@ -1218,6 +1283,7 @@ export default function ClipPreview({
 
       return (
         <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+          {previewLoadOverlay}
           {trackingStatus && (
             <div style={{
               position: 'absolute', top: 8, right: 8, zIndex: 15,
@@ -1296,6 +1362,7 @@ export default function ClipPreview({
 
     return (
       <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+        {previewLoadOverlay}
         {/* Subject tracking status indicator */}
         {trackingStatus && (
           <div style={{
