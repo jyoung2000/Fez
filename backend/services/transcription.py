@@ -3791,6 +3791,24 @@ def _assign_speakers_from_diarization(
 
     Speakers are numbered by order of first appearance in the audio
     (not alphabetically by pyannote's internal SPEAKER_XX labels).
+
+    Three-tier fallback when a Whisper segment has no overlapping
+    pyannote turn (short segments, music/silence brackets,
+    sub-200 ms overlap bugs):
+
+      1. Primary — the turn with the maximum overlap.
+      2. Secondary — when ``best_overlap == 0`` but a turn's
+         midpoint is within 1.0 s of the segment's midpoint, use
+         that speaker. Catches segments that fall in a thin gap
+         between two turns.
+      3. Tertiary — inherit the previous segment's assigned
+         speaker. Only when the fixture is completely empty (no
+         turns at all) does this fall through to ``"Speaker 1"``.
+
+    Previously the code hard-coded every non-overlap segment to
+    ``"Speaker 1"``, which was a major contributor to the "every
+    speaker is Speaker 1" bug whenever pyannote returned a
+    fragmented timeline.
     """
     # Sort diarization turns by start time
     turns = sorted(speaker_map.items(), key=lambda x: x[0][0])
@@ -3803,10 +3821,12 @@ def _assign_speakers_from_diarization(
     speaker_names = {s: f"Speaker {i+1}" for i, s in enumerate(seen_order)}
 
     transcript_segments = []
+    tertiary_fallback_count = 0
+
     for seg in raw_segments:
         seg_start, seg_end = seg["start"], seg["end"]
 
-        # Find the turn with maximum overlap
+        # Tier 1: maximum overlap.
         best_speaker = None
         best_overlap = 0.0
         for (turn_start, turn_end), speaker in turns:
@@ -3817,7 +3837,44 @@ def _assign_speakers_from_diarization(
                 best_overlap = overlap
                 best_speaker = speaker
 
-        speaker_label = speaker_names.get(best_speaker, "Speaker 1") if best_speaker else "Speaker 1"
+        speaker_label: str
+        if best_speaker is not None and best_overlap > 0:
+            speaker_label = speaker_names.get(best_speaker, "Speaker 1")
+        else:
+            # Tier 2: nearest turn by midpoint, within 1.0 s.
+            seg_mid = 0.5 * (seg_start + seg_end)
+            nearest_speaker = None
+            nearest_gap = float("inf")
+            for (turn_start, turn_end), speaker in turns:
+                turn_mid = 0.5 * (turn_start + turn_end)
+                # Gap = 0 when the midpoint sits inside the turn,
+                # otherwise the raw distance from the turn edges.
+                if seg_mid < turn_start:
+                    gap = turn_start - seg_mid
+                elif seg_mid > turn_end:
+                    gap = seg_mid - turn_end
+                else:
+                    gap = 0.0
+                # Fall back to midpoint-to-midpoint for ranking so
+                # equidistant edge cases are deterministic.
+                if gap <= 1.0:
+                    mid_gap = abs(turn_mid - seg_mid)
+                    if mid_gap < nearest_gap:
+                        nearest_gap = mid_gap
+                        nearest_speaker = speaker
+            if nearest_speaker is not None:
+                speaker_label = speaker_names.get(nearest_speaker, "Speaker 1")
+            elif transcript_segments:
+                # Tier 3: inherit the previous segment's speaker.
+                speaker_label = transcript_segments[-1].speaker
+                tertiary_fallback_count += 1
+                logger.debug(
+                    "[Diarization] segment [%.2f, %.2f] inherited speaker "
+                    "%s from previous segment (no nearby turn)",
+                    seg_start, seg_end, speaker_label,
+                )
+            else:
+                speaker_label = "Speaker 1"
 
         words = None
         if seg.get("words"):
@@ -3833,6 +3890,18 @@ def _assign_speakers_from_diarization(
             avg_logprob=seg.get("avg_logprob"),
             no_speech_prob=seg.get("no_speech_prob"),
         ))
+
+    # Diagnostic: if > 20% of segments fell to the tertiary tier the
+    # audio is likely sparse / low-SNR / fragmented and the speaker
+    # labels should be considered lower-confidence. Not an error —
+    # the labels are still correct in the sense that they inherit
+    # from context rather than hard-coding "Speaker 1".
+    if raw_segments and (tertiary_fallback_count / len(raw_segments)) > 0.20:
+        logger.warning(
+            "[Diarization] %d/%d segments used the tertiary fallback "
+            "(inherit from previous) — audio may be sparse or low-SNR.",
+            tertiary_fallback_count, len(raw_segments),
+        )
 
     return transcript_segments
 
