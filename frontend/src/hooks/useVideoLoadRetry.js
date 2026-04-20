@@ -10,79 +10,112 @@ import { useEffect, useRef, useState } from 'react';
  * ``Retry-After: 5`` while ``backend/services/browser_preview`` is
  * still transcoding the source into a browser-playable derivative.
  * That transcode can take several minutes on large (4K / VP9 / MKV
- * with AC3) uploads. During the window, every ``<video>.load()`` fires
- * a fresh ``error`` event and naive one-shot retry loops give up
- * almost immediately and leave the element looking broken.
+ * with AC3) uploads. During the window, a naive one-shot retry loop
+ * gives up almost immediately and leaves the element looking broken —
+ * the root cause is that Chromium frequently surfaces a 503 on a
+ * range request as a ``stalled`` / ``suspend`` event instead of
+ * ``error``, so code that only listens to ``error`` waits forever
+ * for an event that never fires.
  *
  * This hook:
- *   * swallows ``error`` events and schedules a ``video.load()`` retry
- *     with exponential backoff (0.5s → 1s → 2s → 4s → 8s → 10s steady),
- *   * caps at ``maxAttempts`` (default 60 ≈ 10 minutes) before
- *     surfacing a hard failure via ``error=true`` in the return,
- *   * exposes ``preparing=true`` after the first couple of retries so
- *     the component can render a "Preparing preview…" overlay instead
- *     of a dead element,
- *   * resets all bookkeeping whenever ``src`` changes OR a successful
- *     ``canplay`` fires (so a later transient hiccup gets a fresh
- *     retry budget).
+ *   * HEAD-probes ``src`` on mount and every reset. A 503 puts the
+ *     hook into ``preparing`` immediately (no need to wait on the
+ *     ``<video>`` element firing anything). A 401 flips a dedicated
+ *     ``authError`` flag and does NOT retry — retrying a broken
+ *     session forever is worse than failing loudly.
+ *   * Listens to ``error``, ``stalled``, and ``suspend``, debounced
+ *     against ``progress`` so normal buffering doesn't count.
+ *   * Uses ``Retry-After`` from the HEAD response for the first
+ *     retry delay when present.
+ *   * Runs an exponential backoff (0.5s → 1s → 2s → 4s → 8s → 10s
+ *     steady) up to ``maxAttempts`` (default 60 ≈ 10 minutes).
  *
- * Returns ``{ ready, preparing, error, reset }``:
+ * Returns ``{ ready, preparing, error, authError, reset }``:
  *   * ``ready``      — canplay has fired at least once for the current src.
- *   * ``preparing``  — we're in the retry loop and the user should see
- *                      "Preparing preview…".
+ *   * ``preparing``  — we're in the retry loop ("Preparing preview…").
  *   * ``error``      — retry budget exhausted; show a manual-Retry UI.
- *   * ``reset()``    — zero out retry bookkeeping and re-load immediately
- *                      (wire this to the manual-Retry button).
- *
- * The hook mirrors the logic baked into ``VideoEditor.jsx`` (commit
- * 321ff2b) so ``ClipPreview`` and ``VideoPlayer`` behave the same way
- * when the source is still transcoding.
+ *   * ``authError``  — fetch probe returned 401; parent should
+ *                      prompt the user to re-login.
+ *   * ``reset()``    — zero out retry bookkeeping and re-probe.
  */
 export default function useVideoLoadRetry(videoRef, src, options = {}) {
   const {
     maxAttempts = 60,
-    // Delay schedule in ms. After the table is exhausted the last
-    // value is used for every subsequent retry. Total ≈ 10 min with
-    // the default table + default maxAttempts.
     delays = [500, 1000, 2000, 4000, 8000],
     steadyDelay = 10000,
     // After this many attempts, flip ``preparing`` to true so the
     // component can show the spinner. Kept at 2 so a real transient
     // network hiccup (single error burst) doesn't flash the overlay.
     preparingAfterAttempt = 2,
+    // A stall event only counts as a retry trigger if no progress
+    // event fires within this window (ms). Chromium emits stall /
+    // suspend during normal buffering too; debouncing against
+    // progress avoids counting those.
+    stallDebounceMs = 3000,
   } = options;
 
   const [ready, setReady] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const [error, setError] = useState(false);
+  const [authError, setAuthError] = useState(false);
 
   const attemptRef = useRef(0);
   const timerRef = useRef(null);
+  const stallTimerRef = useRef(null);
+  const firstDelayOverrideRef = useRef(null);
+  const abortRef = useRef(null);
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video) return undefined;
+    if (!video || !src) return undefined;
 
     // Fresh src deserves a fresh budget.
     attemptRef.current = 0;
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+    if (stallTimerRef.current) { clearTimeout(stallTimerRef.current); stallTimerRef.current = null; }
+    firstDelayOverrideRef.current = null;
     setReady(false);
     setPreparing(false);
     setError(false);
+    setAuthError(false);
 
-    const onCanPlay = () => {
-      setReady(true);
-      setPreparing(false);
-      setError(false);
-      // A successful canplay means the source is good now — zero out
-      // the retry counter so a later hiccup gets the full budget again.
-      attemptRef.current = 0;
-    };
+    // ── HEAD probe ──────────────────────────────────────────────
+    //
+    // Chromium doesn't always surface a 503 on a Range request as
+    // an HTMLMediaElement ``error`` event — it often reports it as
+    // a ``stalled`` / ``suspend`` instead. Issuing our own HEAD
+    // tells us the server's state directly so we can start the
+    // retry loop without waiting on an event that may never fire.
+    if (abortRef.current) abortRef.current.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    (async () => {
+      try {
+        const resp = await fetch(src, { method: 'HEAD', signal: ctrl.signal });
+        if (ctrl.signal.aborted) return;
+        if (resp.status === 503) {
+          // Transcode still running — enter the preparing state
+          // immediately, use Retry-After for the first delay if
+          // present.
+          setPreparing(true);
+          const retryAfter = parseInt(resp.headers.get('Retry-After') || '', 10);
+          if (Number.isFinite(retryAfter) && retryAfter > 0) {
+            firstDelayOverrideRef.current = retryAfter * 1000;
+          }
+          _scheduleRetry();
+        } else if (resp.status === 401) {
+          setAuthError(true);
+          setPreparing(false);
+        }
+        // 200/206 → do nothing, let the <video> element load normally.
+      } catch (e) {
+        if (ctrl.signal.aborted) return;
+        // Network error on the probe — fall into the retry loop.
+        _scheduleRetry();
+      }
+    })();
 
-    const onError = () => {
+    function _scheduleRetry() {
       const attempt = attemptRef.current;
       if (attempt >= maxAttempts) {
         setError(true);
@@ -90,25 +123,63 @@ export default function useVideoLoadRetry(videoRef, src, options = {}) {
         return;
       }
       if (attempt >= preparingAfterAttempt) setPreparing(true);
-      const delay = attempt < delays.length ? delays[attempt] : steadyDelay;
+      let delay;
+      if (firstDelayOverrideRef.current != null && attempt === 0) {
+        delay = firstDelayOverrideRef.current;
+        firstDelayOverrideRef.current = null;
+      } else {
+        delay = attempt < delays.length ? delays[attempt] : steadyDelay;
+      }
       attemptRef.current = attempt + 1;
       if (timerRef.current) clearTimeout(timerRef.current);
       timerRef.current = setTimeout(() => {
         timerRef.current = null;
-        // The video element might have unmounted (strict-mode double
-        // effect or parent re-render). Guard every access.
         if (videoRef.current) {
-          try {
-            videoRef.current.load();
-          } catch {
-            /* element gone — ignore */
-          }
+          try { videoRef.current.load(); } catch { /* element gone */ }
         }
       }, delay);
+    }
+
+    const onCanPlay = () => {
+      setReady(true);
+      setPreparing(false);
+      setError(false);
+      setAuthError(false);
+      attemptRef.current = 0;
+    };
+
+    const onError = () => {
+      // Element ``error`` — always a hard signal to retry.
+      _scheduleRetry();
+    };
+
+    const onStallOrSuspend = () => {
+      // Debounce: a subsequent ``progress`` within ``stallDebounceMs``
+      // means the video is just buffering. Only if we're still stuck
+      // after the window do we kick off a retry.
+      if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
+      stallTimerRef.current = setTimeout(() => {
+        stallTimerRef.current = null;
+        // Only fire if the element is still not playing anything.
+        const v = videoRef.current;
+        if (!v) return;
+        if (v.readyState >= 3) return;
+        _scheduleRetry();
+      }, stallDebounceMs);
+    };
+
+    const onProgress = () => {
+      if (stallTimerRef.current) {
+        clearTimeout(stallTimerRef.current);
+        stallTimerRef.current = null;
+      }
     };
 
     video.addEventListener('canplay', onCanPlay);
     video.addEventListener('error', onError);
+    video.addEventListener('stalled', onStallOrSuspend);
+    video.addEventListener('suspend', onStallOrSuspend);
+    video.addEventListener('progress', onProgress);
 
     // If we attach after the element is already past canplay (e.g.
     // because the browser cached the response), synthesise the
@@ -121,32 +192,55 @@ export default function useVideoLoadRetry(videoRef, src, options = {}) {
     return () => {
       video.removeEventListener('canplay', onCanPlay);
       video.removeEventListener('error', onError);
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
+      video.removeEventListener('stalled', onStallOrSuspend);
+      video.removeEventListener('suspend', onStallOrSuspend);
+      video.removeEventListener('progress', onProgress);
+      if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+      if (stallTimerRef.current) { clearTimeout(stallTimerRef.current); stallTimerRef.current = null; }
+      if (abortRef.current) { abortRef.current.abort(); abortRef.current = null; }
     };
-    // videoRef is a ref object — stable identity; including it would
-    // be a lint-noise-only change. src drives the real dependency.
+    // videoRef is a ref object — stable identity; src drives the
+    // real dependency.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [src, maxAttempts, steadyDelay, preparingAfterAttempt]);
+  }, [src, maxAttempts, steadyDelay, preparingAfterAttempt, stallDebounceMs]);
 
   const reset = () => {
     attemptRef.current = 0;
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+    if (stallTimerRef.current) { clearTimeout(stallTimerRef.current); stallTimerRef.current = null; }
+    firstDelayOverrideRef.current = null;
     setError(false);
     setPreparing(false);
-    if (videoRef.current) {
-      try {
-        videoRef.current.load();
-      } catch {
-        /* element gone — ignore */
-      }
+    setAuthError(false);
+    // Re-probe via the effect: bumping src dep isn't possible from
+    // here, so we re-run the probe inline.
+    if (videoRef.current && src) {
+      if (abortRef.current) abortRef.current.abort();
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      (async () => {
+        try {
+          const resp = await fetch(src, { method: 'HEAD', signal: ctrl.signal });
+          if (ctrl.signal.aborted) return;
+          if (resp.status === 503) {
+            setPreparing(true);
+            const retryAfter = parseInt(resp.headers.get('Retry-After') || '', 10);
+            if (Number.isFinite(retryAfter) && retryAfter > 0) {
+              firstDelayOverrideRef.current = retryAfter * 1000;
+            }
+          } else if (resp.status === 401) {
+            setAuthError(true);
+            return;
+          }
+        } catch {
+          /* network error — proceed to load() */
+        }
+        try {
+          if (videoRef.current) videoRef.current.load();
+        } catch { /* element gone */ }
+      })();
     }
   };
 
-  return { ready, preparing, error, reset };
+  return { ready, preparing, error, authError, reset };
 }
