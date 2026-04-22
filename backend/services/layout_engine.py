@@ -58,6 +58,114 @@ def multi_layout_allowed_for(content_type, config=None) -> bool:
 # ``multi_layout_allowed_for(content_type, config)``.
 ALLOW_MULTI_LAYOUT = os.environ.get("ALLOW_MULTI_LAYOUT", "false").lower() in ("true", "1", "yes")
 
+
+# Blueprint v2 Phase 2 — hybrid layout selector master flag.
+# When unset / "0" the VLM fallback path is disabled; callers stay on
+# the deterministic top-ranked candidate. Set to "1" / "true" to let
+# ``decide_layout_for_scene`` escalate low-confidence scenes to the VLM.
+def _layout_vlm_enabled() -> bool:
+    return os.environ.get(
+        "CLIPAI_LAYOUT_VLM_ENABLED", "0",
+    ).lower() in ("1", "true", "yes")
+
+
+async def decide_layout_for_scene(
+    *,
+    scene,
+    dense_faces: list,
+    active_speaker_events: list,
+    has_hud: bool = False,
+    has_screen_region: bool = False,
+    has_webcam_overlay: bool = False,
+    saliency_dispersion: float = 0.0,
+    ball_detections: list = None,
+    content_type: str = "generic",
+    config=None,
+    video_path: str = "",
+    source_sha: str = "",
+    orchestrator=None,
+    budget_remaining: list = None,
+    transcript_excerpt: str = "",
+    asd_timeline: str = "",
+):
+    """Blueprint v2 Phase 2 hybrid layout decision.
+
+    Returns ``(layout: str, reason: str, confidence_result)``.
+
+    Steps:
+      1. Score every candidate deterministically via
+         ``score_layout_candidates``.
+      2. If the scorer's confidence >= ``config.layout_confidence_threshold``,
+         or the VLM path is disabled / the orchestrator is missing,
+         return the top candidate.
+      3. Otherwise, if budget remains, call the VLM fallback. Any
+         failure silently drops back to the top candidate.
+
+    ``budget_remaining`` is a mutable ``[int]`` shared across calls
+    within a clip so the caller can enforce a per-clip VLM budget.
+    """
+    from backend.services.layout_confidence import score_layout_candidates
+    from backend.services.reframe_config import get_default_config
+
+    _cfg = config or get_default_config()
+    result = score_layout_candidates(
+        scene_start=float(getattr(scene, "start", 0.0)),
+        scene_end=float(getattr(scene, "end", 0.0)),
+        dense_faces=dense_faces,
+        active_speaker_events=active_speaker_events,
+        has_hud=has_hud,
+        has_screen_region=has_screen_region,
+        has_webcam_overlay=has_webcam_overlay,
+        saliency_centroid_dispersion=saliency_dispersion,
+        ball_detections=ball_detections,
+        content_type=content_type,
+        config=_cfg,
+    )
+
+    threshold = float(getattr(_cfg, "layout_confidence_threshold", 0.6))
+    if (result.is_confident(threshold)
+            or not _layout_vlm_enabled()
+            or orchestrator is None):
+        return (
+            result.top.layout,
+            f"deterministic: {result.top.rationale}",
+            result,
+        )
+
+    if budget_remaining is not None and budget_remaining[0] <= 0:
+        return (
+            result.top.layout,
+            f"vlm-budget-exhausted: {result.top.rationale}",
+            result,
+        )
+
+    from backend.services.layout_vlm_fallback import request_layout_from_vlm
+    start = float(getattr(scene, "start", 0.0))
+    end = float(getattr(scene, "end", 0.0))
+    scene_id = f"{source_sha[:8] if source_sha else 'nosrc'}_{start:.3f}_{end:.3f}"
+    decision = await request_layout_from_vlm(
+        scene_start=start,
+        scene_end=end,
+        scene_id=scene_id,
+        source_sha=source_sha,
+        video_path=video_path,
+        orchestrator=orchestrator,
+        candidates=result.candidates,
+        content_type=content_type,
+        transcript_excerpt=transcript_excerpt,
+        asd_timeline=asd_timeline,
+        config=_cfg,
+    )
+    if budget_remaining is not None:
+        budget_remaining[0] -= 1
+    if decision is None:
+        return (
+            result.top.layout,
+            f"vlm-failed: {result.top.rationale}",
+            result,
+        )
+    return decision.layout, f"vlm: {decision.reason}", result
+
 logger = logging.getLogger(__name__)
 
 

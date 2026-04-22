@@ -352,6 +352,20 @@ class ReframeConfig:
     # directly.
     importance: ImportanceWeights = field(default_factory=ImportanceWeights)
 
+    # ── Blueprint v2 Phase 2 — Hybrid layout selector ─────────────
+    # When the deterministic scorer's top candidate beats the
+    # runner-up by less than this fraction of the top score, the
+    # layout engine escalates the decision to a VLM call. 0.6 = the
+    # top must win by >= 60% margin.
+    layout_confidence_threshold: float = 0.6
+    # Hard cap on VLM layout calls per clip. Prevents pathologically
+    # ambiguous clips from spamming the VLM.
+    layout_vlm_budget_per_clip: int = 8
+    # Backend selector, same convention as ``critic_vlm_backend``.
+    layout_vlm_backend: str = "auto"
+    # Cache dir for per-scene VLM layout decisions.
+    layout_vlm_cache_dir: str = "/tmp/clipai_layout_vlm_cache"
+
     # Extra knobs — per-content overrides stored as a dict so the
     # per-type table can live in one place.
     content_overrides: dict = field(default_factory=dict)
@@ -586,6 +600,20 @@ def load_default_config() -> ReframeConfig:
         kalman_process_noise=_env_float("CLIPAI_KALMAN_PROCESS", 0.04),
         kalman_measurement_noise=_env_float("CLIPAI_KALMAN_MEAS", 0.16),
         kalman_prediction_ms=_env_float("CLIPAI_KALMAN_PRED_MS", 350.0),
+
+        layout_confidence_threshold=_env_float(
+            "CLIPAI_LAYOUT_CONFIDENCE_THRESHOLD", 0.6,
+        ),
+        layout_vlm_budget_per_clip=_env_int(
+            "CLIPAI_LAYOUT_VLM_BUDGET", 8,
+        ),
+        layout_vlm_backend=os.environ.get(
+            "CLIPAI_LAYOUT_VLM_BACKEND", "auto",
+        ),
+        layout_vlm_cache_dir=os.environ.get(
+            "CLIPAI_LAYOUT_VLM_CACHE",
+            "/tmp/clipai_layout_vlm_cache",
+        ),
 
         critic_mode=os.environ.get("CLIPAI_CRITIC_MODE", "learned"),
         critic_vlm_backend=os.environ.get("CLIPAI_CRITIC_VLM_BACKEND", "auto"),
