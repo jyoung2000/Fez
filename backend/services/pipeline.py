@@ -4471,12 +4471,174 @@ async def _run_analysis_inner(job_id: str):
     source_height = int(metadata.get("height", 1080) or 1080)
     _has_speaker_data = active_speaker_events or transcript_speaker_events
     USE_AUTOFLIP_REFRAME = os.environ.get("USE_AUTOFLIP_REFRAME", "false").lower() in ("true", "1", "yes")
+    # Phase A: primary branch that runs the SOTA human-reframe stack
+    # (2-D L1 solver + Kalman + event state machine + A/B scheduler +
+    # motivated zoom) before the legacy segmenters. Default OFF.
+    # Feeds the same ReframeSegment list downstream so the
+    # SceneDescription hoist and RenderPlan builder consume the new
+    # path unchanged.
+    USE_HUMAN_REFRAME_PIPELINE = os.environ.get(
+        "CLIPAI_HUMAN_REFRAME_PIPELINE", "false",
+    ).lower() in ("true", "1", "yes")
     if dense_face_results and face_registry and scenes and _has_speaker_data:
         try:
             from backend.services.reframe_segmenter import USE_REFRAME_SEGMENTER, build_reframe_segments
-            logger.info("[%s] Reframe mode: %s", job_id,
-                        "AUTOFLIP" if USE_AUTOFLIP_REFRAME else "SEGMENTER" if USE_REFRAME_SEGMENTER else "LEGACY")
-            if USE_AUTOFLIP_REFRAME and not _is_gameplay:
+            logger.info(
+                "[%s] Reframe mode: %s", job_id,
+                "HUMAN_REFRAME_PIPELINE" if USE_HUMAN_REFRAME_PIPELINE
+                else "AUTOFLIP" if USE_AUTOFLIP_REFRAME
+                else "SEGMENTER" if USE_REFRAME_SEGMENTER
+                else "LEGACY",
+            )
+            if USE_HUMAN_REFRAME_PIPELINE and not _is_gameplay:
+                # ── Human-reframe pipeline path (SOTA 2026 stack) ──
+                # Composes run_human_reframe → render_plan_from_human_plan
+                # → reframe_segments_from_human_plan so the full
+                # 2-D LP + Kalman + event state machine + A/B scheduler
+                # + motivated-zoom stack lands in production. The
+                # shim emits a ReframeSegment list that the downstream
+                # SceneDescription hoist + RenderPlan builder consume
+                # exactly like the legacy segmenters did.
+                from backend.services.human_reframe import (
+                    HumanReframeInputs,
+                    run_human_reframe,
+                )
+                from backend.services.human_reframe_segment_adapter import (
+                    reframe_segments_from_human_plan,
+                )
+                from backend.services.reframe_config import get_default_config as _get_hr_config
+
+                _hr_video_dur = float(metadata.get("duration", 0) or 0.0)
+                _hr_shot_cuts = list(scene_cut_timestamps or [])
+                _hr_content_type = (
+                    getattr(_content_profile, "content_type", "")
+                    if _content_profile else ""
+                )
+                _hr_beats: list[float] = []
+                _hr_downbeats: list[float] = []
+                try:
+                    from backend.services.beat_detector import (
+                        USE_MUSIC_BEAT_SNAP as _HR_USE_BS,
+                        detect_beats as _hr_detect_beats,
+                    )
+                    _hr_audio = f"/data/uploads/{job_id}/audio.wav"
+                    if (
+                        _HR_USE_BS
+                        and _hr_content_type == "music_video"
+                        and os.path.isfile(_hr_audio)
+                    ):
+                        _g = _hr_detect_beats(_hr_audio)
+                        if _g.has_data:
+                            _hr_beats = list(_g.beat_times)
+                            _hr_downbeats = list(_g.downbeat_times)
+                except Exception as _bs_e:
+                    logger.warning(
+                        "[%s] HumanReframe: beat detect skipped: %s",
+                        job_id, _bs_e,
+                    )
+
+                try:
+                    _hr_plan = run_human_reframe(
+                        HumanReframeInputs(
+                            duration_sec=_hr_video_dur,
+                            source_w=source_width,
+                            source_h=source_height,
+                            content_type=_hr_content_type or "other",
+                            dense_faces=list(dense_face_results or []),
+                            active_speaker_events=list(active_speaker_events or []),
+                            shot_boundaries=_hr_shot_cuts,
+                            beats=_hr_beats,
+                            downbeats=_hr_downbeats,
+                        ),
+                        config=_get_hr_config(),
+                    )
+                    reframe_segments, _hr_rp_direct = reframe_segments_from_human_plan(
+                        _hr_plan,
+                        source_width=source_width,
+                        source_height=source_height,
+                        source_fps=float(metadata.get("fps", 30.0) or 30.0),
+                        content_type=_hr_content_type or "",
+                        config=_get_hr_config(),
+                    )
+                    logger.info(
+                        "[%s] HumanReframe: %d ops, %d events, ab=%s, zooms=%d",
+                        job_id, len(reframe_segments),
+                        len(_hr_plan.events),
+                        "on" if _hr_plan.ab.enabled else "off",
+                        len(_hr_plan.zooms),
+                    )
+                except Exception as _hr_e:
+                    logger.warning(
+                        "[%s] HumanReframe pipeline failed (%s); "
+                        "falling through to legacy branches",
+                        job_id, _hr_e,
+                    )
+                    reframe_segments = []
+                    _hr_rp_direct = None
+
+                if reframe_segments:
+                    from backend.models import SceneDescription
+                    ai_scenes = [s for s in scenes if s.description != "[dense face tracking]"]
+                    for seg in reframe_segments:
+                        _desc = f"[human_reframe:{seg.reason}:{seg.ease_in_ms}:{seg.strategy}:{seg.confidence:.2f}]"
+                        _sx_int = int(round(seg.subject_x / source_width * 100.0)) if source_width > 0 else 50
+                        _asx = _sx_int if seg.active_slot is not None else None
+                        ai_scenes.append(SceneDescription(
+                            timestamp=float(seg.start),
+                            description=_desc,
+                            importance_score=5,
+                            thumbnail_path="",
+                            subject_x=_sx_int,
+                            active_speaker_x=_asx,
+                            active_slot=seg.active_slot,
+                            layout_mode=seg.layout,
+                            precise_x=float(seg.subject_x),
+                            precise_y=float(seg.subject_y),
+                            face_count=len(face_registry.slots) if face_registry else 0,
+                            face_positions=[],
+                        ))
+                    ai_scenes.sort(key=lambda s: s.timestamp)
+                    scenes = ai_scenes
+                    _tracking_mode = "multi_cluster"
+                    await database.update_job_status(
+                        job_id, scenes=list(scenes), tracking_mode=_tracking_mode,
+                    )
+                    logger.info(
+                        "[%s] *** HumanReframePipeline: %d segments → %d scenes ***",
+                        job_id, len(reframe_segments), len(scenes),
+                    )
+                    _reframe_segments_used = True
+
+                    try:
+                        from backend.services.render_plan import USE_RENDER_PLAN
+                        if USE_RENDER_PLAN and _hr_rp_direct is not None:
+                            from backend.services.render_plan_debug import build_debug_payload
+                            _rp_dict = _hr_rp_direct.to_dict()
+                            _rp_dict["debug"] = build_debug_payload(
+                                job=await database.get_job(job_id),
+                                content_profile=_content_profile,
+                                reframe_segments=reframe_segments,
+                                editorial_report=None,
+                                pacing_estimator=None,
+                            )
+                            await database.update_job_status(
+                                job_id, render_plan=_rp_dict,
+                            )
+                            logger.info(
+                                "[%s] HumanReframe RenderPlan: %d ops, %.1fs duration",
+                                job_id, len(_hr_rp_direct.ops),
+                                _hr_rp_direct.total_duration_sec,
+                            )
+                    except Exception as rp_e:
+                        logger.warning(
+                            "[%s] HumanReframe RenderPlan attach failed (non-fatal): %s",
+                            job_id, rp_e,
+                        )
+                # If the human-reframe branch produced no segments
+                # (explicit failure or the flag on but inputs empty),
+                # we fall through to the legacy branches below so the
+                # pipeline never ships without a timeline.
+            if (not _reframe_segments_used) and USE_AUTOFLIP_REFRAME and not _is_gameplay:
                 # ── AutoFlip reframe path ──
                 from backend.services.autoflip_segmenter import build_autoflip_segments
                 _video_dur = metadata.get("duration", 0)
@@ -4662,7 +4824,7 @@ async def _run_analysis_inner(job_id: str):
                     except Exception as rp_e:
                         logger.warning("[%s] AutoFlip RenderPlan build failed (non-fatal): %s", job_id, rp_e)
 
-            elif USE_REFRAME_SEGMENTER and not _is_gameplay and not _is_continuous:
+            elif (not _reframe_segments_used) and USE_REFRAME_SEGMENTER and not _is_gameplay and not _is_continuous:
                 _video_dur = metadata.get("duration", 0)
                 _shot_cuts = scene_cut_timestamps if scene_cut_timestamps else []
 

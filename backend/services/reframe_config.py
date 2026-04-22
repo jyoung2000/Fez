@@ -197,6 +197,17 @@ class ReframeConfig:
     # worse than the legacy baseline.
     human_reframe_enabled: bool = True
 
+    # Phase A wiring flag. Distinct from ``human_reframe_enabled``:
+    # that flag drives the post-hoc RenderPlan override hook
+    # (``human_reframe_bridge.maybe_override_render_plan``). This flag
+    # drives a *primary* pipeline branch that runs ``run_human_reframe``
+    # before the legacy segmenter so the SOTA 2026 stack (2-D LP solver
+    # + Kalman + event state machine + A/B scheduler + motivated zoom)
+    # produces the :class:`ReframeSegment` list that the rest of the
+    # pipeline consumes. Default OFF; promote to ON only after the
+    # human-parity bench measurement lands (see docs/human_parity_bench.md).
+    human_reframe_pipeline_enabled: bool = False
+
     # ── L1 / LP solver weights (Grundmann et al. 2011 Sec 4.2) ─────
     lp_lambda_data: float = 1.0
     lp_lambda_v: float = 20.0
@@ -556,6 +567,9 @@ def load_default_config() -> ReframeConfig:
     defaults and merging in the per-content override table."""
     return ReframeConfig(
         human_reframe_enabled=_env_bool("CLIPAI_HUMAN_REFRAME", True),
+        human_reframe_pipeline_enabled=_env_bool(
+            "CLIPAI_HUMAN_REFRAME_PIPELINE", False,
+        ),
 
         lp_lambda_v=_env_float("CLIPAI_LP_LAMBDA_V", 20.0),
         lp_lambda_a=_env_float("CLIPAI_LP_LAMBDA_A", 100.0),
