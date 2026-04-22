@@ -154,6 +154,8 @@ def _build_op_filter(
         return _filter_grid_2x2(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
     elif op.kind in (RenderOpKind.MOTIVATED_PUSH_IN, RenderOpKind.MOTIVATED_PULL_OUT):
         return _filter_motivated_zoom(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
+    elif op.kind == RenderOpKind.KEN_BURNS:
+        return _filter_ken_burns(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
     else:
         # Fallback to crop
         return _filter_crop(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
@@ -371,6 +373,48 @@ def _filter_wide_master(op, label, tgt_w, tgt_h, start, end) -> str:
         f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
         f"scale={tgt_w}:-1:flags=lanczos,"
         f"pad={tgt_w}:{tgt_h}:0:(oh-ih)/2:black[{label}]"
+    )
+
+
+def _filter_ken_burns(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> str:
+    """KEN_BURNS: cosine-eased zoom-in toward a saliency centroid.
+
+    ``op.motion_path`` must contain at least 2 keypoints. Rects are
+    normalized 0-1 relative to source. Interpolates x/y/w/h linearly
+    over the scene with a cosine ease (0.5 - 0.5 * cos(pi * t01))
+    so the push eases in and out of static endpoints.
+    """
+    kps = op.motion_path or []
+    if len(kps) < 2:
+        return _filter_crop(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
+
+    dur = max(end - start, 1e-3)
+    k0, k1 = kps[0], kps[-1]
+    x0, y0, w0, h0 = k0.rect.to_pixels(src_w, src_h)
+    x1, y1, w1, h1 = k1.rect.to_pixels(src_w, src_h)
+
+    # Degenerate case: start==end — emit a static crop.
+    if (x0, y0, w0, h0) == (x1, y1, w1, h1):
+        return _filter_crop(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
+
+    # Cosine ease on normalized progress t01 = (t-start)/dur, clamped
+    # so time outside the segment can't drive the expression negative.
+    t01 = f"clip((t-{start:.3f})/{dur:.4f}\\,0\\,1)"
+    eased = f"(0.5-0.5*cos(PI*{t01}))"
+
+    def _interp(a: float, b: float) -> str:
+        if abs(b - a) < 1e-3:
+            return f"{a:.2f}"
+        return f"({a:.2f}+({b - a:.2f})*{eased})"
+
+    x_expr = _interp(x0, x1)
+    y_expr = _interp(y0, y1)
+    w_expr = _interp(w0, w1)
+    h_expr = _interp(h0, h1)
+    return (
+        f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
+        f"crop=w={w_expr}:h={h_expr}:x={x_expr}:y={y_expr}:exact=1,"
+        f"scale={tgt_w}:{tgt_h}:flags=lanczos[{label}]"
     )
 
 

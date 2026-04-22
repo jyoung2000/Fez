@@ -148,6 +148,74 @@ def _probe_ollama_reachable(timeout: float = 1.5) -> bool:
         return False
 
 
+async def _ollama_vlm_critique(
+    provider, prompt: str, images: list[dict], max_tokens: int,
+) -> str:
+    """Blueprint v2 — single-call multi-image critique via Ollama.
+
+    Ollama's ``/api/generate`` accepts a list of base64 images in one
+    request, so the whole post-render critic runs in a single HTTP
+    call per clip. The prompt is prefixed with per-image timestamps so
+    the VLM can reference them in its JSON output.
+    """
+    import base64
+    import httpx
+
+    host = getattr(settings, "OLLAMA_HOST", "http://localhost:11434")
+    model = getattr(provider, "_vision_model", None) or "llava:7b"
+    # Prefix the prompt with an index-timestamp map so the VLM can
+    # tie its issues back to seconds instead of image index.
+    ts_list = ", ".join(f"{i}: t={img.get('timestamp', 0):.2f}s"
+                        for i, img in enumerate(images))
+    full_prompt = f"Frames ({ts_list}).\n\n{prompt}"
+    img_b64 = [base64.b64encode(img["data"]).decode("ascii") for img in images]
+    payload = {
+        "model": model,
+        "prompt": full_prompt,
+        "images": img_b64,
+        "stream": False,
+        "options": {"temperature": 0.1, "num_predict": max_tokens},
+    }
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(f"{host}/api/generate", json=payload)
+        resp.raise_for_status()
+        body = resp.json()
+    return body.get("response", "") or ""
+
+
+async def _openrouter_vlm_critique(
+    provider, prompt: str, images: list[dict], max_tokens: int,
+) -> str:
+    """Blueprint v2 — single-call multi-image critique via OpenRouter.
+
+    OpenRouter/OpenAI chat messages support multi-image content as an
+    array of ``image_url`` parts. We encode each PNG as a data URL and
+    attach a tiny text header with the timestamp so the VLM can tie
+    issues back to seconds.
+    """
+    import base64
+
+    model = getattr(provider, "_vision_model", None) or getattr(
+        provider, "_text_model", "openai/gpt-4o-mini",
+    )
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for i, img in enumerate(images):
+        data_url = (
+            "data:image/png;base64,"
+            + base64.b64encode(img["data"]).decode("ascii")
+        )
+        content.append({
+            "type": "text",
+            "text": f"Frame {i} (t={img.get('timestamp', 0):.2f}s):",
+        })
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": data_url},
+        })
+    messages = [{"role": "user", "content": content}]
+    return await provider._call(model, messages, max_tokens=max_tokens)
+
+
 class AIOrchestrator:
     """
     Tries providers in fallback chain order.
@@ -1100,6 +1168,43 @@ class AIOrchestrator:
                 if original_model is not None:
                     provider._text_model = original_model
         raise AllProvidersFailedError("All providers failed for text completion")
+
+    async def vlm_critique(
+        self,
+        *,
+        prompt: str,
+        images: list[dict],
+        max_tokens: int = 512,
+    ) -> str:
+        """Blueprint v2 — single multi-image VLM call, raw text back.
+
+        ``images`` is a list of ``{"data": bytes, "timestamp": float}``
+        dicts. Walks the configured vision provider chain and returns
+        the raw model text from the first provider that succeeds. Never
+        raises — returns an empty string when every provider fails so
+        callers can treat it as an advisory feature.
+        """
+        if not images:
+            return ""
+        for provider in self._get_active_chain():
+            if not provider.supports_vision:
+                continue
+            pname = provider.provider_name
+            try:
+                if pname == "ollama":
+                    text = await _ollama_vlm_critique(provider, prompt, images, max_tokens)
+                elif pname == "openrouter":
+                    text = await _openrouter_vlm_critique(provider, prompt, images, max_tokens)
+                else:
+                    # Other providers don't have a multi-image path yet;
+                    # skip and let fallback chain continue.
+                    continue
+                if text:
+                    return text
+            except Exception as e:
+                logger.info("vlm_critique via %s failed: %s", pname, e)
+                continue
+        return ""
 
     async def generate_seo(
         self,

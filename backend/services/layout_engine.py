@@ -12,17 +12,50 @@ Layout modes:
   SCREENSHARE — Screen/slides content top half + speaker bottom half.
   GAMEPLAY   — Game footage top 70% + speaker webcam bottom 30%.
 
-Multi-layout modes (SPLIT, TRIPLE, etc.) are reachable only behind the
-ALLOW_MULTI_LAYOUT flag (default False). When disabled, the engine always
-emits SINGLE — pure reframing, no layout gimmicks.
+Multi-layout modes (SPLIT, TRIPLE, PIP, SCREENSHARE, GAMEPLAY) are
+reachable only when the clip's ``content_type`` is in the config's
+``multi_layout_content_types`` allowlist. Any content type outside the
+allowlist (cinematic, narrative, talking-head-only, etc.) stays on the
+pure SINGLE reframing path — split screens look wrong on drama /
+movie content. The ALLOW_MULTI_LAYOUT env var still overrides per-run
+so fixture runs and manual QA can force a mode.
 """
 import logging
 import os
 from collections import Counter
 from dataclasses import dataclass, field
 
-# When False (default), layout is always SINGLE — pure reframing.
-# Multi-layout (split, triple, pip, etc.) is dead code behind this flag.
+# Content types where multi-layout is reachable by default. Any other
+# type stays SINGLE-only. Overridable per-run via the
+# ``multi_layout_content_types`` field on ``ReframeConfig``.
+DEFAULT_MULTI_LAYOUT_TYPES = frozenset({
+    "podcast", "interview", "multi_speaker_panel",
+    "stream", "gameplay", "gameplay_fps", "gameplay_moba",
+    "gameplay_tps", "gameplay_racing",
+    "tutorial", "screen_share",
+})
+
+
+def multi_layout_allowed_for(content_type, config=None) -> bool:
+    """True when multi-layout modes are reachable for this content type.
+
+    Resolution order:
+      1. ``ALLOW_MULTI_LAYOUT`` env var — wins unconditionally when set
+         (manual override / fixture runs).
+      2. ``config.multi_layout_content_types`` allowlist.
+      3. ``DEFAULT_MULTI_LAYOUT_TYPES``.
+    """
+    env = os.environ.get("ALLOW_MULTI_LAYOUT")
+    if env is not None:
+        return env.lower() in ("true", "1", "yes")
+    allowed = getattr(config, "multi_layout_content_types", None) or DEFAULT_MULTI_LAYOUT_TYPES
+    key = getattr(content_type, "value", content_type)
+    return (key or "") in allowed
+
+
+# Back-compat shim. Legacy callers that still import the module-level
+# flag get the env-var value (or False when unset). New code should use
+# ``multi_layout_allowed_for(content_type, config)``.
 ALLOW_MULTI_LAYOUT = os.environ.get("ALLOW_MULTI_LAYOUT", "false").lower() in ("true", "1", "yes")
 
 logger = logging.getLogger(__name__)
@@ -219,6 +252,8 @@ def build_layout_timeline(
     clip_end: float = 0,
     min_segment_duration: float = 2.0,
     prefer_single: bool = False,
+    content_type=None,
+    config=None,
 ) -> LayoutTimeline:
     """Build a layout timeline for a clip.
 
@@ -232,7 +267,7 @@ def build_layout_timeline(
     from backend.models import LayoutMode
     from backend.services.active_speaker import get_active_slot_at_time
 
-    if prefer_single or not face_results or not ALLOW_MULTI_LAYOUT:
+    if prefer_single or not face_results or not multi_layout_allowed_for(content_type, config):
         return LayoutTimeline(
             segments=[LayoutSegment(
                 start=clip_start, end=clip_end,
@@ -378,6 +413,7 @@ def plan_layout(
             scene_descriptions=scene_descriptions,
             clip_start=0,
             clip_end=clip_end,
+            content_type=content_type,
         )
 
 
@@ -747,7 +783,7 @@ def _build_padded_segment(
         if content_type == ClipContentType.TALKING_HEAD:
             # Debates/podcasts: SPLIT layout with two speakers
             pad_faces = [fr for fr in frame_faces if sc.start <= fr.timestamp < sc.end]
-            if pad_faces and face_registry and face_registry.multi_speaker and ALLOW_MULTI_LAYOUT:
+            if pad_faces and face_registry and face_registry.multi_speaker and multi_layout_allowed_for(content_type):
                 sub = build_layout_timeline(
                     face_results=pad_faces,
                     face_registry=face_registry,
@@ -755,12 +791,13 @@ def _build_padded_segment(
                     scene_descriptions=scene_descriptions,
                     clip_start=sc.start,
                     clip_end=sc.end,
+                    content_type=content_type,
                 )
                 return sub.segments
 
         elif content_type == ClipContentType.STREAM:
             # Twitch streams: gameplay PIP layout (facecam in corner)
-            if ALLOW_MULTI_LAYOUT:
+            if multi_layout_allowed_for(content_type):
                 return LayoutSegment(
                     start=sc.start, end=sc.end,
                     layout_mode="gameplay",
@@ -793,7 +830,7 @@ def _build_padded_segment(
 
     # Generic fallback: existing layout voter or SINGLE
     pad_faces = [fr for fr in frame_faces if sc.start <= fr.timestamp < sc.end]
-    if pad_faces and ALLOW_MULTI_LAYOUT:
+    if pad_faces and multi_layout_allowed_for(content_type):
         sub = build_layout_timeline(
             face_results=pad_faces,
             face_registry=face_registry,
@@ -801,6 +838,7 @@ def _build_padded_segment(
             scene_descriptions=scene_descriptions,
             clip_start=sc.start,
             clip_end=sc.end,
+            content_type=content_type,
         )
         return sub.segments
 

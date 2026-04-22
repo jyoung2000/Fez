@@ -36,6 +36,13 @@ class RenderOpKind(str, Enum):
     # the FFmpeg builder interpolates w/h linearly along with x/y.
     MOTIVATED_PUSH_IN = "motivated_push_in"
     MOTIVATED_PULL_OUT = "motivated_pull_out"
+    # Blueprint v2 Phase 0: slow-push cinematography for scenes with
+    # no tracked subject (landscape / B-roll / establishing). Total
+    # travel capped by ``reframe_config.ken_burns_max_travel_frac``;
+    # zoom capped by ``ken_burns_max_zoom``. Two keypoints in
+    # ``motion_path`` (start rect, end rect) interpolated with a
+    # cosine ease so the push eases in and out.
+    KEN_BURNS = "ken_burns"
 
 
 @dataclass
@@ -187,11 +194,12 @@ class RenderPlan:
                     else:
                         _check_rect(violations, f"{prefix}.{label}", rect)
 
-            # TRACKING_CROP / motivated-zoom ops must have motion_path
+            # TRACKING_CROP / motivated-zoom / Ken Burns ops must have motion_path
             if op.kind in (
                 RenderOpKind.TRACKING_CROP,
                 RenderOpKind.MOTIVATED_PUSH_IN,
                 RenderOpKind.MOTIVATED_PULL_OUT,
+                RenderOpKind.KEN_BURNS,
             ):
                 if not op.motion_path:
                     violations.append(

@@ -198,6 +198,37 @@ class ReframeConfig:
     fusion_area_max: float = 0.20
     fusion_min_persistence_frames: int = 5
 
+    # ── Multi-layout gating (Blueprint v2 Phase 0) ────────────────
+    # Content types where SPLIT / TRIPLE / PIP / SCREENSHARE /
+    # GAMEPLAY modes are reachable. Any type outside this set stays
+    # SINGLE-only (pure reframing). The ``ALLOW_MULTI_LAYOUT`` env
+    # var still overrides per-run for fixture / QA use.
+    multi_layout_content_types: frozenset = field(
+        default_factory=lambda: frozenset({
+            "podcast", "interview", "multi_speaker_panel",
+            "stream", "gameplay", "gameplay_fps", "gameplay_moba",
+            "gameplay_tps", "gameplay_racing",
+            "tutorial", "screen_share",
+        })
+    )
+
+    # ── Static-hold deadband (Blueprint v2 Phase 0) ───────────────
+    # How far the target can drift before the camera commits to
+    # tracking it. Distinct from ``deadzone_frac`` (which rejects
+    # sub-pixel noise in the face-keypoint stream). Genre-dependent:
+    # sports / vlog want small (fast response), panels want larger
+    # (committed holds). Units: fraction of source width.
+    deadband_frac: float = 0.10
+
+    # ── Ken Burns layout (Blueprint v2 Phase 0) ───────────────────
+    # Slow-push fallback for scenes with no tracked subject
+    # (landscape / B-roll / establishing). Total travel is capped at
+    # 8% of source. Set ``ken_burns_min_duration_sec`` to a huge
+    # value (or zoom cap to 1.0) to disable.
+    ken_burns_max_travel_frac: float = 0.08
+    ken_burns_max_zoom: float = 1.08
+    ken_burns_min_duration_sec: float = 2.0
+
     # Extra knobs — per-content overrides stored as a dict so the
     # per-type table can live in one place.
     content_overrides: dict = field(default_factory=dict)
@@ -232,6 +263,7 @@ _CONTENT_OVERRIDES = {
         "saliency_spatial_weight": 0.45,
         "saliency_temporal_weight": 0.30,
         "saliency_color_weight": 0.25,
+        "deadband_frac": 0.08,
     },
     "cinematic_dialogue": {
         "headroom_min": 0.08,
@@ -239,6 +271,7 @@ _CONTENT_OVERRIDES = {
         "saliency_spatial_weight": 0.45,
         "saliency_temporal_weight": 0.30,
         "saliency_color_weight": 0.25,
+        "deadband_frac": 0.12,
     },
     "multi_speaker_panel": {
         "zoom_push_in_max_scale": 1.00,
@@ -248,6 +281,13 @@ _CONTENT_OVERRIDES = {
         "saliency_spatial_weight": 0.45,
         "saliency_temporal_weight": 0.30,
         "saliency_color_weight": 0.25,
+        "deadband_frac": 0.12,
+    },
+    "podcast": {
+        "deadband_frac": 0.10,
+    },
+    "interview": {
+        "deadband_frac": 0.10,
     },
     "animation_dialogue": {
         "headroom_max": 0.20,
@@ -256,6 +296,7 @@ _CONTENT_OVERRIDES = {
         "saliency_color_weight": 0.25,
         "fusion_aspect_min": 0.8,
         "fusion_aspect_max": 1.8,
+        "deadband_frac": 0.10,
     },
     "animation": {
         "headroom_max": 0.22,
@@ -268,6 +309,7 @@ _CONTENT_OVERRIDES = {
         "fusion_area_min": 0.003,
         "fusion_area_max": 0.30,
         "fusion_min_persistence_frames": 4,
+        "deadband_frac": 0.10,
     },
     "music_video": {
         "lp_lambda_v": 10.0,
@@ -278,6 +320,7 @@ _CONTENT_OVERRIDES = {
         "fusion_aspect_min": 0.6,
         "fusion_aspect_max": 2.5,
         "fusion_min_persistence_frames": 4,
+        "deadband_frac": 0.12,
     },
     "sports": {
         "lp_lambda_v_y": 60.0,
@@ -286,6 +329,7 @@ _CONTENT_OVERRIDES = {
         "saliency_spatial_weight": 0.25,
         "saliency_temporal_weight": 0.55,
         "saliency_color_weight": 0.20,
+        "deadband_frac": 0.08,
     },
     "sports_basketball": {
         "lead_room_gain": 0.14,
@@ -310,22 +354,33 @@ _CONTENT_OVERRIDES = {
         "fusion_area_min": 0.01,
         "fusion_area_max": 0.35,
         "fusion_min_persistence_frames": 3,
+        "deadband_frac": 0.06,
     },
     "gameplay": {
         "zoom_push_in_max_scale": 1.00,
         "deadzone_frac": 0.025,
+        "deadband_frac": 0.10,
     },
     "gameplay_moba": {
         "zoom_push_in_max_scale": 1.00,
         "deadzone_frac": 0.030,
+        "deadband_frac": 0.10,
     },
     "gameplay_tps": {
         "zoom_push_in_max_scale": 1.00,
         "deadzone_frac": 0.020,
+        "deadband_frac": 0.10,
     },
     "gameplay_racing": {
         "zoom_push_in_max_scale": 1.00,
         "deadzone_frac": 0.030,
+        "deadband_frac": 0.10,
+    },
+    "documentary": {
+        "deadband_frac": 0.15,
+    },
+    "landscape": {
+        "deadband_frac": 0.15,
     },
     "stream": {
         "saliency_spatial_weight": 0.40,
@@ -336,6 +391,7 @@ _CONTENT_OVERRIDES = {
         "headroom_min": 0.08,
         "headroom_max": 0.14,
         "zoom_push_in_max_scale": 1.12,
+        "deadband_frac": 0.08,
     },
     "narrative": {
         "zoom_push_in_max_scale": 1.15,
@@ -366,6 +422,11 @@ def load_default_config() -> ReframeConfig:
 
         deadzone_frac=_env_float("CLIPAI_DEADZONE_FRAC", 0.018),
         stationary_threshold=_env_float("CLIPAI_STATIONARY_THRESHOLD", 0.08),
+        deadband_frac=_env_float("CLIPAI_DEADBAND_FRAC", 0.10),
+
+        ken_burns_max_travel_frac=_env_float("CLIPAI_KEN_BURNS_TRAVEL", 0.08),
+        ken_burns_max_zoom=_env_float("CLIPAI_KEN_BURNS_ZOOM", 1.08),
+        ken_burns_min_duration_sec=_env_float("CLIPAI_KEN_BURNS_MIN_DUR", 2.0),
 
         ease_shot_cut_ms=_env_int("CLIPAI_EASE_SHOT_CUT_MS", 0),
         ease_speaker_turn_ms=_env_int("CLIPAI_EASE_SPEAKER_TURN_MS", 200),

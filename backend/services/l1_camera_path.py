@@ -772,6 +772,7 @@ def solve_camera_path(
     seg_idx: int = 0,
     *,
     weights: Optional[list[float]] = None,
+    deadband_frac: Optional[float] = None,
 ) -> dict:
     """Solve L1-optimal camera path for a segment.
 
@@ -983,8 +984,12 @@ def solve_camera_path(
     path_max = max(solved)
     path_range = path_max - path_min
 
-    # Mode selection
-    if path_range < STATIONARY_THRESHOLD * source_width:
+    # Mode selection.
+    # Blueprint v2 Phase 0: ``deadband_frac`` (per-genre) overrides
+    # the module-level ``STATIONARY_THRESHOLD`` so sports / vlog can
+    # respond faster than panel / music_video.
+    _stationary_frac = deadband_frac if deadband_frac is not None else STATIONARY_THRESHOLD
+    if path_range < _stationary_frac * source_width:
         # Stationary: tiny movement, emit single static center
         center = sum(solved) / len(solved)
         return {
@@ -1030,6 +1035,8 @@ def _classify_segment_mode(
     times: list[float],
     solved: list[float],
     source_width: int,
+    *,
+    deadband_frac: Optional[float] = None,
 ) -> dict:
     """Classify a segment slice as stationary/tracking/panning.
 
@@ -1047,7 +1054,8 @@ def _classify_segment_mode(
 
     path_range = max(solved) - min(solved)
 
-    if path_range < STATIONARY_THRESHOLD * source_width:
+    _stationary_frac = deadband_frac if deadband_frac is not None else STATIONARY_THRESHOLD
+    if path_range < _stationary_frac * source_width:
         center = sum(solved) / len(solved)
         return {
             "mode": "stationary",

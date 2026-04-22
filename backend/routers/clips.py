@@ -376,6 +376,38 @@ async def export_clip_endpoint(
 
             elapsed = int(time.monotonic() - export_start)
 
+            # Stage 7: post-render VLM quality gate (Blueprint v2 Phase 0).
+            # Flag-gated off by default. When enabled, samples the
+            # rendered 9:16 output, sends to a VLM, and stores a
+            # structured report on the exported_clips entry. Any VLM
+            # failure is non-fatal — the report is advisory only.
+            post_render_report_dict = None
+            if os.environ.get("CLIPAI_POST_RENDER_CRITIC", "0").lower() in ("1", "true", "yes"):
+                try:
+                    from backend.services.post_render_critic import run_post_render_critic
+                    from backend.services.ai_orchestrator import AIOrchestrator
+                    from backend.services.pipeline_helpers import _record_pipeline_warning
+                    orch = AIOrchestrator()
+                    report = await run_post_render_critic(
+                        rendered_path=output_path,
+                        duration_sec=float(actual_end - actual_start),
+                        orchestrator=orch,
+                        job_id=job_id,
+                    )
+                    post_render_report_dict = report.to_dict()
+                    if not report.ok:
+                        _record_pipeline_warning(
+                            job_id,
+                            f"warn: post-render critic flagged {len(report.issues)} "
+                            f"issues on clip {req.clip_id} "
+                            f"(latency {report.vlm_latency_sec:.1f}s)",
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "[%s] post-render critic failed (non-fatal): %s",
+                        job_id, e,
+                    )
+
             # Update job record
             j = await database.load_job(job_id)
             if j:
@@ -397,6 +429,7 @@ async def export_clip_endpoint(
                     "subtitle_settings": req.subtitle_settings.model_dump() if req.subtitle_settings else None,
                     "volume": req.volume,
                     "speed": req.speed,
+                    "post_render_report": post_render_report_dict,
                     # Per-user attribution so the Exports tab only
                     # surfaces clips this user actually exported (admins
                     # can see every job but should not see every other
