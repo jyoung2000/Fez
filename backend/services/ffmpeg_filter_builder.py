@@ -156,6 +156,8 @@ def _build_op_filter(
         return _filter_motivated_zoom(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
     elif op.kind == RenderOpKind.KEN_BURNS:
         return _filter_ken_burns(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
+    elif op.kind == RenderOpKind.OUTPAINT_FILL:
+        return _filter_outpaint_fill(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
     else:
         # Fallback to crop
         return _filter_crop(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
@@ -428,6 +430,43 @@ def _filter_blur_fill(op, label, tgt_w, tgt_h, start, end) -> str:
         f"gblur=sigma={BLUR_SIGMA},eq=brightness={BLUR_BRIGHTNESS}[bgblur{label}];\n"
         f"[fg{label}]scale={tgt_w}:-1:flags=lanczos[fgs{label}];\n"
         f"[bgblur{label}][fgs{label}]overlay=(W-w)/2:(H-h)/2[{label}]"
+    )
+
+
+def _filter_outpaint_fill(
+    op, label, src_w, src_h, tgt_w, tgt_h, start, end,
+) -> str:
+    """Blueprint v2 Phase 5 — OUTPAINT_FILL.
+
+    When ``op.outpainted_media_path`` points at a readable 9:16 video
+    covering ``[start, end]``, use it directly as the filled frame.
+    If the media is missing or unreadable at render time, degrade
+    gracefully to the op kind stored in ``fallback_op_kind`` (almost
+    always ``blur_fill``) so the clip still exports.
+
+    Note: rendering an OUTPAINT_FILL op requires the outpainted media
+    to be attached to the ffmpeg invocation as an extra input. The
+    convention here is that ``clip_exporter`` adds one ``-i <path>``
+    per OUTPAINT_FILL op, in plan order, starting at input index 1.
+    ``outpaint_input_index`` (stashed by the caller) tells us which
+    ``[N:v]`` to pull from.
+    """
+    media = getattr(op, "outpainted_media_path", None)
+    input_idx = getattr(op, "outpaint_input_index", None)
+    if (
+        not media
+        or not os.path.exists(media)
+        or input_idx is None
+    ):
+        return _filter_blur_fill(op, label, tgt_w, tgt_h, start, end)
+
+    dur = max(0.0, float(end) - float(start))
+    # The outpainted media's timeline starts at 0, so we trim from 0
+    # to the op duration. ``setpts=PTS-STARTPTS`` puts it on the
+    # spliced timeline used by the concat filter.
+    return (
+        f"[{int(input_idx)}:v]trim=start=0:end={dur:.3f},setpts=PTS-STARTPTS,"
+        f"scale={tgt_w}:{tgt_h}:flags=lanczos[{label}]"
     )
 
 

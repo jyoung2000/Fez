@@ -43,6 +43,14 @@ class RenderOpKind(str, Enum):
     # ``motion_path`` (start rect, end rect) interpolated with a
     # cosine ease so the push eases in and out.
     KEN_BURNS = "ken_burns"
+    # Blueprint v2 Phase 5: Tier-3 generative outpaint fill. The
+    # ``outpainted_media_path`` on the RenderOp points at a
+    # pre-generated 9:16 video covering ``[start_sec, end_sec]``.
+    # ``fallback_op_kind`` captures the op kind that would have run
+    # otherwise (typically ``BLUR_FILL``) so the FFmpeg filter can
+    # degrade gracefully if the outpainted media is missing or
+    # corrupted at render time.
+    OUTPAINT_FILL = "outpaint_fill"
 
 
 @dataclass
@@ -113,6 +121,16 @@ class RenderOp:
     gaming_layout_mode: Optional[str] = None
     speaker_slot: Optional[int] = None   # slot_id driving this crop segment, None if unknown
     speaker_label: Optional[str] = None  # resolved display name ("Alice" if renamed, else None)
+    # Blueprint v2 Phase 5 — generative outpaint fill fields. Only
+    # populated on ``OUTPAINT_FILL`` ops; ignored elsewhere.
+    # ``outpainted_media_path`` must be a 9:16 video covering the
+    # op's [start_sec, end_sec] window; ``fallback_op_kind`` is the
+    # op kind the renderer degrades to if the media is missing or
+    # corrupted (typically ``BLUR_FILL``).
+    outpainted_media_path: Optional[str] = None
+    outpaint_provider: Optional[str] = None
+    outpaint_cost_usd: float = 0.0
+    fallback_op_kind: Optional[str] = None
 
 
 @dataclass
