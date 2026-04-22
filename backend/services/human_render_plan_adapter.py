@@ -615,6 +615,14 @@ def verify_frame_coverage(plan: RenderPlan) -> CoverageReport:
     )
 
 
+# ── Splice (Phase 3 auto-fix) ────────────────────────────────────
+#
+# ``splice_segment`` lives in its own module so callers can import it
+# without pulling the full adapter graph (numpy, camera_path_2d, etc.)
+# for a plan-level edit. Re-exported here for back-compat.
+from backend.services.render_plan_splice import splice_segment  # noqa: E402,F401
+
+
 # ── Fallback helpers ────────────────────────────────────────────
 
 

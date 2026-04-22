@@ -1,12 +1,14 @@
-"""Stage 7 — Post-render VLM quality gate (Blueprint v2 Phase 0).
+"""Stage 7 — Post-render VLM quality gate.
 
-Samples the rendered 9:16 output, sends the frames to a VLM with a
-single prompt that asks for a JSON list of flagged timestamps +
-issues, parses the response, and returns a structured report that
-the exporter stores alongside the clip record.
+Blueprint v2 Phase 0 wired the read-only path: sample frames, send to
+VLM, store issues on the clip record.
 
-One VLM call per clip (cheap). Disabled by default — enable with
-``CLIPAI_POST_RENDER_CRITIC=1`` once providers are configured.
+Blueprint v2 Phase 3 extends the prompt with an issue taxonomy so the
+auto-fix module (``post_render_autofix.py``) can decide which issues
+are fixable via a segment re-solve vs structural (source content
+can't be reframed without losing the subject).
+
+One VLM call per clip (cheap). Gated by ``CLIPAI_POST_RENDER_CRITIC=1``.
 """
 
 from __future__ import annotations
@@ -24,22 +26,78 @@ from backend.services.reframe_config import ReframeConfig, get_default_config
 
 logger = logging.getLogger(__name__)
 
+
+# ── Phase 3 issue taxonomy ────────────────────────────────────────
+#
+# Each VLM-flagged issue lands in one of these buckets. The autofix
+# strategy table maps auto-fixable kinds to a concrete config override
+# + optional crop-widen + window size. Structural kinds mark the clip
+# ``low_confidence`` and down-weight its virality score (Task 3.6).
+
+class IssueKind:
+    # ── Auto-fixable (re-solve a segment with new params) ──
+    TIGHT_FRAMING = "tight_framing"             # face clipped at edge
+    PAN_ACROSS_CUT = "pan_across_cut"           # solver bled across shot boundary
+    WRONG_SUBJECT = "wrong_subject"             # tracking the wrong face / object
+    JITTER = "jitter"                            # oscillating crop
+    TEXT_CUT_OFF = "text_cut_off"                # overlay text partially off
+    HEAD_OR_CHIN_CLIP = "head_or_chin_clip"     # headroom / chin violation
+
+    # ── Structural (source can't be reframed) ──
+    SUBJECT_LEFT_FRAME = "subject_left_frame"
+    OUTPAINT_HALLUC = "outpaint_hallucination"
+    HUD_ADJACENT = "hud_adjacent_gameplay"
+
+    # ── Cosmetic (no action) ──
+    SINGLE_FRAME_GLITCH = "single_frame_glitch"
+
+    # ── Unknown / unclassified (default bucket) ──
+    OTHER = "other"
+
+
+AUTO_FIX_KINDS: frozenset = frozenset({
+    IssueKind.TIGHT_FRAMING,
+    IssueKind.PAN_ACROSS_CUT,
+    IssueKind.WRONG_SUBJECT,
+    IssueKind.JITTER,
+    IssueKind.TEXT_CUT_OFF,
+    IssueKind.HEAD_OR_CHIN_CLIP,
+})
+
+STRUCTURAL_KINDS: frozenset = frozenset({
+    IssueKind.SUBJECT_LEFT_FRAME,
+    IssueKind.OUTPAINT_HALLUC,
+    IssueKind.HUD_ADJACENT,
+})
+
+COSMETIC_KINDS: frozenset = frozenset({
+    IssueKind.SINGLE_FRAME_GLITCH,
+})
+
+_KNOWN_KINDS: frozenset = (
+    AUTO_FIX_KINDS | STRUCTURAL_KINDS | COSMETIC_KINDS | frozenset({IssueKind.OTHER})
+)
+
+
 _PROMPT = """You are a video editor reviewing a 9:16 vertical reframe.
 Watch the attached frames (each has a timestamp) and list framing problems.
 
-Look for:
-- speaker off-frame or partially off-frame
-- text or captions cut off at the edge
-- jarring camera moves across scene cuts
-- visible crop seams or artifacts
-- subject suddenly leaving the frame
-- chin or forehead clipped
+For each issue, classify it as ONE of:
+- "tight_framing": subject partially clipped at a frame edge
+- "pan_across_cut": camera panned across a visible scene cut (jarring)
+- "wrong_subject": the wrong face / object is being tracked
+- "jitter": crop oscillates back and forth on a static scene
+- "text_cut_off": overlay text or captions are partially out of frame
+- "head_or_chin_clip": forehead or chin is cut off
+- "subject_left_frame": the subject has left the frame entirely (source issue, not fixable)
+- "outpaint_hallucination": visible outpaint / generative-fill artifact
+- "hud_adjacent_gameplay": gameplay HUD / minimap is cropped or unreadable
+- "single_frame_glitch": a one-frame artifact, not worth fixing
 
 Respond ONLY with a JSON array like:
-[{"t": 3.2, "issue": "speaker's face is half off the right edge", "severity": "high"}]
+[{"t": 3.2, "kind": "tight_framing", "severity": "high", "issue": "left speaker is half off the right edge"}]
 
-Valid severity values: "low", "medium", "high". If no problems,
-respond with an empty array: []
+Valid severity values: "low", "medium", "high". If no problems: []
 """
 
 
@@ -48,6 +106,10 @@ class PostRenderIssue:
     t: float
     issue: str
     severity: str = "medium"  # "low" | "medium" | "high"
+    # Phase 3 taxonomy bucket. Defaults to ``other`` when the VLM
+    # omits the field or returns an unknown value so the autofix
+    # strategy table can ignore the issue safely.
+    kind: str = IssueKind.OTHER
 
 
 @dataclass
@@ -62,12 +124,23 @@ class PostRenderReport:
         return {
             "ok": bool(self.ok),
             "issues": [
-                {"t": float(i.t), "issue": str(i.issue), "severity": str(i.severity)}
+                {
+                    "t": float(i.t),
+                    "kind": str(i.kind),
+                    "severity": str(i.severity),
+                    "issue": str(i.issue),
+                }
                 for i in self.issues
             ],
             "sampled": int(self.sampled_frames),
             "latency_sec": float(self.vlm_latency_sec),
         }
+
+    def structural_issues(self) -> list:
+        return [i for i in self.issues if i.kind in STRUCTURAL_KINDS]
+
+    def auto_fixable_issues(self) -> list:
+        return [i for i in self.issues if i.kind in AUTO_FIX_KINDS]
 
 
 def _parse_response(raw: str) -> list[PostRenderIssue]:
@@ -99,7 +172,12 @@ def _parse_response(raw: str) -> list[PostRenderIssue]:
             sev = str(entry.get("severity", "medium"))[:10].lower()
             if sev not in ("low", "medium", "high"):
                 sev = "medium"
-            out.append(PostRenderIssue(t=t, issue=issue, severity=sev))
+            kind = str(entry.get("kind", IssueKind.OTHER)).lower().strip()
+            if kind not in _KNOWN_KINDS:
+                kind = IssueKind.OTHER
+            out.append(PostRenderIssue(
+                t=t, issue=issue, severity=sev, kind=kind,
+            ))
         except (ValueError, TypeError):
             continue
     return out

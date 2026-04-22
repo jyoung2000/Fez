@@ -376,15 +376,24 @@ async def export_clip_endpoint(
 
             elapsed = int(time.monotonic() - export_start)
 
-            # Stage 7: post-render VLM quality gate (Blueprint v2 Phase 0).
-            # Flag-gated off by default. When enabled, samples the
-            # rendered 9:16 output, sends to a VLM, and stores a
-            # structured report on the exported_clips entry. Any VLM
-            # failure is non-fatal — the report is advisory only.
+            # Stage 7: post-render VLM quality gate.
+            #   Phase 0 wired the read-only path (flag + store issues).
+            #   Phase 3 extends to classify issues by the IssueKind
+            #   taxonomy, tag each clip with a ``confidence`` level
+            #   (high / medium / low), and count how many issues would
+            #   be auto-fixable vs structural. Re-render on a spliced
+            #   plan is deferred until ``export_clip`` exposes a
+            #   ``render_plan_override`` hook (see Phase 3 handoff).
             post_render_report_dict = None
+            clip_confidence = "high"
             if os.environ.get("CLIPAI_POST_RENDER_CRITIC", "0").lower() in ("1", "true", "yes"):
                 try:
-                    from backend.services.post_render_critic import run_post_render_critic
+                    from backend.services.post_render_critic import (
+                        run_post_render_critic,
+                    )
+                    from backend.services.post_render_autofix import (
+                        classify_clip_confidence,
+                    )
                     from backend.services.ai_orchestrator import AIOrchestrator
                     from backend.services.pipeline_helpers import _record_pipeline_warning
                     orch = AIOrchestrator()
@@ -394,12 +403,36 @@ async def export_clip_endpoint(
                         orchestrator=orch,
                         job_id=job_id,
                     )
-                    post_render_report_dict = report.to_dict()
-                    if not report.ok:
+                    clip_confidence = classify_clip_confidence(report)
+                    structural = report.structural_issues()
+                    fixable = report.auto_fixable_issues()
+                    payload = report.to_dict()
+                    payload.update({
+                        "confidence": clip_confidence,
+                        "structural_issues": [
+                            {"t": i.t, "kind": i.kind, "issue": i.issue}
+                            for i in structural
+                        ],
+                        "auto_fixable_count": len(fixable),
+                        # ``auto_fixes_applied`` stays 0 until the
+                        # re-render path is wired. Keeping the field
+                        # here documents the Phase 3 contract for the
+                        # UI + virality scorer.
+                        "auto_fixes_applied": 0,
+                    })
+                    post_render_report_dict = payload
+                    if structural:
+                        _record_pipeline_warning(
+                            job_id,
+                            f"warn: clip {req.clip_id} has {len(structural)} "
+                            f"structural framing issue(s) — source content "
+                            f"may not reframe well",
+                        )
+                    elif not report.ok:
                         _record_pipeline_warning(
                             job_id,
                             f"warn: post-render critic flagged {len(report.issues)} "
-                            f"issues on clip {req.clip_id} "
+                            f"issue(s) on clip {req.clip_id} "
                             f"(latency {report.vlm_latency_sec:.1f}s)",
                         )
                 except Exception as e:
@@ -429,6 +462,13 @@ async def export_clip_endpoint(
                     "subtitle_settings": req.subtitle_settings.model_dump() if req.subtitle_settings else None,
                     "volume": req.volume,
                     "speed": req.speed,
+                    # Blueprint v2 Phase 3 — per-clip reframe confidence.
+                    #   "high"   — no issues flagged by the critic
+                    #   "medium" — fixable / cosmetic issues only
+                    #   "low"    — structural issue (source can't reframe)
+                    # The UI uses this to badge the clip; clip_scoring
+                    # down-weights virality on "low" (see Phase 3 Task 3.6).
+                    "clip_confidence": clip_confidence,
                     "post_render_report": post_render_report_dict,
                     # Per-user attribution so the Exports tab only
                     # surfaces clips this user actually exported (admins

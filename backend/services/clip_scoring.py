@@ -119,6 +119,17 @@ def get_weights(content_type: Optional[ClipContentType]) -> dict[str, float]:
     return GENRE_WEIGHTS.get(content_type, GENRE_WEIGHTS_DEFAULT)
 
 
+# Blueprint v2 Phase 3 — re-export the virality-by-confidence helpers
+# from the stand-alone ``clip_confidence`` module. They live there so
+# tests can exercise them without pulling pydantic / ClipCandidate
+# into the import graph.
+from backend.services.clip_confidence import (  # noqa: E402,F401
+    CLIP_CONFIDENCE_VIRALITY_MULTIPLIER,
+    _confidence_multiplier,
+    apply_clip_confidence,
+)
+
+
 def composite_score(
     clip: ClipCandidate,
     content_type: Optional[ClipContentType] = None,
