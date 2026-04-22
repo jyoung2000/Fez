@@ -11,13 +11,26 @@
 # Environment:
 #   CLIPAI_REAL_CONTENT_CACHE   Cache directory. Defaults to
 #                               /var/cache/clipai/real_content.
+#   CLIPAI_YT_DLP               Explicit path to yt-dlp binary. If
+#                               unset, the script looks up yt-dlp on
+#                               $PATH. If not found, YouTube-style
+#                               URLs fail with a helpful message.
+#
+# URL routing:
+#   Direct media URLs (https://cdn.example.com/x.mp4, file://…,
+#   s3://… signed link) resolve via curl.
+#   Streaming-platform URLs — youtube.com, youtu.be, vimeo.com,
+#   tiktok.com, instagram.com — resolve via yt-dlp when it is
+#   available on PATH (or CLIPAI_YT_DLP). yt-dlp is NOT required;
+#   clips that use direct URLs continue to work without it.
 #
 # First-fetch workflow (when the manifest has empty source_urls and
 # empty sha256 entries):
 #
-#   1. Edit manifest.json to fill in source_url for each slug. If
-#      clips come from a local archive, set source_url to a file://
-#      path.
+#   1. Edit manifest.json to fill in source_url for each slug. For
+#      local archive paths, use file://. For YouTube / TikTok, paste
+#      the watch URL directly — yt-dlp picks the best 9:16-compatible
+#      format automatically.
 #   2. bash tests/real_content/fetch.sh
 #   3. Copy the "new sha256 for <slug>" stderr lines back into the
 #      manifest and re-run fetch.sh to lock them in.
@@ -41,6 +54,24 @@ if [[ ! -f "$MANIFEST" ]]; then
   echo "fetch.sh: manifest not found at $MANIFEST" >&2
   exit 2
 fi
+
+# Optional yt-dlp resolver. We look it up lazily so slugs that use
+# direct URLs (file://, s3, signed CDN) work on hosts without yt-dlp.
+YT_DLP_BIN="${CLIPAI_YT_DLP:-}"
+if [[ -z "$YT_DLP_BIN" ]] && command -v yt-dlp >/dev/null 2>&1; then
+  YT_DLP_BIN="$(command -v yt-dlp)"
+fi
+
+# Return 0 if the URL looks like a streaming-platform URL that needs
+# yt-dlp; return 1 for direct-download URLs that curl handles.
+_needs_yt_dlp() {
+  local u="$1"
+  case "$u" in
+    *youtube.com/*|*youtu.be/*|*vimeo.com/*|*tiktok.com/*|*instagram.com/*)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 mkdir -p "$CACHE"
 filter="${1:-*}"
@@ -89,10 +120,33 @@ while IFS= read -r entry; do
   fi
 
   echo "fetching: $slug <- $url" >&2
-  if ! curl -fL "$url" -o "$out"; then
-    echo "FETCH FAILED: $slug" >&2
-    failed_count=$((failed_count + 1))
-    continue
+  if _needs_yt_dlp "$url"; then
+    if [[ -z "$YT_DLP_BIN" ]]; then
+      echo "FETCH FAILED: $slug — url needs yt-dlp but it is not installed (pip install yt-dlp, or set CLIPAI_YT_DLP=/path/to/yt-dlp)" >&2
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+    # yt-dlp picks the best progressive mp4 ≤ 1080p for reframing
+    # benchmarks; adjust --format if the harness needs a different
+    # resolution. --no-playlist so playlist URLs don't drag in the
+    # whole channel.
+    if ! "$YT_DLP_BIN" \
+        --no-playlist \
+        --format "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best" \
+        --merge-output-format mp4 \
+        --output "$out" \
+        --quiet --no-warnings \
+        "$url"; then
+      echo "FETCH FAILED (yt-dlp): $slug" >&2
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+  else
+    if ! curl -fL "$url" -o "$out"; then
+      echo "FETCH FAILED: $slug" >&2
+      failed_count=$((failed_count + 1))
+      continue
+    fi
   fi
 
   if [[ -n "$sha" ]]; then

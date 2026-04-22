@@ -1,44 +1,44 @@
 {
   "schema": 1,
-  "notes": "Week 3 real-content bench set. Clips are NOT committed to the repo — the fetcher pulls them into a homelab cache directory and pins the sha256. Each entry names its target ClipContentType so the harness can assert the classifier lands on the right row. Source URLs are placeholders; Jalon fills these in with his own archive paths before running fetch.sh for the first time. After the first successful fetch, copy the 'new sha256' lines emitted by fetch.sh on stderr back into this file to pin the entries.",
+  "notes": "Week 3 real-content bench set. Clips are NOT committed to the repo — the fetcher pulls them into a homelab cache directory and pins the sha256. Each entry names its target ClipContentType so the harness can assert the classifier lands on the right row. After the first successful fetch, copy the 'new sha256' lines emitted by fetch.sh on stderr back into this file to pin the entries. fetch.sh transparently routes URLs matching (youtube.com|youtu.be|vimeo.com|tiktok.com|instagram.com) through yt-dlp when it is installed on the host; direct media URLs (file://, s3, signed links) continue to resolve via curl. Ground truth vertical URLs are OPTIONAL — when null the clip scores only on the VLM critic + aesthetic_score_mean (not on mae_cx/cy, cut_timing_deviation, or lead_room_correlation) and the extract_human_trajectories script skips that slug.",
   "cache_dir_env": "CLIPAI_REAL_CONTENT_CACHE",
   "cache_dir_default": "/var/cache/clipai/real_content",
   "clips": [
     {
       "slug": "panel_verzuz_tank_tyrese_10s",
-      "source_url": "",
+      "source_url": "https://www.youtube.com/watch?v=telXQw1_c8I",
       "sha256": "",
       "ext": "mp4",
       "duration_sec": 10,
       "content_type": "debate",
       "subtype": null,
       "target_clipcontenttype": "multi_speaker_panel",
-      "description": "4-seat Verzuz-style panel, steady wide source, moderate speaker changes. Stress test for the panel short-shot override and the editorial J/L cut anticipation.",
+      "description": "4-seat Verzuz-style panel, steady wide source, moderate speaker changes. Stress test for the panel short-shot override and the editorial J/L cut anticipation. Trim the fetched asset to a 10 s window during a two-man exchange (avoid guest spots). Ground truth: Apple Music TikTok @applemusic + Verzuz IG @verzuztv post vertical cuts; search 'tank tyrese verzuz' and paste a specific vertical URL below.",
       "ground_truth_vertical_url": null
     },
     {
       "slug": "panel_joebudden_10s",
-      "source_url": "",
+      "source_url": "https://www.youtube.com/playlist?list=PLhKmHfWT5YmIlx6cUNKD_llMUmZCila_E",
       "sha256": "",
       "ext": "mp4",
       "duration_sec": 10,
       "content_type": "podcast",
       "subtype": null,
       "target_clipcontenttype": "multi_speaker_panel",
-      "description": "4-seat table, static camera, speaker changes every 2-4s. Baseline for the MULTI_SPEAKER_PANEL hold distribution.",
-      "ground_truth_vertical_url": null
+      "description": "4-seat table, static camera, speaker changes every 2-4s. Baseline for the MULTI_SPEAKER_PANEL hold distribution. Pick any 2025-2026 recent episode from the @JoeBuddenTV playlist; trim to 10 s containing a mid-sentence interrupt between Joe and Ice/Parks/Ish. Ground truth: @JoeBuddenClips YT channel and @joebuddenpodcast IG Reels post matching verticals within 24h of each episode.",
+      "ground_truth_vertical_url": "https://www.youtube.com/@JoeBuddenClips"
     },
     {
       "slug": "panel_breakfast_club_10s",
-      "source_url": "",
+      "source_url": "https://www.youtube.com/playlist?list=PL-JcXudKgJPajN5tEWrW0QNp7UMP0ZkUe",
       "sha256": "",
       "ext": "mp4",
       "duration_sec": 10,
       "content_type": "podcast",
       "subtype": null,
       "target_clipcontenttype": "multi_speaker_panel",
-      "description": "3-host panel with occasional B-roll cutaways. Tests the short-shot override gate when opencv-fallback flicker shots would otherwise trip it.",
-      "ground_truth_vertical_url": null
+      "description": "3-host panel with occasional B-roll cutaways. Tests the short-shot override gate when opencv-fallback flicker shots would otherwise trip it. Pick any recent celebrity interview from the 'Latest Breakfast Club Interviews' playlist; trim to 10 s with >= 2 handoffs between Charlamagne/Envy/Jess. Ground truth: @breakfastclubam TikTok + IG Reels reliably vertical-cut every interview.",
+      "ground_truth_vertical_url": "https://www.tiktok.com/@breakfastclubam"
     },
     {
       "slug": "anime_fate_stay_night_fight_15s",
@@ -49,7 +49,7 @@
       "content_type": "anime",
       "subtype": "action",
       "target_clipcontenttype": "animation",
-      "description": "Saber vs. Archer — 6-8 frame cuts, stylized line art, motion blur. Stress test for the Week 2 anime shot detector (histogram + edge-density) and the anime face cascade augmentation.",
+      "description": "Saber vs. Archer UBW Ep 20 mid-episode duel — 6-8 frame cuts, stylized line art, motion blur. Stress test for the Week 2 anime shot detector (histogram + edge-density) and the anime face cascade augmentation. Copyright blocks public access: populate source_url with a file:// path to a local Blu-ray / Crunchyroll rip, e.g. file:///mnt/user/anime/fate_ubw_e20.mkv. Ground truth intentionally null — Aniplex does not post full-scene verticals.",
       "ground_truth_vertical_url": null
     },
     {
@@ -61,7 +61,7 @@
       "content_type": "anime",
       "subtype": "action",
       "target_clipcontenttype": "animation",
-      "description": "Tanjiro water-breathing sequence — particle effects, rapid camera pushes. Tests whether the anime anchor's impact-frame detection lands on the wind-up, not the blur.",
+      "description": "Tanjiro water-breathing sequence — particle effects, rapid camera pushes. Tests whether the anime anchor's impact-frame detection lands on the wind-up, not the blur. Recommended scene: S3 E1 'Someone's Dream' (Tanjiro vs. Hantengu) or S1 E19 Hinokami Kagura. Populate source_url with a file:// path to a local rip. Ground truth intentionally null.",
       "ground_truth_vertical_url": null
     },
     {
@@ -73,79 +73,79 @@
       "content_type": "anime",
       "subtype": "dialogue",
       "target_clipcontenttype": "animation_dialogue",
-      "description": "2-shot dialogue, over-shoulder coverage. Baseline for the ANIMATION_DIALOGUE tuning path (no wide_master_on_multi_face).",
+      "description": "2-shot dialogue, over-shoulder coverage. Baseline for the ANIMATION_DIALOGUE tuning path (no wide_master_on_multi_face). Recommended: S1 E1 (Itadori/Gojo intro) or S2 E5 (Gojo's past). Populate source_url with a file:// path to a local rip. Ground truth intentionally null.",
       "ground_truth_vertical_url": null
     },
     {
       "slug": "sports_nba_fastbreak_20s",
-      "source_url": "",
+      "source_url": "https://www.youtube.com/watch?v=yZxNvLVV5c4",
       "sha256": "",
       "ext": "mp4",
       "duration_sec": 20,
       "content_type": "sports",
       "subtype": "basketball",
       "target_clipcontenttype": "sports_basketball",
-      "description": "Broadcast-style fastbreak with ball passes. Stress test for the Week 2 sports subtype auto-promotion from COCO ball detections and the ball-tracking required-region branch.",
-      "ground_truth_vertical_url": null
+      "description": "Broadcast-style fastbreak with ball passes. Stress test for the Week 2 sports subtype auto-promotion from COCO ball detections and the ball-tracking required-region branch. Source is 'NBA Top 10 Plays of the Night' (Nov 30 2025). Trim to a 20 s window with a full-court transition. Alt sources: https://www.youtube.com/watch?v=u-goGn--Imw (Nov 19 2025), https://www.youtube.com/watch?v=1dX2e7YexFA (Apr 20 2025). Ground truth: @nba TikTok is gold-standard — every play in the Top 10 appears as a standalone vertical within hours.",
+      "ground_truth_vertical_url": "https://www.tiktok.com/@nba"
     },
     {
       "slug": "sports_f1_onboard_20s",
-      "source_url": "",
+      "source_url": "https://www.youtube.com/watch?v=Zjt72i2PEEE",
       "sha256": "",
       "ext": "mp4",
       "duration_sec": 20,
       "content_type": "sports",
       "subtype": "racing",
       "target_clipcontenttype": "sports_racing",
-      "description": "Onboard F1 lap — car mostly static in frame, background flies by. Tests the racing lower-third cy clamp and the car-tracking required-region branch.",
+      "description": "Onboard F1 lap — car mostly static in frame, background flies by. Tests the racing lower-third cy clamp and the car-tracking required-region branch. Source: Perez Spa gyro-cam lap 2024. Alt: https://www.youtube.com/watch?v=38K96y5IShg (Hamilton Suzuka 2023). Trim to first 20 s of a lap (lap 1 turn 1 if race footage, any sector-1 if FP/qualifying). Ground truth intentionally null — F1 posts compressed highlight reels to TikTok, not full laps, so pair-matching a specific window is not feasible.",
       "ground_truth_vertical_url": null
     },
     {
       "slug": "sports_boxing_8s",
-      "source_url": "",
+      "source_url": "https://www.youtube.com/@DAZNBoxing",
       "sha256": "",
       "ext": "mp4",
       "duration_sec": 8,
       "content_type": "sports",
       "subtype": null,
       "target_clipcontenttype": "sports",
-      "description": "Two-fighter static wide with camera micro-pans. Tests generic SPORTS routing (no sub-promotion; there's no ball and no car).",
-      "ground_truth_vertical_url": null
+      "description": "Two-fighter static wide with camera micro-pans. Tests generic SPORTS routing (no sub-promotion; there's no ball and no car). Pick a 2024-2025 heavyweight fight from the @DAZNBoxing channel (Fury/Usyk, Parker/Wardley); trim to 8 s with both fighters in frame throwing combinations. Replace the channel URL above with a specific video URL before running fetch.sh. Ground truth: @daznboxing TikTok + @toprank + @premierboxing post vertical exchange clips.",
+      "ground_truth_vertical_url": "https://www.tiktok.com/@daznboxing"
     },
     {
       "slug": "music_mj_thriller_formation_15s",
-      "source_url": "",
+      "source_url": "https://www.youtube.com/watch?v=sOnqjkJTMaA",
       "sha256": "",
       "ext": "mp4",
       "duration_sec": 15,
       "content_type": "music_video",
       "subtype": "performance",
       "target_clipcontenttype": "music_video",
-      "description": "Zombie-formation dance break — strong downbeats, ~3 faces spanning 60% width. Primary real-content target for the Week 2 formation→downbeat snap (Stage 11 Pass C) and music-video performance auto-promotion.",
+      "description": "Zombie-formation dance break — strong downbeats, ~3 faces spanning 60% width. Primary real-content target for the Week 2 formation→downbeat snap (Stage 11 Pass C) and music-video performance auto-promotion. Source: official Thriller music video. Trim to 15 s starting when the zombies form the V-formation (around 09:20 in the official video). Ground truth: MJ estate @michaeljackson TikTok has posted vertical Thriller moments historically — not guaranteed to match this specific window, so may stay null.",
       "ground_truth_vertical_url": null
     },
     {
       "slug": "music_chris_brown_performance_15s",
-      "source_url": "",
+      "source_url": "https://www.youtube.com/@ChrisBrownTV",
       "sha256": "",
       "ext": "mp4",
       "duration_sec": 15,
       "content_type": "music_video",
       "subtype": "performance",
       "target_clipcontenttype": "music_video",
-      "description": "Ensemble dance routine, tight beat, multiple mid-shot formations. Secondary performance target — tests whether the formation density threshold (≥0.08) is tight enough.",
-      "ground_truth_vertical_url": null
+      "description": "Ensemble dance routine, tight beat, multiple mid-shot formations. Secondary performance target — tests whether the formation density threshold (≥0.08) is tight enough. Pick an 'Under The Influence Tour' clip or a recent awards-show performance from the @ChrisBrownTV channel and replace the channel URL above with a specific video URL before running fetch.sh. Trim to 15 s with CB + dancers in frame. Ground truth: @chrisbrownofficial TikTok / IG Reels post vertical performance cuts.",
+      "ground_truth_vertical_url": "https://www.tiktok.com/@chrisbrownofficial"
     },
     {
       "slug": "music_beyonce_solo_narrative_15s",
-      "source_url": "",
+      "source_url": "https://www.youtube.com/watch?v=LK0vB6yv83M",
       "sha256": "",
       "ext": "mp4",
       "duration_sec": 15,
       "content_type": "music_video",
       "subtype": "narrative",
       "target_clipcontenttype": "music_video",
-      "description": "Single-subject narrative video with slower cuts — control case for the music-video path. Auto-promotion should NOT fire here (formation density too low).",
+      "description": "Single-subject narrative video with slower cuts — control case for the music-video path. Auto-promotion should NOT fire here (formation density too low). Source: '16 CARRIAGES' official video. Trim to 15 s of single-subject narrative framing (not choreography). Ground truth: Beyoncé rarely posts verticals of her own videos; Parkwood Entertainment reposts are more reliable. Accept null if no matching vertical exists.",
       "ground_truth_vertical_url": null
     }
   ]
