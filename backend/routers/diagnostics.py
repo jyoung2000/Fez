@@ -532,6 +532,57 @@ async def get_importance_matrix():
     return {"matrix": importance_matrix_as_dict()}
 
 
+@router.get("/sam3-stats")
+async def get_sam3_stats(limit: int = 100):
+    """Blueprint v2 Phase 4 — recent SAM 3 calls + fallback rate.
+
+    Returns a rolling window of telemetry plus aggregate counters
+    (success rate, average latency, per-backend breakdown) so QA can
+    watch the fallback rate in real time when a SAM 3 deployment
+    change rolls out.
+    """
+    import os
+
+    from backend.services.sam3_wrapper import get_telemetry_snapshot
+
+    entries = get_telemetry_snapshot(limit=limit)
+    total = len(entries)
+    ok_count = sum(1 for e in entries if e.get("ok"))
+    failure_count = total - ok_count
+    latency_values = [
+        float(e.get("latency_sec", 0.0))
+        for e in entries if e.get("ok")
+    ]
+    avg_latency = (
+        sum(latency_values) / len(latency_values)
+        if latency_values else 0.0
+    )
+    per_backend: dict = {}
+    for e in entries:
+        key = str(e.get("backend", "unknown"))
+        per_backend.setdefault(key, {"calls": 0, "ok": 0, "fail": 0})
+        per_backend[key]["calls"] += 1
+        if e.get("ok"):
+            per_backend[key]["ok"] += 1
+        else:
+            per_backend[key]["fail"] += 1
+    return {
+        "enabled": os.environ.get("CLIPAI_SAM3_ENABLED", "0").lower() in (
+            "1", "true", "yes",
+        ),
+        "configured_backend": os.environ.get("SAM3_BACKEND", "disabled"),
+        "total_calls": total,
+        "ok": ok_count,
+        "failures": failure_count,
+        "fallback_rate": (
+            float(failure_count) / total if total else 0.0
+        ),
+        "avg_latency_sec": avg_latency,
+        "per_backend": per_backend,
+        "recent": entries,
+    }
+
+
 @router.get("/gpu-status")
 async def get_gpu_status():
     """Real-time GPU memory usage and loaded Ollama models. Polled every 2s."""
