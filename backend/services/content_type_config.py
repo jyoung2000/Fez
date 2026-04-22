@@ -310,6 +310,44 @@ def get_config(content_type: str) -> dict:
     return CONTENT_TYPE_CONFIG.get(ct, CONTENT_TYPE_CONFIG[ContentType.UNKNOWN])
 
 
+# ── Blueprint v2 Phase 1 — importance-matrix shims ─────────────────
+#
+# The face / saliency / motion / depth / object weights that used to
+# be hardcoded across required_regions.py + genre_refinements.py now
+# live on ``ReframeConfig.importance`` (single source of truth).
+# These helpers let callers fetch one weight at a time by content
+# type name without importing the whole ReframeConfig plumbing.
+
+def get_face_weight(content_type) -> float:
+    """Blueprint v2: Stage-3 face weight for a content type.
+
+    ``content_type`` may be a string, a ``ClipContentType`` enum, or
+    ``None`` (→ generic defaults).
+    """
+    from backend.services.reframe_config import get_default_config
+    return float(get_default_config().for_content(content_type).importance.face)
+
+
+def get_saliency_weight(content_type) -> float:
+    from backend.services.reframe_config import get_default_config
+    return float(get_default_config().for_content(content_type).importance.saliency)
+
+
+def get_motion_weight(content_type) -> float:
+    from backend.services.reframe_config import get_default_config
+    return float(get_default_config().for_content(content_type).importance.motion)
+
+
+def get_object_weight(content_type) -> float:
+    from backend.services.reframe_config import get_default_config
+    return float(get_default_config().for_content(content_type).importance.object)
+
+
+def get_depth_weight(content_type) -> float:
+    from backend.services.reframe_config import get_default_config
+    return float(get_default_config().for_content(content_type).importance.depth)
+
+
 # ──────────────────── Gap 5c — per-content-type vote split ────────────
 #
 # When a diarization pass ran in the pipeline (Gap 5a) AND at least

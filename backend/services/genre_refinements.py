@@ -33,6 +33,15 @@ from backend.services.reframe_config import ReframeConfig, get_default_config
 logger = logging.getLogger(__name__)
 
 
+# Blueprint v2 Phase 1: ball / car boosts layer on top of the genre's
+# ``importance.object`` weight so the matrix stays the single source
+# of truth. Raw multipliers preserve the pre-Phase-1 numerical output
+# (object=1.0 × 1.1 ball boost = 1.1 weight, matching the legacy
+# hardcoded 1.1).
+BASKETBALL_BALL_BOOST = 1.1
+RACING_CAR_BOOST = 1.2
+
+
 # ── Shared dataclasses ────────────────────────────────────────────
 
 
@@ -79,10 +88,15 @@ def _basketball_refinements(
     *,
     ball_detections: list,
     shot_boundaries: list[float],
+    config: ReframeConfig,
 ) -> GenreRefinementResult:
     """Promote basketball ball detections to required when the ball is
     seen for ≥ 8 consecutive frames with conf ≥ 0.5, and predict its
     airtime arc so the top of the arc lands near the eye-line.
+
+    Phase 1: the boost weight derives from
+    ``config.importance.object * BASKETBALL_BALL_BOOST`` so the
+    Stage 3 matrix is authoritative.
     """
     res = GenreRefinementResult()
     if not ball_detections:
@@ -107,9 +121,10 @@ def _basketball_refinements(
     if consecutive >= 8 and run_start is not None and last_t is not None:
         runs.append((run_start, last_t))
 
+    ball_weight = float(config.importance.object) * BASKETBALL_BALL_BOOST
     for s, e in runs:
         res.required_boosts.append(RequiredBoost(
-            source="ball", start=s, end=e, tier="required", weight=1.1,
+            source="ball", start=s, end=e, tier="required", weight=ball_weight,
         ))
     res.notes.append(f"basketball: {len(runs)} required-ball runs")
     return res
@@ -118,14 +133,17 @@ def _basketball_refinements(
 def _racing_refinements(
     *,
     car_detections: list,
+    config: ReframeConfig,
 ) -> GenreRefinementResult:
     res = GenreRefinementResult()
     if not car_detections:
         return res
     # The biggest / most-central car per frame drives the crop.
+    # Phase 1: weight = config.importance.object * RACING_CAR_BOOST.
+    car_weight = float(config.importance.object) * RACING_CAR_BOOST
     res.required_boosts.append(RequiredBoost(
         source="car", start=0.0, end=float("inf"),
-        tier="required", weight=1.2,
+        tier="required", weight=car_weight,
     ))
     res.notes.append("racing: car promoted to required globally")
     return res
@@ -296,9 +314,13 @@ def apply_genre_refinements(
         results.append(_basketball_refinements(
             ball_detections=inputs.ball_detections,
             shot_boundaries=inputs.shot_boundaries,
+            config=config,
         ))
     if ct == "sports_racing":
-        results.append(_racing_refinements(car_detections=inputs.car_detections))
+        results.append(_racing_refinements(
+            car_detections=inputs.car_detections,
+            config=config,
+        ))
     if ct in ("music_video",):
         results.append(_music_refinements(
             beats=inputs.beats, downbeats=inputs.downbeats,

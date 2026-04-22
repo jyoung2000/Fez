@@ -4,11 +4,18 @@ into the solver's input format.
 Supports face-only mode (standalone solver) and full fusion mode (face +
 object + saliency). The solver treats "required" regions as hard constraints
 and "preferred" regions as tiebreakers.
+
+Blueprint v2 Phase 1: the passive-face score that used to be hardcoded
+at 0.55 is now read from ``ReframeConfig.importance.passive_face_weight``
+so it can vary by genre. Default is still 0.55 so unchanged content
+types produce bit-identical required-region output.
 """
 
 import logging
 from dataclasses import dataclass
 from typing import List, Optional
+
+from backend.services.reframe_config import ReframeConfig, get_default_config
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +253,7 @@ def build_required_regions(
     content_type=None,
     shot_cuts: list = None,
     frame_persons: list = None,
+    config: Optional[ReframeConfig] = None,
 ) -> List[List[RequiredRegion]]:
     """Return per-frame lists of required regions.
 
@@ -318,6 +326,12 @@ def build_required_regions(
     dialogue_mode = _is_dialogue_mode(content_type)
     animated_mode = _is_animated_mode(content_type)
     action_mode = _is_action_mode(content_type)
+
+    # Blueprint v2 Phase 1: passive-face score comes from the Stage 3
+    # importance matrix. Defaults to 0.55 so generic / unknown content
+    # types stay bit-identical; panel / dialogue can override.
+    _cfg = (config or get_default_config()).for_content(content_type)
+    _passive_face_score = float(_cfg.importance.passive_face_weight)
 
     # ── Attention anchor stream ──
     # For dialogue modes: bridge faces across 1.5s gaps, fall back to
@@ -443,8 +457,10 @@ def build_required_regions(
 
             # Weight rules:
             #   active speaker:                          score=1.00 weight=1.40
-            #   passive, same shot as active speaker:    score=0.55 weight=0.45
+            #   passive, same shot as active speaker:    score=_passive_face_score weight=0.45
             #   passive, no active speaker in frame:     score=0.80 weight=0.80
+            # Phase 1: passive-same-shot score comes from
+            # ``config.importance.passive_face_weight`` (default 0.55).
             if is_active:
                 score = 1.0
                 weight = 1.4
@@ -452,7 +468,7 @@ def build_required_regions(
             elif frame_has_active_speaker or (active_ev is not None and not on_screen):
                 # Another face in this frame is the speaker, OR the speaker
                 # is off-screen (reaction shot) — demote heavily.
-                score = 0.55
+                score = _passive_face_score
                 weight = 0.45
                 _passive_same_count += 1
             else:
@@ -565,7 +581,10 @@ def build_required_regions(
                         cx=cx, cy=cy,
                         half_width=max(0.05, hw),
                         half_height=max(0.05, hh),
-                        score=0.55,
+                        # Phase 1: match the passive-face baseline so
+                        # ball preferred regions don't outscore passive
+                        # faces. Default still 0.55 = legacy behavior.
+                        score=_passive_face_score,
                         tier="preferred",
                         source="object",
                         weight=0.7,

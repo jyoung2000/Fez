@@ -519,6 +519,19 @@ async def _check_model_gpu(client: httpx.AsyncClient, model: str) -> tuple[str, 
 # ── Endpoints ────────────────────────────────────────────────────────────
 
 
+@router.get("/importance-matrix")
+async def get_importance_matrix():
+    """Blueprint v2 Phase 1 — return the Stage-3 importance matrix.
+
+    One row per content type with face / saliency / motion / depth /
+    object weights. Useful for surfacing "which weights does ClipAI
+    use for my content" on the settings page and for reproducible
+    QA dumps.
+    """
+    from backend.services.reframe_config import importance_matrix_as_dict
+    return {"matrix": importance_matrix_as_dict()}
+
+
 @router.get("/gpu-status")
 async def get_gpu_status():
     """Real-time GPU memory usage and loaded Ollama models. Polled every 2s."""

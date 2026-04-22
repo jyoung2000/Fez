@@ -63,6 +63,121 @@ def _env_bool(key: str, default: bool) -> bool:
     return val.lower() in ("1", "true", "yes", "on")
 
 
+# ── Blueprint v2 Phase 1 — Stage 3 importance matrix ───────────────
+#
+# Single source of truth for how the reframing stack mixes Stage 3
+# signals (face, saliency, motion, depth, object) to build the
+# per-pixel importance map. Before Phase 1, these weights were
+# scattered across ``required_regions.py``, ``genre_refinements.py``,
+# ``content_type_config.py``, and several per-genre files.
+#
+# ``required_region_gain`` is the hard-constraint multiplier
+# (blueprint's H = 1000); it must dominate the sum of all soft
+# weights by at least 100x so the L1 solver treats required regions
+# as hard constraints. ``passive_face_weight`` is the fraction of
+# active-speaker weight applied to non-speaking faces in the same
+# shot — previously hardcoded at 0.55 in ``required_regions.py``.
+@dataclass(frozen=True)
+class ImportanceWeights:
+    """Stage-3 signal weights per genre."""
+
+    face: float = 1.0
+    saliency: float = 0.4
+    motion: float = 0.2
+    depth: float = 0.0
+    object: float = 0.0
+    # Hard-constraint gain for required regions (active speakers, text,
+    # HUDs). Must dominate the sum of all soft weights by at least 100x.
+    required_region_gain: float = 1000.0
+    # Passive-face downweight: non-speaking faces get this fraction of
+    # the active-speaker weight. Previously hardcoded in required_regions.py.
+    passive_face_weight: float = 0.55
+
+
+# Blueprint v2 Stage 3 matrix. One row per content type. Missing
+# entries fall back to ``_IMPORTANCE_MATRIX["generic"]`` via
+# ``importance_for``.
+_IMPORTANCE_MATRIX: dict[str, "ImportanceWeights"] = {
+    # Talking head / single speaker
+    "talking_head":        ImportanceWeights(face=1.0, saliency=0.3, motion=0.1, depth=0.0, object=0.0),
+    "vlog":                ImportanceWeights(face=0.9, saliency=0.4, motion=0.2, depth=0.0, object=0.0),
+    "podcast":             ImportanceWeights(face=1.0, saliency=0.3, motion=0.1),
+    "interview":           ImportanceWeights(face=1.0, saliency=0.4, motion=0.2),
+    "multi_speaker_panel": ImportanceWeights(face=1.0, saliency=0.4, motion=0.2),
+
+    # Cinematic / narrative
+    "cinematic_dialogue":  ImportanceWeights(face=0.8, saliency=0.6, motion=0.2, depth=0.5),
+    "narrative":           ImportanceWeights(face=0.8, saliency=0.6, motion=0.2, depth=0.5),
+
+    # Sports
+    "sports":              ImportanceWeights(face=0.4, saliency=0.5, motion=0.4, object=1.0),
+    "sports_basketball":   ImportanceWeights(face=0.4, saliency=0.5, motion=0.4, object=1.0),
+    "sports_racing":       ImportanceWeights(face=0.2, saliency=0.4, motion=0.6, object=1.0),
+
+    # Gameplay
+    "gameplay":            ImportanceWeights(face=0.3, saliency=0.7, motion=0.5, object=0.9),
+    "gameplay_fps":        ImportanceWeights(face=0.3, saliency=0.6, motion=0.5, object=0.9),
+    "gameplay_tps":        ImportanceWeights(face=0.3, saliency=0.7, motion=0.5, object=0.9),
+    "gameplay_moba":       ImportanceWeights(face=0.2, saliency=0.8, motion=0.4, object=0.9),
+    "gameplay_racing":     ImportanceWeights(face=0.2, saliency=0.6, motion=0.6, object=0.9),
+
+    # Stream (gameplay + webcam)
+    "stream":              ImportanceWeights(face=0.6, saliency=0.6, motion=0.4, object=0.7),
+
+    # Animation
+    "animation":           ImportanceWeights(face=1.0, saliency=0.8, motion=0.3, object=0.3),
+    "anime":               ImportanceWeights(face=1.0, saliency=0.8, motion=0.3, object=0.3),
+    "animation_dialogue":  ImportanceWeights(face=1.0, saliency=0.7, motion=0.2),
+
+    # Music
+    "music_video":         ImportanceWeights(face=0.6, saliency=0.5, motion=0.4, object=0.2),
+    "music_performance":   ImportanceWeights(face=0.6, saliency=0.5, motion=0.4, object=0.2),
+
+    # B-roll / documentary
+    "documentary":         ImportanceWeights(face=0.2, saliency=0.9, motion=0.3, depth=0.3),
+    "landscape":           ImportanceWeights(face=0.0, saliency=1.0, motion=0.2, depth=0.3),
+    "broll":               ImportanceWeights(face=0.3, saliency=0.8, motion=0.3, depth=0.2),
+
+    # Screen-share / tutorial
+    "tutorial":            ImportanceWeights(face=0.9, saliency=0.4, motion=0.2),
+    "screen_share":        ImportanceWeights(face=0.5, saliency=0.3, motion=0.1, object=0.8),
+
+    # Fallback
+    "generic":             ImportanceWeights(),
+    "unknown":             ImportanceWeights(),
+}
+
+
+def importance_for(content_type) -> "ImportanceWeights":
+    """Return the Stage-3 importance weights for ``content_type``.
+
+    Accepts enum, string, or ``None``. Missing keys fall back to
+    ``_IMPORTANCE_MATRIX["generic"]`` — which matches the legacy
+    defaults so unknown content types keep their pre-Phase-1 behavior.
+    """
+    key = getattr(content_type, "value", content_type)
+    if key is None:
+        return _IMPORTANCE_MATRIX["generic"]
+    return _IMPORTANCE_MATRIX.get(str(key), _IMPORTANCE_MATRIX["generic"])
+
+
+def importance_matrix_as_dict() -> dict[str, dict[str, float]]:
+    """Return the full matrix as a plain dict for JSON serialization
+    (used by the diagnostics endpoint)."""
+    return {
+        key: {
+            "face": w.face,
+            "saliency": w.saliency,
+            "motion": w.motion,
+            "depth": w.depth,
+            "object": w.object,
+            "required_region_gain": w.required_region_gain,
+            "passive_face_weight": w.passive_face_weight,
+        }
+        for key, w in _IMPORTANCE_MATRIX.items()
+    }
+
+
 @dataclass(frozen=True)
 class ReframeConfig:
     """Frozen bundle of every tunable the reframing stack respects."""
@@ -229,6 +344,14 @@ class ReframeConfig:
     ken_burns_max_zoom: float = 1.08
     ken_burns_min_duration_sec: float = 2.0
 
+    # ── Blueprint v2 Phase 1 — Stage 3 importance matrix ──────────
+    # Weights for mixing face / saliency / motion / depth / object
+    # signals when building the per-pixel importance map.
+    # ``for_content(ct)`` overlays the per-genre row from
+    # ``_IMPORTANCE_MATRIX`` automatically; callers rarely set this
+    # directly.
+    importance: ImportanceWeights = field(default_factory=ImportanceWeights)
+
     # Extra knobs — per-content overrides stored as a dict so the
     # per-type table can live in one place.
     content_overrides: dict = field(default_factory=dict)
@@ -239,11 +362,21 @@ class ReframeConfig:
         return replace(self, **kwargs)
 
     def for_content(self, content_type) -> "ReframeConfig":
-        """Apply the per-content override table to this config."""
+        """Apply the per-content override table to this config.
+
+        Blueprint v2 Phase 1: the Stage-3 ``importance`` matrix row is
+        overlaid automatically from ``_IMPORTANCE_MATRIX`` so callers
+        never have to hand-wire weights. An explicit override in
+        ``content_overrides[key]["importance"]`` still wins.
+        """
         key = getattr(content_type, "value", content_type)
         if key is None:
             return self
-        over = self.content_overrides.get(key)
+        over = dict(self.content_overrides.get(key) or {})
+        if "importance" not in over:
+            matrix_row = _IMPORTANCE_MATRIX.get(str(key))
+            if matrix_row is not None:
+                over["importance"] = matrix_row
         if not over:
             return self
         return replace(self, **over)

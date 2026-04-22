@@ -120,3 +120,75 @@ The solver selection (`CLIPAI_L1_SOLVER=auto`, the new default) works as follows
 
 Baseline (before): Sub-second recall 100%, overlaps 0, lag -6 frames.
 After parity pass: Sub-second recall 100%, overlaps 0, lag -6 frames. No regression.
+
+## Stage 3 Importance Matrix (Blueprint v2 Phase 1)
+
+The reframing stack weights five signals when building the per-pixel
+importance map:
+
+| Signal     | Source                               | When it dominates          |
+|------------|--------------------------------------|----------------------------|
+| `face`     | `face_detector.py` + `face_registry` | Talking-head / dialogue    |
+| `saliency` | `saliency_tracker.py`                | Anime / documentary / B-roll |
+| `motion`   | `optical_flow.py`                    | Sports / action / racing   |
+| `depth`    | monocular-depth (future)             | Cinematic close-ups        |
+| `object`   | `object_detector.py` (YOLO)          | Ball / car / product       |
+
+Weights live in `backend/services/reframe_config.py` in the
+`_IMPORTANCE_MATRIX` dict. One row per `ClipContentType`:
+
+```python
+_IMPORTANCE_MATRIX = {
+    "talking_head":       ImportanceWeights(face=1.0, saliency=0.3, motion=0.1),
+    "sports_racing":      ImportanceWeights(face=0.2, saliency=0.4, motion=0.6, object=1.0),
+    "landscape":          ImportanceWeights(face=0.0, saliency=1.0, motion=0.2, depth=0.3),
+    ...
+}
+```
+
+### How to read the matrix
+
+- Rows with `face=1.0` treat every detected face as a required region.
+  Panels / podcasts / talking heads are the extreme case.
+- Rows with `object=1.0` promote their genre's object class (ball in
+  basketball, car in racing) so it outscores passive faces.
+- `required_region_gain=1000.0` is the hard-constraint multiplier
+  (blueprint's `H`). It must dominate the soft-weight sum by >= 100x;
+  this is verified by `test_required_gain_dominates_soft_weights`.
+- `passive_face_weight=0.55` is the score given to non-speaking faces
+  in the same shot as an active speaker. Larger = softer demotion.
+
+### How to tune the matrix
+
+1. Inspect the current row: `GET /api/diagnostics/importance-matrix`
+   returns the full matrix as JSON.
+2. Change the desired row in `_IMPORTANCE_MATRIX` in
+   `backend/services/reframe_config.py`. New fields go on
+   `ImportanceWeights` (not hardcoded at the call site).
+3. Run the parity test: `pytest
+   backend/tests/test_importance_migration_parity.py -x` to confirm
+   downstream weights still match.
+4. Add a regression entry in `backend/tests/test_importance_matrix.py`
+   if you're pinning a new numerical invariant.
+
+### Where weights are consumed
+
+- `required_regions.py` — `passive_face_weight` sets the score of
+  passive same-shot faces (the previously hardcoded 0.55).
+- `genre_refinements.py` — `importance.object * BASKETBALL_BALL_BOOST`
+  and `importance.object * RACING_CAR_BOOST` drive the required-boost
+  weights for ball / car detections.
+- `content_type_config.py` — `get_face_weight(ct)` /
+  `get_saliency_weight(ct)` / `get_motion_weight(ct)` /
+  `get_object_weight(ct)` / `get_depth_weight(ct)` are public shims
+  for callers that need a single weight without importing the whole
+  config object.
+
+### Migration status
+
+Phase 1 migrated the two highest-leverage hardcoded constants
+(`passive_face_weight` 0.55 and the ball/car boosts). Other legacy
+values (e.g. 0.8 score for passive-no-speaker, 1.4 solver weight for
+active speakers, containment bbox expansion factors) remain hardcoded
+in `required_regions.py` and will migrate in later phases if they
+prove to need per-genre tuning.
