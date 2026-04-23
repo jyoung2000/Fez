@@ -27,9 +27,12 @@ Emits one row per fixture followed by a summary.
 from __future__ import annotations
 
 import argparse
+import json as _json
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from backend.services.camera_path_2d import FaceFrame2D, solve_2d_camera_path
@@ -75,6 +78,7 @@ class FixtureMetrics:
     n_frames_scored: int = 0
     chin_clip_frames: int = 0
     head_clip_frames: int = 0
+    head_clip_unreachable_frames: int = 0
     center_errors: list = field(default_factory=list)
     fallback_center_frames: int = 0
     coverage_ok: bool = True
@@ -93,6 +97,11 @@ class FixtureMetrics:
         if self.n_frames_scored == 0:
             return 0.0
         return self.head_clip_frames / self.n_frames_scored
+
+    def head_unreachable_rate(self) -> float:
+        if self.n_frames_scored == 0:
+            return 0.0
+        return self.head_clip_unreachable_frames / self.n_frames_scored
 
     def center_err_p95(self) -> float:
         if not self.center_errors:
@@ -144,15 +153,17 @@ class _FakeFrameFaces:
 
 
 def _fx_talking_head(duration: float = 10.0, hz: float = 10.0) -> dict:
+    # Face positioned so face_top sits in the [headroom_min, headroom_max]
+    # window of a full-height crop. nose_y=15, height=10 → face_top=10%,
+    # dead center of the default [0.05, 0.15] headroom window.
     n = int(duration * hz)
     dense = []
     for i in range(n):
         t = i / hz
-        # Single face near center, slight left-right drift.
         x = 50.0 + 2.0 * ((i % 10) - 5)
         dense.append(_FakeFrameFaces(
             timestamp=t,
-            faces=[_FakeFace(nose_x=x, nose_y=35.0, width=15.0, height=18.0,
+            faces=[_FakeFace(nose_x=x, nose_y=15.0, width=8.0, height=10.0,
                              identity_id=0)],
         ))
     return {
@@ -173,16 +184,16 @@ def _fx_mixed_genre(duration: float = 15.0, hz: float = 10.0) -> dict:
     for i in range(n):
         t = i / hz
         if t < 5.0:
-            # dialogue
-            faces = [_FakeFace(nose_x=40.0, nose_y=35.0, width=15.0, height=18.0,
+            # dialogue — face_top = 10%, within [0.05, 0.15] headroom.
+            faces = [_FakeFace(nose_x=40.0, nose_y=15.0, width=8.0, height=10.0,
                                identity_id=0)]
         elif t < 6.0:
             # montage: no faces
             faces = []
         else:
-            # action: sweeping face
+            # action: sweeping face — face_top = 8%, within window.
             x = 20.0 + ((i % 8) * 8.0)
-            faces = [_FakeFace(nose_x=x, nose_y=40.0, width=12.0, height=14.0,
+            faces = [_FakeFace(nose_x=x, nose_y=14.0, width=8.0, height=12.0,
                                identity_id=1)]
         dense.append(_FakeFrameFaces(timestamp=t, faces=faces))
     return {
@@ -205,7 +216,8 @@ def _fx_gappy_faces(duration: float = 10.0, hz: float = 10.0) -> dict:
         if 3.0 <= t < 6.0:
             faces = []
         else:
-            faces = [_FakeFace(nose_x=30.0, nose_y=40.0, width=12.0, height=14.0,
+            # face_top = 9%, within the [0.05, 0.15] headroom window.
+            faces = [_FakeFace(nose_x=30.0, nose_y=15.0, width=8.0, height=12.0,
                                identity_id=0)]
         dense.append(_FakeFrameFaces(timestamp=t, faces=faces))
     return {
@@ -213,6 +225,95 @@ def _fx_gappy_faces(duration: float = 10.0, hz: float = 10.0) -> dict:
         "duration": duration,
         "source_w": 1920, "source_h": 1080,
         "content_type": "talking_head",
+        "dense_faces": dense,
+        "shot_boundaries": [],
+        "active_speaker_events": [],
+    }
+
+
+# ── Real-content loader ────────────────────────────────────────
+#
+# Activated when ``CLIPAI_REAL_CONTENT_CACHE`` is set AND the manifest
+# at ``tests/real_content/manifest.json`` has at least one clip with a
+# pinned ``sha256``. No new env flag: pinning the hash is the signal
+# that the clip is a deterministic bench input.
+
+
+_REAL_MANIFEST = Path(__file__).resolve().parents[2] / \
+    "tests" / "real_content" / "manifest.json"
+
+
+def _load_real_manifest() -> list[dict]:
+    try:
+        with _REAL_MANIFEST.open() as f:
+            data = _json.load(f)
+    except (OSError, ValueError):
+        return []
+    return list(data.get("clips", []))
+
+
+def _real_content_fixtures(cache_dir: str) -> list[dict]:
+    """Return fixture dicts for each cached clip with a pinned sha256."""
+    clips = _load_real_manifest()
+    fixtures: list[dict] = []
+    for entry in clips:
+        slug = entry.get("slug") or ""
+        sha = entry.get("sha256") or ""
+        ext = entry.get("ext") or "mp4"
+        if not slug or not sha:
+            continue
+        path = Path(cache_dir) / f"{slug}.{ext}"
+        if not path.is_file():
+            continue
+        fx = _fixture_from_video(
+            path=str(path),
+            slug=slug,
+            content_type=entry.get("target_clipcontenttype") or "",
+            expected_duration=float(entry.get("duration_sec") or 0.0),
+        )
+        if fx is not None:
+            fixtures.append(fx)
+    return fixtures
+
+
+def _fixture_from_video(
+    *, path: str, slug: str, content_type: str,
+    expected_duration: float,
+) -> Optional[dict]:
+    """Build a fixture dict from an MP4 by probing dimensions and
+    running the production face detector at 5 Hz.
+    """
+    try:
+        from backend.services.face_detector import detect_faces_dense
+        from backend.services.human_reframe_bridge import _probe_video
+    except Exception as e:
+        logger.warning("real-content deps unavailable (%s); skipping %s",
+                       e, slug)
+        return None
+
+    width, height, _fps, duration = _probe_video(path)
+    if duration <= 0.0 and expected_duration > 0.0:
+        duration = expected_duration
+    if duration <= 0.0:
+        logger.warning("real-content: zero duration for %s; skipping", slug)
+        return None
+
+    try:
+        dense = detect_faces_dense(
+            path, 0.0, duration,
+            sample_rate=0.2,  # 5 Hz
+            extract_embeddings=False,
+        )
+    except Exception as e:
+        logger.warning("real-content: face detection failed for %s (%s)",
+                       slug, e)
+        return None
+
+    return {
+        "name": f"real:{slug}",
+        "duration": duration,
+        "source_w": width, "source_h": height,
+        "content_type": content_type,
         "dense_faces": dense,
         "shot_boundaries": [],
         "active_speaker_events": [],
@@ -270,6 +371,8 @@ def _measure_fixture(fx: dict) -> FixtureMetrics:
             metrics.chin_clip_frames += 1
         if "head_clip" in s.reasons:
             metrics.head_clip_frames += 1
+        if "head_clip_unreachable" in s.reasons:
+            metrics.head_clip_unreachable_frames += 1
         err = s.metrics.get("avg_center_err", 0.0) or 0.0
         metrics.center_errors.append(err)
         jitter = s.metrics.get("jitter_std", 0.0) or 0.0
@@ -337,11 +440,18 @@ def main(argv: Optional[list] = None) -> int:
         format="%(levelname)s %(message)s",
     )
 
-    fixtures = [
+    fixtures: list = [
         _fx_talking_head(),
         _fx_mixed_genre(),
         _fx_gappy_faces(),
     ]
+    cache_dir = os.environ.get("CLIPAI_REAL_CONTENT_CACHE")
+    if cache_dir:
+        real = _real_content_fixtures(cache_dir)
+        if real:
+            logger.info("real-content: %d clip(s) from %s",
+                        len(real), cache_dir)
+            fixtures.extend(real)
     thresholds = Thresholds()
     rows = []
     any_hard_fail = False
@@ -361,6 +471,7 @@ def main(argv: Optional[list] = None) -> int:
                 "pass": ok,
                 "chin_rate": round(m.chin_rate(), 4),
                 "head_rate": round(m.head_rate(), 4),
+                "head_unreachable_rate": round(m.head_unreachable_rate(), 4),
                 "center_err_p95": round(m.center_err_p95(), 4),
                 "jitter_p95": round(m.jitter_p95(), 4),
                 "fallback_center_frames": m.fallback_center_frames,

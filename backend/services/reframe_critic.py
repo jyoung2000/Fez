@@ -111,6 +111,7 @@ def _score_window(
 
     centering_err = 0.0
     headroom_bad = 0
+    headroom_unreachable = 0
     chin_clip_frames = 0
     side_clip_bad = 0
     n_scored = 0
@@ -150,10 +151,25 @@ def _score_window(
         # 1. Subject centering: face_x relative to crop center.
         centering_err += abs(face_x - crop_cx)
         # 2. Headroom: face_top position inside the crop as fraction.
+        #    Split into reachable-but-bad (true solver miss) vs.
+        #    unreachable (geometrically impossible given the source
+        #    aspect / face position — no cy satisfies the constraint).
         if rect.h > 0:
             face_top_in_crop = (face_top - crop_top) / rect.h
             if not (config.headroom_min <= face_top_in_crop <= config.headroom_max):
-                headroom_bad += 1
+                # Feasible crop_top interval is [0, 1 - rect.h]. The
+                # headroom window requires crop_top in
+                # [face_top - headroom_max*h, face_top - headroom_min*h].
+                # If those intervals don't overlap, no solver choice
+                # could have landed inside the window.
+                need_lo = face_top - config.headroom_max * rect.h
+                need_hi = face_top - config.headroom_min * rect.h
+                feasible_hi = 1.0 - rect.h
+                reachable = (need_lo <= feasible_hi) and (need_hi >= 0.0)
+                if reachable:
+                    headroom_bad += 1
+                else:
+                    headroom_unreachable += 1
         # 3. Chin clip: face_bot extends below crop_bot.
         if face_bot > crop_bot - 0.02:
             chin_clip_frames += 1
@@ -192,6 +208,12 @@ def _score_window(
             if headroom_bad_frac > 0.5:
                 reasons.append("head_clip")
     metrics["headroom_bad_frac"] = round(headroom_bad_frac, 2)
+
+    headroom_unreachable_frac = headroom_unreachable / n_scored_safe
+    if headroom_unreachable_frac > 0.5:
+        # Flag separately but do NOT penalize — solver had no choice.
+        reasons.append("head_clip_unreachable")
+    metrics["headroom_unreachable_frac"] = round(headroom_unreachable_frac, 2)
 
     chin_frac = chin_clip_frames / n_scored_safe
     if chin_frac > 0.10:
