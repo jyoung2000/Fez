@@ -4474,9 +4474,115 @@ async def _run_analysis_inner(job_id: str):
     if dense_face_results and face_registry and scenes and _has_speaker_data:
         try:
             from backend.services.reframe_segmenter import USE_REFRAME_SEGMENTER, build_reframe_segments
-            logger.info("[%s] Reframe mode: %s", job_id,
-                        "AUTOFLIP" if USE_AUTOFLIP_REFRAME else "SEGMENTER" if USE_REFRAME_SEGMENTER else "LEGACY")
-            if USE_AUTOFLIP_REFRAME and not _is_gameplay:
+            from backend.services.human_reframe_pipeline import (
+                HUMAN_REFRAME_ALLOWED_CONTENT_TYPES,
+                is_compare_mode_enabled,
+                is_pipeline_flag_enabled as _is_human_reframe_flag_enabled,
+                try_run_human_reframe_pipeline,
+            )
+
+            # Phase A: try the SOTA human-reframe path first when its
+            # flag + content-type allowlist gates are open. Returns
+            # None on any gating miss / runtime failure so we fall
+            # through to the legacy autoflip / segmenter branches
+            # below without behavior change.
+            _ct_for_human = (
+                getattr(_content_profile, "content_type", "") or ""
+                if _content_profile else ""
+            )
+            _human_outcome = None
+            if (
+                _is_human_reframe_flag_enabled()
+                and _ct_for_human in HUMAN_REFRAME_ALLOWED_CONTENT_TYPES
+                and not _is_gameplay
+            ):
+                _human_outcome = try_run_human_reframe_pipeline(
+                    duration_sec=float(metadata.get("duration", 0) or 0.0),
+                    source_width=source_width,
+                    source_height=source_height,
+                    source_fps=float(metadata.get("fps", 30.0) or 30.0),
+                    content_type=_ct_for_human,
+                    dense_faces=dense_face_results,
+                    active_speaker_events=active_speaker_events,
+                    shot_boundaries=scene_cut_timestamps if scene_cut_timestamps else [],
+                    job_id=job_id,
+                )
+
+            _reframe_path = "human_reframe" if _human_outcome is not None else (
+                "autoflip" if USE_AUTOFLIP_REFRAME else
+                "reframe_segmenter" if USE_REFRAME_SEGMENTER else "legacy"
+            )
+            logger.info("[%s] Reframe mode: %s", job_id, _reframe_path.upper())
+
+            if _human_outcome is not None:
+                # ── Phase A: human-reframe path ──
+                reframe_segments, _human_rp = _human_outcome
+                if reframe_segments:
+                    from backend.models import SceneDescription
+                    ai_scenes = [s for s in scenes if s.description != "[dense face tracking]"]
+                    for seg in reframe_segments:
+                        _desc = (
+                            f"[human_reframe:{seg.reason}:{seg.ease_in_ms}:"
+                            f"{seg.strategy}:{seg.confidence:.2f}]"
+                        )
+                        _sx_int = int(round(seg.subject_x / source_width * 100.0)) if source_width > 0 else 50
+                        _asx = _sx_int if seg.active_slot is not None else None
+                        ai_scenes.append(SceneDescription(
+                            timestamp=float(seg.start),
+                            description=_desc,
+                            importance_score=5,
+                            thumbnail_path="",
+                            subject_x=_sx_int,
+                            active_speaker_x=_asx,
+                            active_slot=seg.active_slot,
+                            layout_mode=seg.layout,
+                            precise_x=float(seg.subject_x),
+                            precise_y=float(seg.subject_y),
+                            face_count=len(face_registry.slots) if face_registry else 0,
+                            face_positions=[],
+                        ))
+                    ai_scenes.sort(key=lambda s: s.timestamp)
+                    scenes = ai_scenes
+                    _tracking_mode = "multi_cluster"
+                    _human_rp_dict = _human_rp.to_dict()
+                    await database.update_job_status(
+                        job_id,
+                        scenes=list(scenes),
+                        tracking_mode=_tracking_mode,
+                        render_plan=_human_rp_dict,
+                    )
+                    logger.info(
+                        "[%s] *** HumanReframePipeline: %d segments → %d scenes ***",
+                        job_id, len(reframe_segments), len(scenes),
+                    )
+                    _reframe_segments_used = True
+
+                    # Compare mode: log the marker so the export step
+                    # (or an offline eyeball script) knows both paths
+                    # are wanted. The actual ``<job>_legacy.mp4``
+                    # render is produced by re-running analysis with
+                    # ``CLIPAI_HUMAN_REFRAME_PIPELINE=0`` and exporting
+                    # again — see docs/human_reframe_rollout.md for
+                    # the full eyeball workflow.
+                    if is_compare_mode_enabled():
+                        try:
+                            await database.update_job_status(
+                                job_id, reframe_compare_mode=True,
+                            )
+                            logger.info(
+                                "[%s] HumanReframePipeline: compare mode "
+                                "marker set; primary=human_reframe "
+                                "(see docs/human_reframe_rollout.md "
+                                "for the legacy-render workflow)",
+                                job_id,
+                            )
+                        except Exception as _cmp_e:
+                            logger.warning(
+                                "[%s] compare-mode marker update failed (%s)",
+                                job_id, _cmp_e,
+                            )
+
+            elif USE_AUTOFLIP_REFRAME and not _is_gameplay:
                 # ── AutoFlip reframe path ──
                 from backend.services.autoflip_segmenter import build_autoflip_segments
                 _video_dur = metadata.get("duration", 0)
