@@ -27,8 +27,12 @@ import { useEffect, useRef, useState } from 'react';
  *     against ``progress`` so normal buffering doesn't count.
  *   * Uses ``Retry-After`` from the HEAD response for the first
  *     retry delay when present.
- *   * Runs an exponential backoff (0.5s → 1s → 2s → 4s → 8s → 10s
- *     steady) up to ``maxAttempts`` (default 60 ≈ 10 minutes).
+ *   * Runs a tight exponential backoff (0.2s → 0.4s → 0.8s → 1.5s →
+ *     3s → 5s steady) up to ``maxAttempts`` (default 60 ≈ 5 minutes).
+ *     The backend's faster (HW / ultrafast) preview encoder makes
+ *     most encodes finish inside the first few retries, so the
+ *     player picks the file up almost as soon as it's written
+ *     instead of sleeping for 5-10 s after the encoder finishes.
  *
  * Returns ``{ ready, preparing, error, authError, reset }``:
  *   * ``ready``      — canplay has fired at least once for the current src.
@@ -41,8 +45,13 @@ import { useEffect, useRef, useState } from 'react';
 export default function useVideoLoadRetry(videoRef, src, options = {}) {
   const {
     maxAttempts = 60,
-    delays = [500, 1000, 2000, 4000, 8000],
-    steadyDelay = 10000,
+    // Tight initial backoff so we re-probe quickly while the
+    // preview encoder is finishing — the HW / ultrafast pipeline
+    // typically lands the final preview within the first handful
+    // of attempts, and a 500 ms first delay would waste half the
+    // time-to-play budget on a sleep.
+    delays = [200, 400, 800, 1500, 3000],
+    steadyDelay = 5000,
     // After this many attempts, flip ``preparing`` to true so the
     // component can show the spinner. Kept at 2 so a real transient
     // network hiccup (single error burst) doesn't flash the overlay.

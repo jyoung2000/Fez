@@ -109,21 +109,35 @@ _BROWSER_CONTAINERS = frozenset({
 })
 
 
-# Preview-encoding targets. Chosen for smooth scrubbing on a typical
-# laptop over a typical home connection:
-#   * 1080p is more than enough for an in-browser preview even on a
-#     4K monitor; decoding 4K H.264 in software stalls low-end CPUs
-#     and slows every seek because the browser has to decode more
-#     data to land on a keyframe.
-#   * 6 Mbps is within the progressive-download budget of ordinary
-#     connections and cheap for a CPU decoder. Blu-ray rips often
-#     sit at 15-40 Mbps, which is far above that budget.
-_PREVIEW_MAX_WIDTH = 1920
-_PREVIEW_MAX_BITRATE_KBPS = 6000
+# Preview-encoding targets. Chosen so the encode itself completes in
+# the 15-30 second window the in-page player budget allows:
+#   * 720p (max width 1280) is more than enough for an in-browser
+#     preview window. Encoding 1080p was the largest single cost in
+#     the old pipeline — dropping to 720p cuts encoder pixel work by
+#     ~2.25× without any visible quality loss in a preview-sized
+#     viewport.
+#   * 3.5 Mbps is plenty for 720p, fits comfortably inside the
+#     progressive-download budget on ordinary connections, and the
+#     lower target rate also speeds up the encoder (less rate-control
+#     work per frame). Blu-ray rips often sit at 15-40 Mbps; this is
+#     6-10× lower and that's the whole point of a preview.
+_PREVIEW_MAX_WIDTH = 1280
+_PREVIEW_MAX_BITRATE_KBPS = 3500
 # Short GOP → fine-grained seek. 2 seconds lets the browser land
 # within one keyframe of any scrub target instead of jumping 4–10 s
 # at a time the way factory-default libx264 does.
 _PREVIEW_KEYFRAME_INTERVAL_SEC = 2.0
+
+# Copy-mode thresholds. These are intentionally **larger** than the
+# re-encode preview cap above: copy is essentially instantaneous (a
+# remux, not a re-encode), so as long as the source is something the
+# browser can decode comfortably (H.264 up to 1080p at sane bitrates),
+# we'd rather keep the user's bytes than spend 15+ s re-encoding to a
+# slightly smaller derivative. Re-encoding only kicks in for
+# genuinely browser-hostile sources (H.265, 4K, ≥8 Mbps rips) — see
+# :func:`_needs_preview` and :func:`_should_copy_video`.
+_COPY_MAX_WIDTH = 1920
+_COPY_MAX_BITRATE_KBPS = 8000
 
 
 @dataclass
@@ -246,12 +260,19 @@ def _needs_preview(source_path: str, probe: _ProbeResult) -> bool:
     Triggers on any of:
       * container / codec incompatibility (the original reason this
         module exists — MKV + AC3 etc.)
-      * oversize source (resolution above ``_PREVIEW_MAX_WIDTH`` or
-        bitrate above ``_PREVIEW_MAX_BITRATE_KBPS``). Even when the
+      * oversize source (resolution above ``_COPY_MAX_WIDTH`` or
+        bitrate above ``_COPY_MAX_BITRATE_KBPS``). Even when the
         codec is browser-supported, 4K Blu-ray sources stutter on
         laptop CPUs and every seek pulls MB-per-second chunks that
-        don't fit the scrubbing budget — so we build a 1080p cap
+        don't fit the scrubbing budget — so we build a smaller cap
         preview for smooth playback.
+
+    These thresholds intentionally match ``_should_copy_video``'s
+    1080p / 8 Mbps comfort zone: a source the browser plays smoothly
+    needs no preview at all (fastest possible path), while anything
+    above gets either a remuxed copy preview (also fast) or a
+    re-encoded preview at the lower ``_PREVIEW_MAX_WIDTH`` /
+    ``_PREVIEW_MAX_BITRATE_KBPS`` target.
     """
     ext = os.path.splitext(source_path)[1].lower()
     if ext not in _BROWSER_CONTAINERS:
@@ -260,9 +281,9 @@ def _needs_preview(source_path: str, probe: _ProbeResult) -> bool:
         return True
     if probe.has_audio and probe.audio_codec not in _BROWSER_AUDIO_CODECS:
         return True
-    if probe.width and probe.width > _PREVIEW_MAX_WIDTH:
+    if probe.width and probe.width > _COPY_MAX_WIDTH:
         return True
-    if probe.bitrate_kbps and probe.bitrate_kbps > _PREVIEW_MAX_BITRATE_KBPS * 1.2:
+    if probe.bitrate_kbps and probe.bitrate_kbps > _COPY_MAX_BITRATE_KBPS:
         return True
     return False
 
@@ -270,38 +291,150 @@ def _needs_preview(source_path: str, probe: _ProbeResult) -> bool:
 def _preview_path_for(source_path: str) -> str:
     """Return the canonical browser-preview path for a source video.
 
-    The ``.v2`` tag in the filename bumps whenever the encoding
+    The ``.v3`` tag in the filename bumps whenever the encoding
     pipeline changes in a way that invalidates older cached previews
-    (e.g. added GOP tuning, scale cap, bitrate cap). The previous
-    ``browser_preview.mp4`` files stay on disk but are simply not
-    looked up anymore — new previews land at the versioned name and
-    playback smoothness improves on the next request.
+    (e.g. added GOP tuning, scale cap, bitrate cap, faster preset).
+    The previous ``browser_preview.v2.mp4`` files stay on disk but
+    are simply not looked up anymore — new previews land at the
+    versioned name and playback starts faster on the next request.
     """
     directory = os.path.dirname(source_path) or "."
-    return os.path.join(directory, "browser_preview.v2.mp4")
+    return os.path.join(directory, "browser_preview.v3.mp4")
+
+
+# Cached HW-encoder spec for the preview transcode. Populated lazily on
+# the first encode and reused for the rest of the process lifetime —
+# capability detection forks ``ffmpeg -encoders`` plus a tiny test
+# encode and shouldn't run per request.
+_preview_encoder_cache: Optional[dict] = None
+
+
+def _detect_preview_encoder() -> dict:
+    """Pick the fastest available H.264 encoder for browser previews.
+
+    The clip-export path already detects available HW encoders
+    (NVENC / QSV / VAAPI / VideoToolbox); we reuse that detection so
+    a deployment with a GPU gets a 5-10× faster preview encode for
+    free. Falls back to ``libx264 -preset ultrafast`` everywhere else.
+
+    Returns a spec dict consumed by :func:`_build_ffmpeg_cmd`:
+      * ``encoder``    — ``"h264_nvenc"`` / ``"h264_qsv"`` /
+                          ``"h264_videotoolbox"`` / ``"libx264"``
+      * ``rate_args``  — encoder-specific quality / rate-control args
+      * ``preset``     — encoder-specific speed preset (None → omit)
+
+    On any detection error we silently fall back to libx264 — the old
+    behaviour. This keeps the path working on minimal deployments
+    that have ffmpeg but no GPU runtime.
+    """
+    global _preview_encoder_cache
+    if _preview_encoder_cache is not None:
+        return _preview_encoder_cache
+
+    # Default: software libx264 at ultrafast preset. ``ultrafast`` is
+    # ~2× quicker than ``veryfast`` on the same CPU, with quality
+    # loss that's invisible in a preview-sized viewport. ``-threads 0``
+    # tells libx264 to use every CPU core for the encode (default
+    # behaviour, but spelled out here so it can't be lost to a future
+    # global ffmpeg flag).
+    spec: dict = {
+        "encoder": "libx264",
+        "preset": "ultrafast",
+        "rate_args": [
+            "-crf", "26",
+            "-maxrate", f"{_PREVIEW_MAX_BITRATE_KBPS}k",
+            "-bufsize", f"{_PREVIEW_MAX_BITRATE_KBPS * 2}k",
+            "-threads", "0",
+        ],
+    }
+
+    try:
+        from backend.services.clip_exporter import detect_gpu_capabilities
+        gpu = detect_gpu_capabilities()
+        encoder = (gpu or {}).get("encoder") or "libx264"
+        if encoder == "h264_nvenc":
+            # NVENC ``p1`` is the fastest preset (lowest latency, lowest
+            # quality). For a 720p preview this is more than enough,
+            # and it routinely encodes at 100-300 fps even on an
+            # entry-level GPU — well inside the 15-30 s budget for
+            # any reasonable source.
+            spec = {
+                "encoder": "h264_nvenc",
+                "preset": "p1",
+                "rate_args": [
+                    "-tune", "ll",
+                    "-rc", "vbr",
+                    "-cq", "26",
+                    "-b:v", f"{_PREVIEW_MAX_BITRATE_KBPS}k",
+                    "-maxrate", f"{_PREVIEW_MAX_BITRATE_KBPS}k",
+                    "-bufsize", f"{_PREVIEW_MAX_BITRATE_KBPS * 2}k",
+                ],
+            }
+        elif encoder == "h264_qsv":
+            # Intel QuickSync — comparable to NVENC for our use case.
+            spec = {
+                "encoder": "h264_qsv",
+                "preset": "veryfast",
+                "rate_args": [
+                    "-global_quality", "26",
+                    "-maxrate", f"{_PREVIEW_MAX_BITRATE_KBPS}k",
+                    "-bufsize", f"{_PREVIEW_MAX_BITRATE_KBPS * 2}k",
+                ],
+            }
+        elif encoder == "h264_videotoolbox":
+            # Apple VideoToolbox doesn't take ``-preset``; ``-q:v`` on
+            # a 0-100 scale picks the rate-control quality. 55 is
+            # roughly equivalent to libx264 CRF 26.
+            spec = {
+                "encoder": "h264_videotoolbox",
+                "preset": None,
+                "rate_args": [
+                    "-q:v", "55",
+                    "-maxrate", f"{_PREVIEW_MAX_BITRATE_KBPS}k",
+                    "-bufsize", f"{_PREVIEW_MAX_BITRATE_KBPS * 2}k",
+                ],
+            }
+        # h264_vaapi is intentionally not wired up here — it requires
+        # ``-vaapi_device`` before the input plus a hwupload filter
+        # chain, which would tangle with the existing scale filter.
+        # libx264 ultrafast is fast enough as a fallback.
+        if spec["encoder"] != "libx264":
+            logger.info(
+                "browser_preview: using HW encoder %s (preset=%s) for previews",
+                spec["encoder"], spec.get("preset"),
+            )
+    except Exception as e:  # pragma: no cover — detect path is best-effort
+        logger.debug(
+            "browser_preview: HW encoder detect failed, using libx264: %s", e,
+        )
+
+    _preview_encoder_cache = spec
+    return spec
 
 
 def _should_copy_video(probe: _ProbeResult) -> bool:
     """Return True when it is safe to stream-copy the source video.
 
-    We only copy when ALL of the following hold:
+    We copy when ALL of the following hold:
       * Codec is H.264 (browser plays it without a transcode).
-      * Resolution is at or below the preview cap (otherwise the
-        player has to decode 4K frames on every seek → stutter).
-      * Reported bitrate is sane (≤ 1.2× the preview target). Anything
-        higher implies a rip-grade bitstream that scrubs poorly in
-        the browser even when it's technically H.264.
+      * Resolution is at or below 1080p (above that, even H.264
+        decode stresses laptop CPUs and every seek pulls megabytes).
+      * Reported bitrate is sane (≤ 8 Mbps). Anything higher implies
+        a rip-grade bitstream that scrubs poorly in the browser even
+        when it's technically H.264.
 
-    If any of those fail we fall through to a re-encode at the
-    preview profile so seeks feel responsive. Copy is still the
-    preferred path — it's seconds, not minutes — so we leave it in
-    place for the common case of already-web-friendly source MP4s.
+    The thresholds are deliberately *higher* than the re-encode cap
+    (``_PREVIEW_MAX_WIDTH``, ``_PREVIEW_MAX_BITRATE_KBPS``): copy is
+    a remux that finishes in single-digit seconds even for a feature-
+    length film, so we always prefer it when the source is already
+    inside the browser's comfort zone. Re-encoding kicks in only for
+    sources that *can't* play in-browser without it.
     """
     if probe.video_codec != "h264":
         return False
-    if probe.width and probe.width > _PREVIEW_MAX_WIDTH:
+    if probe.width and probe.width > _COPY_MAX_WIDTH:
         return False
-    if probe.bitrate_kbps and probe.bitrate_kbps > _PREVIEW_MAX_BITRATE_KBPS * 1.2:
+    if probe.bitrate_kbps and probe.bitrate_kbps > _COPY_MAX_BITRATE_KBPS:
         return False
     return True
 
@@ -330,14 +463,16 @@ def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult) -
     Strategy:
       * Video: stream-copy when the source is already H.264 **and**
         within the preview size/bitrate budget. Otherwise re-encode
-        with libx264 at the preview profile — needed for H.265, 4K
-        rips, or very-high-bitrate sources that stutter in-browser.
-      * Re-encode path is tuned for smooth **seeking**, not file
-        size: short GOP (every ~2 s of video), a 1080p scale cap,
-        and a capped bitrate. These three together let the browser
-        land within one keyframe of any scrub target and finish the
-        Range fetch quickly.
-      * Audio: always transcode to AAC at 192 kbps stereo. The
+        with the fastest available encoder (NVENC / QSV /
+        VideoToolbox / libx264 ultrafast) at the preview profile —
+        needed for H.265, 4K rips, or very-high-bitrate sources that
+        stutter in-browser.
+      * Re-encode path is tuned for **encode speed**, not file size:
+        ultrafast preset, 720p scale cap, capped bitrate, fully
+        threaded. These together let a multi-minute Blu-ray rip
+        finish encoding inside the player's 15-30 s budget on
+        ordinary CPUs (and well under that with a GPU).
+      * Audio: always transcode to AAC at 160 kbps stereo. The
         original track might be AC3, DTS, FLAC, etc. Transcoding
         costs almost nothing on top of the audio duration.
       * ``+faststart`` moves the moov atom up front so the
@@ -363,34 +498,27 @@ def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult) -
         #   the user's seek lands on a long inter frame and the
         #   decoder has to walk backwards several seconds before it
         #   can paint a picture.
-        # * ``scale='min(w,iw)':-2`` caps the width at 1080p-ish
+        # * ``scale='min(w,iw)':-2`` caps the width at 720p-ish
         #   while preserving aspect ratio; ``-2`` keeps height even
         #   (yuv420p requires that).
-        # * ``-maxrate`` / ``-bufsize`` clamp the bitrate so 4K
-        #   sources don't emit 40 Mbps previews that defeat the
-        #   point of a preview.
-        # * ``-tune fastdecode`` reduces CPU cost on the client
-        #   decoder (disables CABAC and a few decoder-unfriendly
-        #   tools). Visible quality loss is imperceptible at CRF 23
-        #   and the smoothness win on low-end laptops is real.
-        # * ``-profile:v main`` + ``-level 4.0`` keep the file
-        #   within the baseline every current browser accepts and
-        #   avoids triggering a hardware-decode compatibility mode
-        #   on some Safari/iOS builds.
+        # * The actual encoder + rate-control args come from
+        #   :func:`_detect_preview_encoder` so a deployment with a
+        #   GPU gets NVENC / QSV / VideoToolbox automatically. The
+        #   software fallback is libx264 at ``ultrafast``, which is
+        #   ~2× faster than the previous ``veryfast`` setting.
         fps_for_keyint = probe.fps if probe.fps and probe.fps > 1 else 30.0
         gop = max(24, int(round(fps_for_keyint * _PREVIEW_KEYFRAME_INTERVAL_SEC)))
         video_filters.append(
             f"scale='min({_PREVIEW_MAX_WIDTH},iw)':-2"
         )
-        video_opts = [
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "fastdecode",
+        encoder_spec = _detect_preview_encoder()
+        video_opts = ["-c:v", encoder_spec["encoder"]]
+        if encoder_spec.get("preset"):
+            video_opts += ["-preset", encoder_spec["preset"]]
+        video_opts += [
             "-profile:v", "main",
             "-level", "4.0",
-            "-crf", "23",
-            "-maxrate", f"{_PREVIEW_MAX_BITRATE_KBPS}k",
-            "-bufsize", f"{_PREVIEW_MAX_BITRATE_KBPS * 2}k",
+            *encoder_spec.get("rate_args", []),
             "-g", str(gop),
             "-keyint_min", str(gop),
             "-sc_threshold", "0",
@@ -399,9 +527,13 @@ def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult) -
 
     audio_opts: list[str]
     if probe.has_audio:
+        # 160 kbps AAC is transparent for stereo content and saves
+        # encoder cycles vs the old 192 kbps target. Audio cost is
+        # never the bottleneck but every saved cycle compounds when
+        # the goal is sub-30s end-to-end.
         audio_opts = [
             "-c:a", "aac",
-            "-b:a", "192k",
+            "-b:a", "160k",
             "-ac", "2",
         ]
     else:

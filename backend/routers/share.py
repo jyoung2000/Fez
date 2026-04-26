@@ -411,7 +411,9 @@ async def public_share_video(token: str, request: Request):
             return Response(
                 status_code=503,
                 content="preview still being prepared",
-                headers={"Retry-After": "5"},
+                # 2 s — see the matching handler in main.serve_file.
+                # Faster preview encoder means shorter retry window.
+                headers={"Retry-After": "2"},
                 media_type="text/plain",
             )
     except Exception as e:  # pragma: no cover — fallback path

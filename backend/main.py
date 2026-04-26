@@ -730,7 +730,13 @@ async def serve_file(
                 return Response(
                     status_code=503,
                     content="preview still being prepared",
-                    headers={"Retry-After": "5"},
+                    # 2 s — the new (HW / ultrafast) encoder finishes
+                    # most preview transcodes in under 30 s, so a
+                    # short retry window keeps total time-to-play
+                    # close to the encode time. The frontend's
+                    # exponential backoff still escalates for slow
+                    # CPU encodes that genuinely need more time.
+                    headers={"Retry-After": "2"},
                     media_type="text/plain",
                 )
         except Exception as e:  # pragma: no cover — fallback path
