@@ -378,6 +378,84 @@ export default function PipelineDiagnostics() {
     }
   }, [testIncludeWhisper, testTranslation]);
 
+  // ── 2026 SOTA Reframing — 1-click QA + bench runner ───────────────
+  const [sotaRunning, setSotaRunning] = useState(false);
+  const [sotaSkipBench, setSotaSkipBench] = useState(false);
+  const [sotaPhases, setSotaPhases] = useState([]);
+  const [sotaLogs, setSotaLogs] = useState([]);
+  const [sotaResult, setSotaResult] = useState(null);
+  const sotaLogRef = React.useRef(null);
+
+  React.useEffect(() => {
+    if (sotaLogRef.current) {
+      sotaLogRef.current.scrollTop = sotaLogRef.current.scrollHeight;
+    }
+  }, [sotaLogs]);
+
+  const runSotaBench = useCallback(async () => {
+    setSotaRunning(true);
+    setSotaPhases([]);
+    setSotaLogs([]);
+    setSotaResult(null);
+    try {
+      const resp = await fetch('/api/diagnostics/sota-bench', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ skip_bench: sotaSkipBench }),
+      });
+      if (!resp.ok || !resp.body) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const evt = JSON.parse(line.slice(6));
+            if (evt.type === 'phase_start') {
+              setSotaPhases((prev) => [
+                ...prev,
+                { phase: evt.data.phase, label: evt.data.label, status: 'running' },
+              ]);
+              setSotaLogs((prev) => [
+                ...prev,
+                { kind: 'phase', text: `▶ ${evt.data.label}` },
+              ]);
+            } else if (evt.type === 'phase_result') {
+              setSotaPhases((prev) =>
+                prev.map((p) =>
+                  p.phase === evt.data.phase ? { ...p, status: evt.data.status } : p,
+                ),
+              );
+            } else if (evt.type === 'log') {
+              setSotaLogs((prev) => [...prev, { kind: 'log', text: evt.data.line }]);
+            } else if (evt.type === 'exit_code') {
+              setSotaLogs((prev) => [
+                ...prev,
+                { kind: 'meta', text: `→ process exited with code ${evt.data.code}` },
+              ]);
+            } else if (evt.type === 'complete') {
+              setSotaResult(evt.data);
+            }
+          } catch {
+            /* skip malformed */
+          }
+        }
+      }
+    } catch (e) {
+      setSotaResult({ ok: false, message: `Network error: ${e.message}` });
+    } finally {
+      setSotaRunning(false);
+    }
+  }, [sotaSkipBench]);
+
   return (
     <div style={{ marginBottom: 32 }}>
       <h3 style={{ fontSize: 14, marginBottom: 16, color: 'var(--text-secondary)' }}>
@@ -468,6 +546,117 @@ export default function PipelineDiagnostics() {
                   : '\u274c Pipeline has issues \u2014 check results above'}
               </div>
             )}
+          </div>
+        )}
+      </div>
+
+      {/* \u2500\u2500 2026 SOTA Reframing \u2014 1-click QA + bench runner \u2500\u2500\u2500\u2500\u2500 */}
+      <div style={{ ...cardStyle, marginTop: 12 }}>
+        <div style={{
+          fontSize: 12, fontWeight: 600, color: 'var(--text-primary)',
+          marginBottom: 4,
+        }}>
+          2026 SOTA Reframing \u2014 Validate
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
+          Runs the local Phase A\u2013E QA harness (101 mocked unit tests) and then the
+          real-content fixture bench with every SOTA flag (SAMURAI tracking,
+          CoTracker3 dense, AV saliency, CLIP composition head, editorial planner)
+          turned ON. The QA stage is fast (~5 s); the bench stage needs the GPU
+          and the fixture cache and can take several minutes.
+        </div>
+
+        <div style={{ display: 'flex', gap: 16, marginBottom: 12, flexWrap: 'wrap' }}>
+          <label style={{
+            display: 'flex', alignItems: 'center', gap: 6, fontSize: 11,
+            color: 'var(--text-secondary)',
+            cursor: sotaRunning ? 'default' : 'pointer',
+          }}>
+            <input
+              type="checkbox"
+              checked={sotaSkipBench}
+              onChange={(e) => setSotaSkipBench(e.target.checked)}
+              disabled={sotaRunning}
+              style={{ accentColor: 'var(--accent-cyan)' }}
+            />
+            QA only (skip fixture bench)
+          </label>
+        </div>
+
+        <button
+          onClick={runSotaBench}
+          disabled={sotaRunning}
+          style={{
+            ...smallBtnStyle,
+            background: sotaRunning ? 'var(--bg-elevated)' : 'var(--accent-cyan)',
+            color: sotaRunning ? 'var(--text-muted)' : '#fff',
+            cursor: sotaRunning ? 'default' : 'pointer',
+            marginBottom: 12, padding: '6px 16px',
+          }}
+        >
+          {sotaRunning
+            ? (sotaSkipBench ? 'Running QA...' : 'Running QA + bench...')
+            : (sotaSkipBench ? 'Run QA harness' : 'Run QA + SOTA bench')}
+        </button>
+
+        {sotaPhases.length > 0 && (
+          <div style={{
+            padding: '8px 12px', background: 'var(--bg-base)',
+            border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+            marginBottom: 8,
+          }}>
+            {sotaPhases.map((p) => (
+              <div key={p.phase} style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '4px 0', fontSize: 11, fontFamily: 'var(--font-mono)',
+                color: 'var(--text-secondary)',
+              }}>
+                <span style={{ width: 18 }}>
+                  {p.status === 'pass' && '\u2705'}
+                  {p.status === 'fail' && '\u274c'}
+                  {p.status === 'running' && <Spinner />}
+                </span>
+                <span>{p.label}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {sotaLogs.length > 0 && (
+          <div
+            ref={sotaLogRef}
+            style={{
+              maxHeight: 280, overflowY: 'auto',
+              padding: '8px 12px', background: 'var(--bg-base)',
+              border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+              fontSize: 10, fontFamily: 'var(--font-mono)',
+              color: 'var(--text-muted)', whiteSpace: 'pre-wrap',
+              lineHeight: 1.45, marginBottom: 8,
+            }}
+          >
+            {sotaLogs.map((l, i) => (
+              <div key={i} style={{
+                color: l.kind === 'phase' ? 'var(--accent-cyan)'
+                     : l.kind === 'meta'  ? 'var(--text-secondary)'
+                     : 'var(--text-muted)',
+              }}>
+                {l.text}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {sotaResult && (
+          <div style={{
+            padding: '8px 12px', fontSize: 12, fontWeight: 600,
+            color: sotaResult.ok ? '#22c55e' : '#ef4444',
+            background: sotaResult.ok
+              ? 'rgba(34, 197, 94, 0.08)'
+              : 'rgba(239, 68, 68, 0.08)',
+            border: `1px solid ${sotaResult.ok ? '#22c55e' : '#ef4444'}`,
+            borderRadius: 'var(--radius-sm)',
+          }}>
+            {sotaResult.ok ? '\u2705 ' : '\u274c '}{sotaResult.message}
           </div>
         )}
       </div>

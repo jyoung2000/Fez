@@ -1534,6 +1534,167 @@ async def test_subject_tracking():
 # NOTE: Whisper testing is now integrated into test-pipeline above.
 
 
+# ── SOTA reframing bench (1-click runner) ────────────────────────────────
+
+
+@router.post("/sota-bench")
+async def run_sota_bench(request: Request):
+    """One-click 2026 SOTA reframing validation.
+
+    Runs the local QA harness (``python -m tests.qa.run_all_phases``)
+    THEN the homelab fixture bench (``compare_autoflip_vs_clipai``)
+    against the real-content manifest with every Phase A–E flag ON.
+
+    Streams Server-Sent Events so the GUI can show live progress
+    without long-polling.
+
+    Body params (all optional):
+      - skip_bench (bool)  : run only the QA harness (skip fixture
+                              bench). Default false.
+      - manifest (str)      : override manifest path. Default
+                              ``tests/real_content/manifest.json``.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    skip_bench = bool(body.get("skip_bench", False))
+    manifest = str(body.get("manifest") or "tests/real_content/manifest.json")
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo_root = os.path.dirname(repo_root)  # backend → repo root
+
+    async def _stream_subprocess(
+        cmd: list[str], *, env: dict | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Run a subprocess and yield each stdout line as an SSE log event."""
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=repo_root,
+            env={**os.environ, **(env or {})},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                yield _sse_event("log", {"line": line.decode(errors="replace").rstrip()})
+            await proc.wait()
+            yield _sse_event("exit_code", {"code": proc.returncode})
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        # ── Phase 1: QA harness ─────────────────────────────────────
+        yield _sse_event("phase_start", {
+            "phase": "qa_harness",
+            "label": "Running tests/qa/run_all_phases (mocks; ~5 s)…",
+        })
+        qa_failed = False
+        async for evt in _stream_subprocess(
+            ["python", "-m", "tests.qa.run_all_phases"],
+        ):
+            yield evt
+            try:
+                parsed = json.loads(evt[6:])
+                if parsed.get("type") == "exit_code":
+                    qa_failed = parsed["data"]["code"] != 0
+            except Exception:
+                pass
+        yield _sse_event("phase_result", {
+            "phase": "qa_harness",
+            "status": "fail" if qa_failed else "pass",
+        })
+        if qa_failed:
+            yield _sse_event("complete", {
+                "ok": False,
+                "stage": "qa_harness",
+                "message": "QA harness failed — bench skipped. Read the failures above and fix the offending phase before re-running.",
+            })
+            return
+
+        if skip_bench:
+            yield _sse_event("complete", {
+                "ok": True,
+                "stage": "qa_harness",
+                "message": "QA harness PASSED. Bench skipped per request.",
+            })
+            return
+
+        # ── Phase 2: full SOTA fixture bench ────────────────────────
+        yield _sse_event("phase_start", {
+            "phase": "sota_bench",
+            "label": (
+                "Running compare_autoflip_vs_clipai with all Phase A-E "
+                "flags ON (homelab GPU; this can take several minutes)…"
+            ),
+        })
+        bench_env = {
+            "CLIPAI_TRACKER_BACKEND": "samurai",
+            "CLIPAI_DENSE_POINT_TRACKING": "1",
+            "CLIPAI_SALIENCY_ENABLED": "1",
+            "CLIPAI_COMPOSITION_HEAD": "clip",
+            "CLIPAI_EDITORIAL_PLANNER": "1",
+            "CLIPAI_HUMAN_REFRAME_PIPELINE": "1",
+        }
+        bench_failed = False
+        bench_cmd = [
+            "python", "-m", "backend.scripts.compare_autoflip_vs_clipai",
+            "--manifest", manifest,
+            "--output", "/tmp/sota_bench_results.md",
+            "--json-out", "/tmp/sota_bench_results.json",
+        ]
+        async for evt in _stream_subprocess(bench_cmd, env=bench_env):
+            yield evt
+            try:
+                parsed = json.loads(evt[6:])
+                if parsed.get("type") == "exit_code":
+                    bench_failed = parsed["data"]["code"] != 0
+            except Exception:
+                pass
+        yield _sse_event("phase_result", {
+            "phase": "sota_bench",
+            "status": "fail" if bench_failed else "pass",
+            "results_md": "/tmp/sota_bench_results.md",
+            "results_json": "/tmp/sota_bench_results.json",
+        })
+
+        # ── Final summary ────────────────────────────────────────────
+        if bench_failed:
+            yield _sse_event("complete", {
+                "ok": False,
+                "stage": "sota_bench",
+                "message": (
+                    "Bench failed. Most common cause: missing fixture cache "
+                    "(see CLIPAI_REAL_CONTENT_CACHE) or missing AutoFlip "
+                    "reference outputs. See docs/sota_reframe_runbook.md."
+                ),
+            })
+        else:
+            yield _sse_event("complete", {
+                "ok": True,
+                "stage": "sota_bench",
+                "message": (
+                    "QA harness + SOTA bench PASSED. Results written to "
+                    "/tmp/sota_bench_results.md (markdown) and "
+                    "/tmp/sota_bench_results.json (machine-readable)."
+                ),
+            })
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.get("/auth-cache")
 async def auth_cache_stats(_admin: User = Depends(require_admin)):
     """Expose the in-process session + user cache counters.
