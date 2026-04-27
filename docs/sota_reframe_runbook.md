@@ -10,6 +10,17 @@ ADR in `docs/sota_reframe_rollout.md`.
 After pushing to `claude/clipai-sota-reframing-tOo41` and rebuilding:
 
 ```bash
+# 1. Local check BEFORE pushing (run from the repo root):
+bash scripts/verify_sota_bench.sh local
+
+# 2. Container check AFTER `docker compose up -d`:
+docker compose exec backend bash scripts/verify_sota_bench.sh container
+
+# 3. Quickest manual probe of the diagnostics endpoint:
+curl -s http://localhost:1353/api/diagnostics/sota-bench-status | python -m json.tool
+curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
+  http://localhost:1353/api/diagnostics/sota-bench-qa | python -m json.tool
+
 docker compose down && docker compose build --no-cache && docker compose up -d
 
 # 1. Confirm GPU passthrough

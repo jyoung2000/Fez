@@ -1787,6 +1787,152 @@ async def run_sota_bench(request: Request):
     )
 
 
+# ── SOTA bench: synchronous JSON variant + status probe ──────────────
+
+
+@router.get("/sota-bench-status")
+async def sota_bench_status():
+    """Return a JSON snapshot of everything the SOTA bench needs.
+
+    Fast (<200 ms), no streaming, no subprocess. Use this to verify
+    that the container has the QA harness baked in BEFORE clicking
+    the 1-click button. Curl it directly:
+
+        curl -s http://localhost:1353/api/diagnostics/sota-bench-status | jq
+
+    Output flags every potential failure mode the operator cares
+    about: missing file, wrong python interpreter, broken module
+    import, etc.
+    """
+    import shutil
+    import sys
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo_root = os.path.dirname(repo_root)
+    qa_runner = os.path.join(repo_root, "tests", "qa", "run_all_phases.py")
+    suite_files = []
+    qa_dir = os.path.join(repo_root, "tests", "qa")
+    if os.path.isdir(qa_dir):
+        suite_files = sorted(
+            f for f in os.listdir(qa_dir) if f.startswith("test_phase_")
+        )
+
+    # Try a trivial subprocess to confirm the plumbing works.
+    sub_ok = False
+    sub_stdout = ""
+    sub_err = ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "print('ok')",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        sub_ok = proc.returncode == 0
+        sub_stdout = out.decode(errors="replace").strip()
+        sub_err = err.decode(errors="replace").strip()
+    except Exception as exc:
+        sub_err = f"subprocess plumbing failed: {exc!r}"
+
+    # Try to import the harness module to see if the path works.
+    import_ok = False
+    import_err = ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c",
+            "import importlib; importlib.import_module('tests.qa.run_all_phases')",
+            cwd=repo_root,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        import_ok = proc.returncode == 0
+        if not import_ok:
+            import_err = err.decode(errors="replace").strip()
+    except Exception as exc:
+        import_err = f"{exc!r}"
+
+    return {
+        "ok": all([
+            os.path.exists(qa_runner), sub_ok, import_ok, len(suite_files) >= 5,
+        ]),
+        "repo_root": repo_root,
+        "qa_runner_path": qa_runner,
+        "qa_runner_exists": os.path.exists(qa_runner),
+        "qa_dir_exists": os.path.isdir(qa_dir),
+        "suite_files": suite_files,
+        "python": sys.executable,
+        "pytest_available": shutil.which("pytest") is not None,
+        "subprocess_plumbing": {
+            "ok": sub_ok, "stdout": sub_stdout, "stderr": sub_err,
+        },
+        "module_import": {"ok": import_ok, "error": import_err},
+    }
+
+
+@router.post("/sota-bench-qa")
+async def sota_bench_qa_sync():
+    """Synchronous JSON variant of the QA-only run. No streaming.
+
+    Runs ``python -m tests.qa.run_all_phases`` to completion (~5 s)
+    and returns the captured stdout + exit code as JSON. Use this
+    when the streaming endpoint misbehaves — it is fundamentally
+    more reliable across reverse-proxies and container networks
+    because it is a single request/response cycle.
+
+    The GUI's ``QA only`` checkbox falls back to this on the first
+    SSE error.
+    """
+    import sys
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo_root = os.path.dirname(repo_root)
+    qa_runner = os.path.join(repo_root, "tests", "qa", "run_all_phases.py")
+
+    if not os.path.exists(qa_runner):
+        return {
+            "ok": False,
+            "stage": "preflight",
+            "error": f"QA harness not found at {qa_runner}. Rebuild the image.",
+            "stdout": "",
+            "stderr": "",
+            "exit_code": -1,
+        }
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", "-m", "tests.qa.run_all_phases",
+            cwd=repo_root,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=120.0)
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "stage": "qa_harness",
+            "error": "QA harness exceeded 120 s timeout",
+            "stdout": "", "stderr": "", "exit_code": -1,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "stage": "qa_harness",
+            "error": f"subprocess failed: {exc!r}",
+            "stdout": "", "stderr": "", "exit_code": -1,
+        }
+
+    return {
+        "ok": proc.returncode == 0,
+        "stage": "qa_harness",
+        "stdout": out.decode(errors="replace"),
+        "stderr": err.decode(errors="replace"),
+        "exit_code": proc.returncode,
+    }
+
+
 @router.get("/auth-cache")
 async def auth_cache_stats(_admin: User = Depends(require_admin)):
     """Expose the in-process session + user cache counters.

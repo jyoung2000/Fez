@@ -397,11 +397,99 @@ export default function PipelineDiagnostics() {
     setSotaPhases([]);
     setSotaLogs([]);
     setSotaResult(null);
+
+    // Step 0: probe the bench-status endpoint so the operator sees
+    // exactly what the server thinks of its environment before any
+    // streaming starts. This is fast (<200 ms) and never tears the
+    // chunked encoding because it is a regular JSON response.
+    try {
+      const probe = await fetch('/api/diagnostics/sota-bench-status');
+      if (probe.ok) {
+        const data = await probe.json();
+        setSotaLogs((prev) => [...prev, {
+          kind: 'meta',
+          text: `[probe] qa_runner_exists=${data.qa_runner_exists} ` +
+                `subprocess=${data.subprocess_plumbing?.ok} ` +
+                `module_import=${data.module_import?.ok} ` +
+                `suites=${(data.suite_files || []).length}`,
+        }]);
+        if (!data.ok) {
+          setSotaResult({
+            ok: false,
+            stage: 'preflight',
+            message:
+              !data.qa_runner_exists
+                ? `QA harness not in image at ${data.qa_runner_path}. ` +
+                  `Rebuild the container with: ` +
+                  `docker compose down && docker compose build --no-cache && docker compose up -d`
+                : !data.subprocess_plumbing?.ok
+                  ? `subprocess plumbing broken: ${data.subprocess_plumbing?.stderr || 'unknown'}`
+                : !data.module_import?.ok
+                  ? `harness import failed: ${data.module_import?.error}`
+                : `unknown preflight failure (suites=${data.suite_files?.length})`,
+          });
+          setSotaRunning(false);
+          return;
+        }
+      }
+    } catch (e) {
+      setSotaLogs((prev) => [...prev, {
+        kind: 'meta', text: `[probe] failed: ${e.message} (continuing anyway)`,
+      }]);
+    }
+
+    // Step 1: QA-only mode uses the synchronous JSON endpoint - no
+    // SSE, no streaming surface. This is BY FAR the most reliable
+    // path across container networks / reverse proxies.
+    if (sotaSkipBench) {
+      setSotaPhases([{
+        phase: 'qa_harness',
+        label: 'Running tests/qa/run_all_phases (sync; ~5 s)...',
+        status: 'running',
+      }]);
+      try {
+        const resp = await fetch('/api/diagnostics/sota-bench-qa', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        const lines = (data.stdout || '').split('\n').filter(Boolean);
+        setSotaLogs((prev) => [
+          ...prev,
+          ...lines.map((text) => ({ kind: 'log', text })),
+          ...(data.stderr ? data.stderr.split('\n')
+              .filter(Boolean)
+              .map((text) => ({ kind: 'meta', text: `stderr: ${text}` })) : []),
+          { kind: 'meta', text: `(exit code ${data.exit_code})` },
+        ]);
+        setSotaPhases([{
+          phase: 'qa_harness',
+          label: 'Running tests/qa/run_all_phases (sync)',
+          status: data.ok ? 'pass' : 'fail',
+        }]);
+        setSotaResult({
+          ok: data.ok,
+          stage: 'qa_harness',
+          message: data.ok
+            ? 'QA harness PASSED. Bench skipped per "QA only" checkbox.'
+            : `QA harness failed: ${data.error || `exit ${data.exit_code}`}`,
+        });
+      } catch (e) {
+        setSotaResult({ ok: false, message: `Network error: ${e.message}` });
+      } finally {
+        setSotaRunning(false);
+      }
+      return;
+    }
+
+    // Step 2: Full bench - SSE streaming. Long-running, needs live updates.
     try {
       const resp = await fetch('/api/diagnostics/sota-bench', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ skip_bench: sotaSkipBench }),
+        body: JSON.stringify({ skip_bench: false }),
       });
       if (!resp.ok || !resp.body) {
         throw new Error(`HTTP ${resp.status}`);
@@ -438,7 +526,7 @@ export default function PipelineDiagnostics() {
                 { kind: 'meta', text: `(process exited with code ${evt.data.code})` },
               ]);
             } else if (evt.type === 'heartbeat') {
-              // Keep the connection alive; do not surface to user.
+              // Keep alive; do not surface.
             } else if (evt.type === 'complete') {
               setSotaResult(evt.data);
             }
@@ -448,7 +536,10 @@ export default function PipelineDiagnostics() {
         }
       }
     } catch (e) {
-      setSotaResult({ ok: false, message: `Network error: ${e.message}` });
+      setSotaResult({
+        ok: false,
+        message: `Streaming failed: ${e.message}. Try "QA only" mode (synchronous).`,
+      });
     } finally {
       setSotaRunning(false);
     }
