@@ -147,6 +147,16 @@ COPY backend/ ./backend/
 # "Setup guide →" link land on a blank page.
 COPY docs/ ./docs/
 
+# Copy the QA harness (Phase A-E mock-heavy unit tests + the master
+# runner) so the Settings -> Advanced -> "2026 SOTA Reframing" 1-click
+# button can spawn `python -m tests.qa.run_all_phases` against the
+# real container. ~50 KB of Python; never imported at startup, only
+# spawned on demand by the diagnostics router.
+COPY tests/qa/ ./tests/qa/
+# Make ``tests`` importable as a top-level package (the QA runner uses
+# ``python -m tests.qa.run_all_phases``).
+RUN touch ./tests/__init__.py
+
 # Copy built frontend from stage 1
 COPY --from=frontend-build /app/frontend/dist ./static
 

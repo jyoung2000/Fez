@@ -1561,8 +1561,12 @@ async def run_sota_bench(request: Request):
     skip_bench = bool(body.get("skip_bench", False))
     manifest = str(body.get("manifest") or "tests/real_content/manifest.json")
 
+    # __file__ is /app/backend/routers/diagnostics.py inside the
+    # container; the repo root is /app.
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    repo_root = os.path.dirname(repo_root)  # backend → repo root
+    repo_root = os.path.dirname(repo_root)  # backend -> repo root
+
+    qa_runner_path = os.path.join(repo_root, "tests", "qa", "run_all_phases.py")
 
     async def _stream_subprocess(
         cmd: list[str], *, env: dict | None = None,
@@ -1615,10 +1619,60 @@ async def run_sota_bench(request: Request):
                     pass
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        # ── Phase 1: QA harness ─────────────────────────────────────
+        try:
+            async for evt in _do_stream():
+                yield evt
+        except Exception as exc:
+            # Any uncaught error becomes a visible SSE event rather
+            # than a torn chunked-encoding stream that the browser
+            # surfaces as ``ERR_INCOMPLETE_CHUNKED_ENCODING``.
+            logger.exception("[sota-bench] event_stream crashed: %s", exc)
+            yield _sse_event("log", {"line": f"!! event_stream error: {exc}"})
+            yield _sse_event("complete", {
+                "ok": False,
+                "stage": "event_stream",
+                "message": (
+                    f"Internal error: {exc!s}. Check the backend logs for the "
+                    "full traceback."
+                ),
+            })
+
+    async def _do_stream() -> AsyncGenerator[str, None]:
+        # Pre-flight: the harness file MUST be present in the image.
+        # Without this check, a missing tests/ directory crashes
+        # the subprocess instantly and the SSE stream torn-resets.
+        if not os.path.exists(qa_runner_path):
+            yield _sse_event("phase_start", {
+                "phase": "qa_harness",
+                "label": "Pre-flight check (QA harness path)...",
+            })
+            yield _sse_event("log", {
+                "line": f"!! QA harness not found at {qa_runner_path}",
+            })
+            yield _sse_event("log", {
+                "line": (
+                    "!! The image was built before the SOTA QA harness "
+                    "landed. Rebuild with: "
+                    "docker compose build --no-cache && docker compose up -d"
+                ),
+            })
+            yield _sse_event("phase_result", {
+                "phase": "qa_harness", "status": "fail",
+            })
+            yield _sse_event("complete", {
+                "ok": False,
+                "stage": "qa_harness",
+                "message": (
+                    f"QA harness missing in image at {qa_runner_path}. "
+                    "Rebuild the container."
+                ),
+            })
+            return
+
+        # Phase 1: QA harness
         yield _sse_event("phase_start", {
             "phase": "qa_harness",
-            "label": "Running tests/qa/run_all_phases (mocks; ~5 s)…",
+            "label": "Running tests/qa/run_all_phases (mocks; ~5 s)...",
         })
         qa_failed = False
         async for evt in _stream_subprocess(
