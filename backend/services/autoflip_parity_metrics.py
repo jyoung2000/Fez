@@ -366,7 +366,204 @@ def face_centroid_in_thirds_rate(
     return in_thirds / len(face_y_in_crop_normalized)
 
 
-# ── Metric 9: cut-to-hold ratio (Week 3) ────────────────────────────
+# ── Metric 9 (Phase A): identity-switch count ───────────────────────
+
+
+def identity_switch_count(
+    timeline: list[dict],
+    *,
+    iou_threshold: float = 0.30,
+    min_gap_sec: float = 0.20,
+) -> int:
+    """Count tracker identity switches across a multi-subject timeline.
+
+    A "switch" is when a tracker slot's bounding box at frame ``t``
+    has IoU below ``iou_threshold`` with the same slot's bbox at
+    frame ``t-1``, with at least ``min_gap_sec`` between frames (so
+    sub-frame jitter doesn't count). The metric is monotonic — every
+    real ID swap counts exactly once.
+
+    Input shape (``timeline`` is per-frame):
+
+        [
+            {"t": float, "slots": {slot_id: (x, y, w, h)}, ...},
+            ...
+        ]
+
+    Coordinates are in any consistent unit (pixels OR % of source).
+    The metric only uses IoU, which is unit-agnostic.
+
+    Phase A target: identity-switch rate ≥ 30 % lower than the
+    OpenCV-tracker baseline on the four-speaker panel fixture.
+    """
+    if len(timeline) < 2:
+        return 0
+    switches = 0
+    last_slots: dict = {}
+    last_t: Optional[float] = None
+    for frame in timeline:
+        try:
+            t = float(frame.get("t", 0.0))
+        except (TypeError, ValueError):
+            continue
+        slots = frame.get("slots", {}) or {}
+        if last_t is not None and (t - last_t) < min_gap_sec:
+            # Sub-frame jitter — skip but still update last_slots.
+            last_slots = dict(slots)
+            last_t = t
+            continue
+        for slot_id, bbox in slots.items():
+            if slot_id in last_slots:
+                if _iou(last_slots[slot_id], bbox) < iou_threshold:
+                    switches += 1
+        last_slots = dict(slots)
+        last_t = t
+    return switches
+
+
+def _iou(box_a, box_b) -> float:
+    """Pixel-space IoU for two ``(x, y, w, h)`` tuples."""
+    if box_a is None or box_b is None:
+        return 0.0
+    ax, ay, aw, ah = (float(v) for v in box_a)
+    bx, by, bw, bh = (float(v) for v in box_b)
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return 0.0
+    ax1, ay1 = ax + aw, ay + ah
+    bx1, by1 = bx + bw, by + bh
+    ix0 = max(ax, bx)
+    iy0 = max(ay, by)
+    ix1 = min(ax1, bx1)
+    iy1 = min(ay1, by1)
+    iw = max(0.0, ix1 - ix0)
+    ih = max(0.0, iy1 - iy0)
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+# ── Metric 10 (Phase C): saliency-in-crop fraction ──────────────────
+
+
+def saliency_in_crop_fraction(
+    crop_centers: list[float],
+    crop_width_pct: float,
+    saliency_peaks_per_second: list[list[tuple[float, float, float]]],
+    *,
+    timestamps: Optional[list[float]] = None,
+) -> float:
+    """Fraction of frames where ≥1 top-3 saliency peak lies inside the crop.
+
+    Phase C target: ≥ 0.80 on dynamic content (sports / music_video /
+    anime). Soft metric — saliency is a hint, not a constraint.
+
+    Coordinates are in % of source frame width to match the rest of
+    the parity bench. ``saliency_peaks_per_second[i]`` is a list of
+    ``(x, y, score)`` peaks for second ``i``; ``timestamps[j]`` (or
+    ``j``-as-second when ``timestamps`` is None) maps each crop frame
+    to its peaks-per-second slot.
+    """
+    if not crop_centers or not saliency_peaks_per_second:
+        return 0.0
+    half = crop_width_pct / 2.0
+    n_in_crop = 0
+    for i, cx in enumerate(crop_centers):
+        if timestamps is not None:
+            sec_idx = int(timestamps[i]) if i < len(timestamps) else i
+        else:
+            sec_idx = i
+        if sec_idx < 0 or sec_idx >= len(saliency_peaks_per_second):
+            continue
+        peaks = saliency_peaks_per_second[sec_idx]
+        if not peaks:
+            continue
+        for (px, _py, _score) in peaks:
+            if cx - half <= px <= cx + half:
+                n_in_crop += 1
+                break
+    return n_in_crop / len(crop_centers)
+
+
+# ── Metric 11 (Phase D): face-clipping rate ─────────────────────────
+
+
+def face_clipping_rate(
+    crop_centers: list[float],
+    crop_width_pct: float,
+    face_bboxes_per_frame: list[list[tuple[float, float, float, float]]],
+    *,
+    margin_pct: float = 0.5,
+) -> float:
+    """Fraction of frames where any face's bbox extends outside the crop.
+
+    Phase D target: ≥ 50 % reduction vs Phase C baseline. A face is
+    "clipped" when more than ``margin_pct`` % of source-width sticks
+    out of either crop edge — a tiny tolerance avoids false positives
+    on faces that are exactly tangent to the crop edge.
+
+    ``face_bboxes_per_frame[i]`` is the list of ``(x, y, w, h)`` faces
+    for crop frame ``i`` in % of source width (the same units as the
+    crop center).
+    """
+    if not crop_centers:
+        return 0.0
+    half = crop_width_pct / 2.0
+    clipped = 0
+    for i, cx in enumerate(crop_centers):
+        crop_left = cx - half
+        crop_right = cx + half
+        faces = face_bboxes_per_frame[i] if i < len(face_bboxes_per_frame) else []
+        for (fx, _fy, fw, _fh) in faces:
+            f_left = fx
+            f_right = fx + fw
+            if (crop_left - f_left > margin_pct) or (f_right - crop_right > margin_pct):
+                clipped += 1
+                break
+    return clipped / len(crop_centers)
+
+
+# ── Metric 12 (Phase C): text-region clipping rate ──────────────────
+
+
+def text_region_clipping_rate(
+    crop_centers: list[float],
+    crop_width_pct: float,
+    text_regions_per_frame: list[list[tuple[float, float, float, float]]],
+    *,
+    min_visible_fraction: float = 0.95,
+) -> float:
+    """Fraction of frames where at least one OCR text region is clipped.
+
+    A region is considered clipped when less than ``min_visible_fraction``
+    of its horizontal extent sits inside the crop. The default 95 %
+    threshold protects readable text — anything tighter cuts mid-letter.
+
+    Phase C target: < 0.05 (≤ 5 % of frames have any text clipped).
+    """
+    if not crop_centers:
+        return 0.0
+    half = crop_width_pct / 2.0
+    clipped = 0
+    for i, cx in enumerate(crop_centers):
+        crop_left = cx - half
+        crop_right = cx + half
+        regions = text_regions_per_frame[i] if i < len(text_regions_per_frame) else []
+        for (rx, _ry, rw, _rh) in regions:
+            r_left = rx
+            r_right = rx + rw
+            visible_left = max(crop_left, r_left)
+            visible_right = min(crop_right, r_right)
+            visible_w = max(0.0, visible_right - visible_left)
+            r_w = r_right - r_left
+            if r_w > 0 and (visible_w / r_w) < min_visible_fraction:
+                clipped += 1
+                break
+    return clipped / len(crop_centers)
+
+
+# ── Metric 13: cut-to-hold ratio (Week 3) ────────────────────────────
 
 def cut_to_hold_ratio(events: list[dict]) -> dict:
     """Distribution of per-segment hold durations.
@@ -465,6 +662,13 @@ def score_fixture(
     downbeat_snap_tolerance_ms: float = 200.0,
     hud_min_visible_fraction: float = 0.8,
     thirds_tolerance: float = 0.10,
+    # 2026 SOTA additions — kwargs are optional so existing callers
+    # don't have to change.
+    identity_timeline: Optional[list[dict]] = None,
+    saliency_peaks_per_second: Optional[list[list[tuple[float, float, float]]]] = None,
+    saliency_timestamps: Optional[list[float]] = None,
+    face_bboxes_per_frame: Optional[list[list[tuple[float, float, float, float]]]] = None,
+    text_regions_per_frame: Optional[list[list[tuple[float, float, float, float]]]] = None,
 ) -> dict:
     """Run every requested metric and return a JSON-friendly dict.
 
@@ -524,6 +728,39 @@ def score_fixture(
                 face_y_in_crop_normalized or [],
                 tolerance=thirds_tolerance,
             )
+        elif metric == "identity_switch_count":
+            if identity_timeline is None:
+                out[metric] = None
+            else:
+                out[metric] = identity_switch_count(identity_timeline)
+        elif metric == "saliency_in_crop_fraction":
+            if crop_width_pct is None or saliency_peaks_per_second is None:
+                out[metric] = None
+            else:
+                out[metric] = saliency_in_crop_fraction(
+                    crop_centers or [],
+                    crop_width_pct,
+                    saliency_peaks_per_second,
+                    timestamps=saliency_timestamps,
+                )
+        elif metric == "face_clipping_rate":
+            if crop_width_pct is None or face_bboxes_per_frame is None:
+                out[metric] = None
+            else:
+                out[metric] = face_clipping_rate(
+                    crop_centers or [],
+                    crop_width_pct,
+                    face_bboxes_per_frame,
+                )
+        elif metric == "text_region_clipping_rate":
+            if crop_width_pct is None or text_regions_per_frame is None:
+                out[metric] = None
+            else:
+                out[metric] = text_region_clipping_rate(
+                    crop_centers or [],
+                    crop_width_pct,
+                    text_regions_per_frame,
+                )
         else:
             out[metric] = {"error": f"unknown metric {metric!r}"}
     return out
@@ -540,4 +777,9 @@ ALL_METRICS: tuple[str, ...] = (
     "downbeat_snap_error",
     "hud_preservation_rate",
     "face_centroid_in_thirds_rate",
+    # 2026 SOTA additions
+    "identity_switch_count",          # Phase A
+    "saliency_in_crop_fraction",      # Phase C
+    "face_clipping_rate",             # Phase D
+    "text_region_clipping_rate",      # Phase C
 )

@@ -131,6 +131,27 @@ class Settings(BaseSettings):
     # Camera solver (per-shot AutoFlip-style crop planning)
     CLIPAI_CAMERA_SOLVER: str = "on"  # "on" | "off" — env CLIPAI_CAMERA_SOLVER
 
+    # ── 2026 SOTA reframing pipeline flags (Phases A–E) ──────────────
+    # Phase A — SAMURAI subject tracking (SAM 2.1 + motion-aware memory).
+    # Values: ``samurai`` | ``opencv`` | ``auto`` (default). ``auto``
+    # picks SAMURAI when CUDA is visible, OpenCV otherwise.
+    CLIPAI_TRACKER_BACKEND: str = "auto"
+    # Phase B — CoTracker3 dense point trajectories. Default OFF until
+    # Phase-B bench is green; flipped ON in Phase E.
+    CLIPAI_DENSE_POINT_TRACKING: bool = False
+    # Phase C — TASED-Net AV saliency + PaddleOCR text-region
+    # exclusions. Default OFF; flipped ON in Phase E.
+    CLIPAI_SALIENCY_ENABLED: bool = False
+    # Phase D — CLIP-based composition head. Values: ``clip`` |
+    # ``legacy`` | ``none``. Default ``legacy`` until Phase E.
+    CLIPAI_COMPOSITION_HEAD: str = "legacy"
+    # Phase E — global editorial planner (single LLM call per clip).
+    # Default OFF until Phase E lands.
+    CLIPAI_EDITORIAL_PLANNER: bool = False
+    # Emergency rollback — forces the legacy ``reframe_segmenter`` path
+    # for one release after Phase E flips the defaults.
+    CLIPAI_LEGACY_REFRAME: bool = False
+
     # Content-type routing for solver tuning (off by default until tested)
     CLIPAI_CONTENT_ROUTING: str = "off"  # "on" | "off" — env CLIPAI_CONTENT_ROUTING
     CLIPAI_CONTENT_TYPES_ENABLED: str = ""  # comma-separated: "talking_head,stream" — empty = all
