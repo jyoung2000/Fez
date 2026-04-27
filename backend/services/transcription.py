@@ -40,6 +40,87 @@ _MODEL_LOAD_TIMEOUT = 600  # 10 minutes
 _SEGMENT_STALL_TIMEOUT = 120  # 2 minutes
 
 
+# One-shot GPU passthrough probe. Cached for the process lifetime —
+# if /dev/nvidia* doesn't exist at process start it won't materialize
+# later, and nvidia-smi being missing is a deployment bug, not a
+# transient state. The previous behaviour was to re-run multi-method
+# CUDA detection on every Whisper load, which logged a flurry of
+# "CUDA library libcuda.so.1 is loadable — GPU may be available"
+# / "CUDA failed (CUDA failed with error unknown error) — falling
+# back to CPU" pairs every single time the gap-filler reloaded the
+# in-process singleton.
+_gpu_probe_cache: Optional[dict] = None
+
+
+def _probe_gpu_availability() -> dict:
+    """One-shot GPU passthrough probe. Cached for the process lifetime.
+
+    Returns a dict with:
+      - visible (bool): True iff CUDA is actually usable in this container.
+      - nvidia_devices (list[str]): /dev/nvidia* character devices found.
+      - nvidia_smi_available (bool): whether ``nvidia-smi`` is on PATH.
+      - ctranslate2_devices (int): CUDA devices reported by ctranslate2.
+      - reason (str): short human-readable reason when unavailable.
+
+    Keeps the cost low: ``glob`` + ``shutil.which`` + a single
+    ``ctranslate2.get_cuda_device_count`` call. Calling it many times
+    is free after the first invocation.
+    """
+    global _gpu_probe_cache
+    if _gpu_probe_cache is not None:
+        return _gpu_probe_cache
+
+    import glob as _glob
+    import shutil as _shutil
+
+    nvidia_devices = sorted(_glob.glob("/dev/nvidia[0-9]*"))
+    nvidia_smi = _shutil.which("nvidia-smi") is not None
+    try:
+        import ctranslate2  # type: ignore
+        ct2_devices = int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        ct2_devices = 0
+
+    visible = bool(nvidia_devices) and ct2_devices > 0
+    if not visible:
+        if not nvidia_devices:
+            reason = (
+                "no /dev/nvidia* devices in container "
+                "(GPU passthrough missing)"
+            )
+        elif ct2_devices == 0:
+            reason = (
+                "ctranslate2 reports 0 CUDA devices "
+                "(driver/library mismatch)"
+            )
+        else:
+            reason = "unknown"
+    else:
+        reason = "ok"
+
+    _gpu_probe_cache = {
+        "visible": visible,
+        "nvidia_devices": nvidia_devices,
+        "nvidia_smi_available": nvidia_smi,
+        "ctranslate2_devices": ct2_devices,
+        "reason": reason,
+    }
+    if visible:
+        logger.info(
+            "GPU probe: visible (%d ctranslate2 device(s), %d nvidia "
+            "char device(s))",
+            ct2_devices, len(nvidia_devices),
+        )
+    else:
+        logger.warning(
+            "GPU probe: unavailable in this container — Whisper will "
+            "run on CPU. Reason: %s. nvidia-smi=%s, /dev/nvidia*=%s, "
+            "ctranslate2_cuda_devices=%d.",
+            reason, nvidia_smi, nvidia_devices, ct2_devices,
+        )
+    return _gpu_probe_cache
+
+
 def _get_gpu_vram_mb() -> int:
     """Get total GPU VRAM in MB. Returns 0 if unavailable."""
     gpus = _enumerate_gpus_nvidia_smi()
@@ -135,6 +216,69 @@ def ensure_whisper_model_downloaded(model_name: str, timeout: float = 600) -> bo
     except Exception as e:
         logger.error("Failed to download Whisper model '%s': %s", model_name, e)
         return False
+
+
+def _evict_ollama_for_whisper_sync() -> None:
+    """Synchronous best-effort Ollama eviction before Whisper CUDA load.
+
+    The async ``_evict_ollama_for_whisper`` is the canonical version
+    used by the subprocess path. ``_get_whisper_model`` is a sync
+    function that may be called from an executor (e.g. the gap-filler)
+    where bouncing into an event loop is awkward and racy. This sync
+    twin runs the same /api/ps + keep_alive=0 dance with httpx's
+    blocking client so we can always evict before opening the CUDA
+    context, regardless of the caller's threading model.
+    """
+    try:
+        import httpx
+    except ImportError:
+        logger.debug("httpx not available — skipping Ollama eviction (sync)")
+        return
+
+    ollama_url = (
+        os.environ.get("OLLAMA_HOST")
+        or getattr(settings, "OLLAMA_HOST", None)
+        or "http://ollama:11434"
+    ).rstrip("/")
+
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            try:
+                resp = client.get(f"{ollama_url}/api/ps")
+            except Exception as e:
+                logger.debug("Ollama /api/ps unreachable (sync): %s", e)
+                return
+            if resp.status_code != 200:
+                return
+            try:
+                models = resp.json().get("models", [])
+            except Exception:
+                models = []
+            if not models:
+                return
+            evicted = 0
+            for m in models:
+                name = m.get("name") or m.get("model")
+                if not name:
+                    continue
+                try:
+                    client.post(
+                        f"{ollama_url}/api/generate",
+                        json={"model": name, "keep_alive": 0},
+                    )
+                    evicted += 1
+                except Exception:
+                    continue
+            if evicted:
+                logger.info(
+                    "Evicted %d Ollama model(s) from VRAM before Whisper "
+                    "(sync path)",
+                    evicted,
+                )
+                # Give the driver a moment to actually release VRAM
+                time.sleep(2.0)
+    except Exception as e:
+        logger.debug("Ollama eviction (sync) failed: %s", e)
 
 
 async def _evict_ollama_for_whisper() -> None:
@@ -809,12 +953,142 @@ async def transcribe_audio_subprocess(
             pass
 
 
+def transcribe_audio_slice_subprocess(
+    slice_path: str,
+    *,
+    language: str = "",
+    task: str = "transcribe",
+    initial_prompt: str = "",
+    model_name: Optional[str] = None,
+    timeout: float = 120.0,
+    is_animated: bool = False,
+) -> list[dict]:
+    """Synchronous Whisper subprocess pass over a single audio slice.
+
+    Used by the gap-filler to get fresh CUDA-context isolation per
+    slice instead of inheriting (and re-attempting CUDA on) the
+    in-process singleton — that singleton is stale immediately after
+    the main transcription subprocess exits and was retrying CUDA on
+    every gap fill, adding ~3 minutes of CPU-Whisper time on a 10
+    minute job.
+
+    Returns the raw list of segment dicts from the worker (with
+    ``start``, ``end``, ``text``, ``words``, ``avg_logprob``,
+    ``no_speech_prob`` keys). The caller is responsible for shifting
+    timestamps and converting to ``TranscriptSegment`` — the
+    gap-filler already does both.
+    """
+    import json as _json
+    import subprocess as _sp
+    import sys as _sys
+    import tempfile as _tempfile
+
+    chosen_model = model_name or settings.WHISPER_MODEL
+    device = "cpu"
+    compute_type = "int8"
+    device_index = 0
+    if settings.GPU_ACCELERATION_ENABLED:
+        cuda_available, cuda_count, _, best_idx = _detect_cuda_available()
+        if cuda_available and cuda_count > 0:
+            device = "cuda"
+            compute_type = "float16"
+            device_index = best_idx
+            gpu_idx = (settings.GPU_DEVICE_INDEX or "").strip()
+            if gpu_idx and gpu_idx.isdigit():
+                idx = int(gpu_idx)
+                if idx < cuda_count:
+                    device_index = idx
+            try:
+                _evict_ollama_for_whisper_sync()
+            except Exception as _e:
+                logger.debug("slice eviction failed: %s", _e)
+
+    with _tempfile.NamedTemporaryFile(suffix=".json", delete=False, dir="/tmp") as tmp:
+        output_path = tmp.name
+    try:
+        cmd = [
+            _sys.executable, "-m", "backend.services.whisper_worker",
+            "--audio", slice_path,
+            "--output", output_path,
+            "--model", chosen_model,
+            "--device", device,
+            "--device-index", str(device_index),
+            "--compute-type", compute_type,
+            # Recall-first knobs: slices come from VAD-positive gaps,
+            # so we trust VAD over Whisper's own gates.
+            "--beam-size", "5",
+            "--best-of", "1",
+            "--task", task,
+            "--no-speech-threshold", "0.2",
+            "--log-prob-threshold", "-1.5",
+            "--compression-ratio-threshold", "3.0" if is_animated else "2.6",
+            "--repetition-penalty", "1.1",
+            "--no-repeat-ngram-size", "3",
+            "--no-condition-on-previous",
+            "--word-timestamps",
+        ]
+        if language:
+            cmd.extend(["--language", language])
+        if initial_prompt:
+            cmd.extend(["--initial-prompt", initial_prompt])
+
+        try:
+            proc = _sp.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={**os.environ},
+            )
+        except _sp.TimeoutExpired:
+            logger.warning(
+                "gap-filler slice subprocess timed out after %.0fs (model=%s, device=%s)",
+                timeout, chosen_model, device,
+            )
+            return []
+        if proc.returncode != 0:
+            tail = (proc.stderr or "")[-300:]
+            logger.info(
+                "gap-filler slice subprocess failed (exit %d): %s",
+                proc.returncode, tail.strip(),
+            )
+            return []
+
+        try:
+            with open(output_path, "r") as f:
+                raw = _json.load(f)
+        except Exception as e:
+            logger.info("gap-filler slice: failed to parse worker JSON: %s", e)
+            return []
+
+        if raw.get("status") == "error":
+            logger.info("gap-filler slice: worker reported error: %s", raw.get("error"))
+            return []
+        return raw.get("segments", []) or []
+    finally:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+
+
 def _detect_cuda_available() -> tuple[bool, int, str, int]:
     """Try multiple methods to detect CUDA GPU availability.
 
     Returns (cuda_available, device_count, gpu_name, best_device_index).
     The best_device_index is the index of the most capable GPU (highest VRAM).
     """
+    # Cached probe short-circuit: if /dev/nvidia* are missing OR
+    # ctranslate2 reports 0 CUDA devices we know CUDA can't work, no
+    # matter what later detection methods (libcuda.so loadability,
+    # /proc sysfs scrapes) say. The previous fall-through to method
+    # 4 was the source of the "libcuda.so.1 is loadable — GPU may be
+    # available" line followed by an immediate "CUDA failed" on every
+    # Whisper load.
+    probe = _probe_gpu_availability()
+    if not probe["visible"]:
+        return False, 0, "", 0
+
     best_name, best_idx = _get_best_gpu()
 
     # Method 0 (fast, no CUDA context): Check /dev/nvidia* device nodes
@@ -1090,6 +1364,21 @@ def _get_whisper_model():
             }
             if device == "cuda":
                 model_kwargs["device_index"] = device_index
+
+                # Best-effort Ollama eviction before opening our CUDA
+                # context, mirroring the subprocess path. Without it,
+                # Ollama's idle ~1.6 GB VRAM context evicts the
+                # in-process Whisper model on 4 GB GPUs and forces an
+                # int8 CPU fallback. The gap-filler reuses this
+                # singleton, so the eviction has to happen here too,
+                # not only in ``transcribe_audio_subprocess``.
+                try:
+                    _evict_ollama_for_whisper_sync()
+                except Exception as _e:
+                    logger.debug(
+                        "Ollama eviction in _get_whisper_model failed: %s",
+                        _e,
+                    )
 
             # Auto-upgrade model when GPU is available and user hasn't explicitly chosen.
             # VRAM-aware: large-v3-turbo needs ~3GB VRAM in float16. On 4GB GPUs,

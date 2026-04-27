@@ -39,6 +39,22 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+# Canonical filename of the cached browser preview. The version
+# suffix (currently ``v3``) bumps whenever the encoding pipeline
+# changes in a way that invalidates older cached previews. Operators
+# can grep the startup log for "browser_preview: module loaded" to
+# confirm at a glance whether the running container is on the latest
+# code — the previous regression had a fresh build emitting v2 names
+# while the source had moved to v3, and the only signal was a 60-min
+# retry storm of ``Unable to choose an output format`` errors.
+_PREVIEW_FILENAME = "browser_preview.v3.mp4"
+
+logger.info(
+    "browser_preview: module loaded, target filename = %s",
+    _PREVIEW_FILENAME,
+)
+
+
 # Short-lived cache of ``_probe`` results keyed on ``(path, mtime)``.
 # Every HTML5 ``<video>`` range request flows through
 # ``ensure_browser_preview_status``. For sources that don't need a
@@ -299,7 +315,7 @@ def _preview_path_for(source_path: str) -> str:
     versioned name and playback starts faster on the next request.
     """
     directory = os.path.dirname(source_path) or "."
-    return os.path.join(directory, "browser_preview.v3.mp4")
+    return os.path.join(directory, _PREVIEW_FILENAME)
 
 
 # Cached HW-encoder spec for the preview transcode. Populated lazily on
@@ -555,6 +571,14 @@ def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult) -
         # is deliberately *not* added — fragmented MP4 plays back
         # fine but some older Safari builds scrub poorly on it.
         "-movflags", "+faststart",
+        # Force MP4 container explicitly so FFmpeg never has to infer
+        # it from the temp filename's extension. Without this, a
+        # ``.mp4.tmp`` suffix produces ``Unable to choose an output
+        # format for '<...>.mp4.tmp'; use a standard extension for
+        # the filename or specify the format manually`` and every
+        # preview build fails identically until the cache name is
+        # bumped on the next deploy.
+        "-f", "mp4",
         # Write through a scratch path — _run_ffmpeg atomically
         # renames onto target_path only after a successful exit.
         # See _tmp_path_for for the partial-file race this closes.

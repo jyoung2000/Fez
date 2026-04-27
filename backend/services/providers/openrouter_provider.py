@@ -1833,6 +1833,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         video_summary: Optional[str] = None,
         existing_clips: Optional[str] = None,
         hot_zones=None,
+        pass2_timeout: Optional[int] = None,
         **_extra,
     ) -> list[ClipCandidate]:
         instruction = custom_prompt if custom_prompt else DEFAULT_VIRAL_CLIP_PROMPT
@@ -1985,10 +1986,19 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 {"role": "user", "content": user_prompt},
             ]
 
+            # Pass 2 gap scans use a tighter ceiling than Pass 1 — the
+            # prompt is smaller (single gap, no full-video context) and
+            # the previous 147-151s budget was almost entirely dead
+            # request time when the model was hung. 60s lets us fail
+            # fast and let the next provider in the chain take a swing.
+            if pass2_timeout is not None:
+                _clip_timeout = max(20, int(pass2_timeout))
+            else:
+                _clip_timeout = self._get_clip_timeout(len(transcript_text))
             raw = await self._call_with_fallback(
                 self._text_model, self._text_fallbacks, messages,
                 max_tokens=8192, cancel_check=cancel_check,
-                timeout=self._get_clip_timeout(len(transcript_text)),
+                timeout=_clip_timeout,
             )
             try:
                 # Use extract_json() which handles thinking tags (<think>...</think>),

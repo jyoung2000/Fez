@@ -91,6 +91,56 @@ def _build_provider(name: str) -> Optional[AIProvider]:
 
 _OPENROUTER_MODEL_CACHE: dict[str, bool] = {}
 
+# Per-job circuit breaker for OpenRouter "Key limit exceeded" 403s.
+# That 403 is global to the API key, not per-model — once it trips we
+# stop retrying every model in the OpenRouter chain for the rest of
+# the job. The previous behaviour burned ~120 useless API requests in
+# 30s when polish credits ran out mid-run.
+_openrouter_credit_exhausted: dict[str, bool] = {}
+
+
+def _is_openrouter_credit_exhausted(job_id: str | None) -> bool:
+    return bool(job_id and _openrouter_credit_exhausted.get(job_id))
+
+
+def _trip_openrouter_breaker(job_id: str | None, reason: str) -> None:
+    if not job_id:
+        return
+    if _openrouter_credit_exhausted.get(job_id):
+        return
+    _openrouter_credit_exhausted[job_id] = True
+    logger.warning(
+        "OpenRouter circuit-breaker tripped for job %s (%s) — "
+        "remaining requests will skip OpenRouter",
+        job_id, reason,
+    )
+
+
+def _reset_openrouter_breaker(job_id: str | None) -> None:
+    """Clear the per-job breaker. Used on job cleanup so the dict
+    doesn't grow unboundedly across long-running orchestrators."""
+    if job_id:
+        _openrouter_credit_exhausted.pop(job_id, None)
+
+
+def _looks_like_openrouter_credit_403(exc: Exception) -> bool:
+    """Detect the 'Key limit exceeded' / 403-credit-exhausted signal.
+
+    The OpenRouter provider raises a wrapped error whose string form
+    contains either ``Key limit exceeded`` or ``'code': 403``. Either
+    is treated as global credit exhaustion for this API key.
+    """
+    msg = str(exc).lower()
+    if "key limit exceeded" in msg:
+        return True
+    if "credit" in msg and "exhaust" in msg:
+        return True
+    if getattr(exc, "status_code", None) == 403:
+        return True
+    if "'code': 403" in msg or '"code": 403' in msg or "status 403" in msg:
+        return True
+    return False
+
 
 async def _openrouter_model_exists(model_id: str, timeout: float = 8.0) -> bool | None:
     """Return True / False if ``model_id`` is in OpenRouter's catalog,
@@ -166,6 +216,7 @@ class AIOrchestrator:
         self._providers: dict[str, AIProvider] = {}
         self._consecutive_ollama_failures: int = 0
         self._current_model_override: str | None = None
+        self._ollama_text_fallback_only: bool = False
         # Provider names that we know are unreachable for the lifetime
         # of this orchestrator (e.g. Ollama daemon not running, but
         # listed in AI_FALLBACK_CHAIN). Excluded from ``_get_active_chain``
@@ -176,10 +227,35 @@ class AIOrchestrator:
             p = _build_provider(name)
             if p:
                 self._providers[name] = p
-        # Best-effort sync reachability probe for Ollama.
+        # Always construct the Ollama provider when reachable, even if
+        # the user didn't add it to AI_FALLBACK_CHAIN. It's used as a
+        # last-resort *text-only* fallback (see ``text_completion``)
+        # so transcript polishing keeps making progress when every
+        # cloud provider in the chain has dropped — e.g. when the
+        # OpenRouter API key hits its global daily-credit limit
+        # mid-job. We do NOT add it to ``active_provider_chain``,
+        # which would also opt it into vision / scene analysis where
+        # local models are dramatically slower than cloud equivalents.
+        if "ollama" not in self._providers:
+            try:
+                if _probe_ollama_reachable():
+                    p = _build_provider("ollama")
+                    if p:
+                        self._providers["ollama"] = p
+                        self._ollama_text_fallback_only = True
+                        logger.info(
+                            "Ollama text-only fallback wired (%s) — "
+                            "used if every chain provider fails for "
+                            "text_completion",
+                            getattr(settings, "OLLAMA_HOST", ""),
+                        )
+            except Exception as e:
+                logger.debug("Ollama reachability probe failed: %s", e)
+        # Best-effort sync reachability probe for Ollama when it WAS
+        # in the user's configured chain.
         # We do NOT probe cloud providers here — their auth check costs
         # money and the orchestrator does proper fallback on first call.
-        if "ollama" in self._providers:
+        if "ollama" in self._providers and not getattr(self, "_ollama_text_fallback_only", False):
             try:
                 if not _probe_ollama_reachable():
                     self._unreachable.add("ollama")
@@ -455,6 +531,24 @@ class AIOrchestrator:
             )
         else:
             logger.debug("Active provider chain: %s", chain_names)
+        return chain
+
+    def _get_active_text_chain(self) -> list[AIProvider]:
+        """Active chain for text-only tasks. Identical to
+        ``_get_active_chain`` but appends the text-only Ollama
+        fallback (if wired) so transcript polishing can continue
+        when every cloud provider has failed.
+        """
+        chain = self._get_active_chain()
+        if getattr(self, "_ollama_text_fallback_only", False):
+            ollama = self._providers.get("ollama")
+            if (
+                ollama is not None
+                and ollama not in chain
+                and "ollama" not in self._unreachable
+                and not self._circuit_breaker.is_degraded("ollama")
+            ):
+                chain.append(ollama)
         return chain
 
     async def _notify_attempt(self, job_id: str, provider, task: str):
@@ -1050,8 +1144,21 @@ class AIOrchestrator:
                 (like transcript polishing) that should not degrade the provider
                 for subsequent critical operations (summary, clip detection).
         """
-        for provider in self._get_active_chain():
+        for provider in self._get_active_text_chain():
             pname = provider.provider_name
+            # Per-job credit-exhaustion short-circuit: once OpenRouter
+            # returns "Key limit exceeded" we know every subsequent
+            # model in their catalog will fail the same way for this
+            # API key. Skip the entire OpenRouter provider for the
+            # remainder of the job instead of retrying its full model
+            # chain on every batch.
+            if pname == "openrouter" and _is_openrouter_credit_exhausted(job_id):
+                logger.info(
+                    "text_completion skipping openrouter for job %s — "
+                    "credit-exhaustion breaker tripped earlier",
+                    job_id,
+                )
+                continue
             model_name = provider.text_model_name
             # Apply model override for Ollama if we've downgraded after failures
             if pname == "ollama" and self._current_model_override:
@@ -1088,6 +1195,8 @@ class AIOrchestrator:
                 await self._notify_fallback(job_id, pname, f"Text completion timed out after {timeout:.0f}s (model={model_name})")
                 continue
             except Exception as e:
+                if pname == "openrouter" and _looks_like_openrouter_credit_403(e):
+                    _trip_openrouter_breaker(job_id, "Key limit exceeded")
                 if not skip_circuit_breaker:
                     self._circuit_breaker.record_failure(pname)
                 logger.warning("text_completion via %s model=%s failed: %s — trying next provider", pname, model_name, e)

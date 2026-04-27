@@ -1683,6 +1683,19 @@ def classify_gameplay_content(
 
     # Signal 3 + 4: dense face stats.
     raw_ratio, verified_ratio = _verified_face_ratio(dense_face_data)
+
+    # Detect whether HumanFaceVerifier actually ran on this data.
+    # Without this guard, un-verified inputs (verified_hits == 0)
+    # look identical to "100% rejected" inputs, and the cartoon-
+    # contamination rule below fires on real human faces. This is
+    # what regressed the Tank vs Tyrese podcast to subject_x=50
+    # across all 105 scenes.
+    verified_ran = any(
+        getattr(face, "is_human_verified", False) is True
+        for f in (dense_face_data or [])
+        for face in (getattr(f, "faces", None) or [])
+    )
+
     if raw_ratio == 0.0 and total_frames > 0:
         # Fallback to the legacy raw count when the verifier
         # wasn't populated on this data (backwards compat).
@@ -1694,8 +1707,10 @@ def classify_gameplay_content(
 
     # Cartoon-contamination check: if the raw rate is high but
     # the verified-human rate is very low, this is TF2-style
-    # content where YuNet is firing on cartoon characters.
-    if raw_ratio >= 0.30 and verified_ratio < 0.15:
+    # content where YuNet is firing on cartoon characters. Only
+    # fires when verification actually ran — otherwise verified=0
+    # means "verifier didn't run", not "100% non-human".
+    if verified_ran and raw_ratio >= 0.30 and verified_ratio < 0.15:
         logger.info(
             "Gameplay classification: dense raw_ratio=%.2f but "
             "verified_ratio=%.2f (%.0f%% non-human rejection) — "
@@ -1704,6 +1719,13 @@ def classify_gameplay_content(
             (1.0 - verified_ratio / max(raw_ratio, 1e-6)) * 100.0,
         )
         return "gameplay"
+    elif raw_ratio >= 0.30 and verified_ratio < 0.15:
+        logger.debug(
+            "Gameplay classification: skipped cartoon-contamination "
+            "check (raw=%.2f, verified=%.2f) — verifier did not run "
+            "on this data",
+            raw_ratio, verified_ratio,
+        )
 
     if raw_ratio > 0.30:
         return "not_gameplay"

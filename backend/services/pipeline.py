@@ -490,13 +490,33 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
             await database.update_job_status(job_id, transcript=list(polished))
             transcript = polished  # Use polished version for translation below
 
+            # If OpenRouter ran out of credits mid-polish the breaker
+            # tripped and remaining batches were either skipped or
+            # served by Ollama. Surface that as ``degraded`` so the
+            # frontend can show a partial-polish indicator instead of
+            # a misleading "complete" badge.
+            from backend.services.ai_orchestrator import (
+                _is_openrouter_credit_exhausted,
+            )
+            if _is_openrouter_credit_exhausted(job_id):
+                final_status = "degraded"
+                final_message = (
+                    "Transcript partially polished — OpenRouter "
+                    "credit limit reached"
+                )
+            else:
+                final_status = "complete"
+                final_message = "Transcript polished"
             await broadcast_ws(job_id, {
                 "type": "background_task",
                 "task": "transcript_polishing",
-                "status": "complete",
-                "message": "Transcript polished",
+                "status": final_status,
+                "message": final_message,
             })
-            logger.info("[%s] Background transcript polishing complete", job_id)
+            logger.info(
+                "[%s] Background transcript polishing %s",
+                job_id, final_status,
+            )
         except Exception as e:
             logger.warning("[%s] Background transcript polishing failed: %s", job_id, e)
             await broadcast_ws(job_id, {
@@ -1417,8 +1437,17 @@ async def _run_analysis_inner(job_id: str):
                     str(f.path) for f in frames[:30]
                 ] if frames else []
                 _early_filename = getattr(job, "filename", None) or ""
+                # Pass an EMPTY list for the dense slot. The early
+                # pre-detect runs before the dense+verifier pass, so
+                # ``face_results`` here is sparse-only data with no
+                # ``is_human_verified`` annotations. Feeding it into
+                # the dense slot would let Signal 3 (cartoon
+                # contamination) fire on un-verified data because
+                # ``verified_ratio == 0`` is indistinguishable from
+                # "100% non-human rejection" — the exact bug that
+                # branded the Tank vs Tyrese podcast as gameplay.
                 _early_result = _early_cgc(
-                    face_results or [],  # dense slot unused on sparse path
+                    [],
                     len(face_results or []),
                     _early_sample_paths,
                     sparse_face_data=face_results or [],

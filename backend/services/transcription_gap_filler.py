@@ -470,12 +470,23 @@ def fill_transcript_gaps_sync(
 
     stats.gaps_attempted = len(to_fill)
 
-    # 4. Lazy-load the existing Whisper singleton.
+    # 4. Resolve the slice transcriber. The gap-filler used to inherit
+    #    the in-process Whisper singleton via ``_get_whisper_model``,
+    #    but right after the main transcription subprocess exits that
+    #    singleton is either uninitialised or stale, and reloading it
+    #    re-attempts CUDA against an Ollama-occupied / passthrough-
+    #    missing GPU on every single gap. The subprocess path gives
+    #    fresh CUDA-context isolation per slice (or falls back to CPU
+    #    cleanly if GPU is unavailable) without polluting this thread.
     try:
-        from backend.services.transcription import _get_whisper_model
-        model = _get_whisper_model()
+        from backend.services.transcription import (
+            transcribe_audio_slice_subprocess,
+        )
     except Exception as e:
-        logger.warning("gap_filler: could not load Whisper model (%s) — skipping", e)
+        logger.warning(
+            "gap_filler: subprocess slice helper unavailable (%s) — skipping",
+            e,
+        )
         stats.skipped_reason = "model_unavailable"
         stats.coverage_after = stats.coverage_before
         stats.elapsed_sec = time.monotonic() - wall_start
@@ -483,28 +494,9 @@ def fill_transcript_gaps_sync(
 
     added_segments: list[TranscriptSegment] = []
 
-    # 5. Recall-first kwargs. Note: NO temperature fallback, NO previous-text
-    #    conditioning, NO VAD filter (we already trust the outer VAD).
-    recall_kwargs = {
-        "task": task,
-        "beam_size": 5,
-        "best_of": 1,
-        "vad_filter": False,                      # outer VAD already positive
-        "condition_on_previous_text": False,      # prevent echo hallucinations
-        "word_timestamps": True,
-        "no_speech_threshold": 0.2,               # aggressive — trust VAD
-        "log_prob_threshold": -1.5,
-        "compression_ratio_threshold": 3.0 if is_animated else 2.6,
-        "repetition_penalty": 1.1,
-        "no_repeat_ngram_size": 3,
-        "temperature": [0.0],                     # no fallback → no hallucination chain
-    }
-    if language:
-        recall_kwargs["language"] = language
-    if initial_prompt:
-        recall_kwargs["initial_prompt"] = initial_prompt
-
-    # 6. For each gap: slice → transcribe → shift timestamps → filter → append.
+    # 5. For each gap: slice → transcribe (subprocess) → shift
+    #    timestamps → filter → append. Recall-first knobs are baked
+    #    into ``transcribe_audio_slice_subprocess``.
     for gs, ge, voiced in to_fill:
         per_gap: dict = {
             "gap_start": round(gs, 2),
@@ -528,43 +520,46 @@ def fill_transcript_gaps_sync(
                     pass
                 continue
             try:
-                segments_iter, info = model.transcribe(slice_path, **recall_kwargs)
+                slice_dur = max(15.0, (ge - gs) * 4.0 + 30.0)
+                segments_raw = transcribe_audio_slice_subprocess(
+                    slice_path,
+                    language=language,
+                    task=task,
+                    initial_prompt=initial_prompt,
+                    timeout=slice_dur,
+                    is_animated=is_animated,
+                )
                 collected = []
-                for seg in segments_iter:
-                    text = (seg.text or "").strip()
+                for seg in segments_raw:
+                    text = (seg.get("text") or "").strip()
                     if _is_hallucinated_fill(text):
                         continue
 
-                    avg_lp = getattr(seg, "avg_logprob", -1.0) or -1.0
-                    no_speech = getattr(seg, "no_speech_prob", 0.0) or 0.0
+                    avg_lp = float(seg.get("avg_logprob") or -1.0)
+                    no_speech = float(seg.get("no_speech_prob") or 0.0)
                     confidence = max(0.0, min(1.0, 1.0 + avg_lp))
-                    # Additional penalty for high no_speech on the slice —
-                    # note: threshold in recall_kwargs is 0.2, but we still
-                    # want to reject segments that Whisper itself thought
-                    # were almost certainly silence.
                     if no_speech > 0.85:
                         continue
                     if confidence < _MIN_FILL_CONFIDENCE:
                         continue
 
                     words = None
-                    if getattr(seg, "words", None):
+                    raw_words = seg.get("words") or []
+                    if raw_words:
                         words = []
-                        for w in seg.words:
-                            if not w.word:
-                                continue
-                            wt = w.word.strip()
+                        for w in raw_words:
+                            wt = (w.get("word") or "").strip()
                             if not wt:
                                 continue
                             words.append(WordTimestamp(
-                                start=round(float(w.start) + gs, 3),
-                                end=round(float(w.end) + gs, 3),
+                                start=round(float(w["start"]) + gs, 3),
+                                end=round(float(w["end"]) + gs, 3),
                                 word=wt,
                             ))
 
                     collected.append(TranscriptSegment(
-                        start=round(float(seg.start) + gs, 2),
-                        end=round(float(seg.end) + gs, 2),
+                        start=round(float(seg["start"]) + gs, 2),
+                        end=round(float(seg["end"]) + gs, 2),
                         text=text,
                         speaker="Speaker ?",  # deferred; diarization assigns later
                         words=words,
