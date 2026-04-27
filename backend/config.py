@@ -132,24 +132,25 @@ class Settings(BaseSettings):
     CLIPAI_CAMERA_SOLVER: str = "on"  # "on" | "off" — env CLIPAI_CAMERA_SOLVER
 
     # ── 2026 SOTA reframing pipeline flags (Phases A–E) ──────────────
-    # Phase A — SAMURAI subject tracking (SAM 2.1 + motion-aware memory).
-    # Values: ``samurai`` | ``opencv`` | ``auto`` (default). ``auto``
-    # picks SAMURAI when CUDA is visible, OpenCV otherwise.
+    # All flags are ON by default after Phase E. Set CLIPAI_LEGACY_REFRAME=1
+    # for one-release emergency rollback to the pre-SOTA pipeline.
+    #
+    # Phase A — SAMURAI subject tracking. Values: ``samurai`` |
+    # ``opencv`` | ``auto``. ``auto`` picks SAMURAI when CUDA is
+    # visible, OpenCV otherwise.
     CLIPAI_TRACKER_BACKEND: str = "auto"
-    # Phase B — CoTracker3 dense point trajectories. Default OFF until
-    # Phase-B bench is green; flipped ON in Phase E.
-    CLIPAI_DENSE_POINT_TRACKING: bool = False
+    # Phase B — CoTracker3 dense point trajectories. ON.
+    CLIPAI_DENSE_POINT_TRACKING: bool = True
     # Phase C — TASED-Net AV saliency + PaddleOCR text-region
-    # exclusions. Default OFF; flipped ON in Phase E.
-    CLIPAI_SALIENCY_ENABLED: bool = False
+    # exclusions. ON.
+    CLIPAI_SALIENCY_ENABLED: bool = True
     # Phase D — CLIP-based composition head. Values: ``clip`` |
-    # ``legacy`` | ``none``. Default ``legacy`` until Phase E.
-    CLIPAI_COMPOSITION_HEAD: str = "legacy"
-    # Phase E — global editorial planner (single LLM call per clip).
-    # Default OFF until Phase E lands.
-    CLIPAI_EDITORIAL_PLANNER: bool = False
+    # ``legacy`` | ``none``. Defaults to ``clip``.
+    CLIPAI_COMPOSITION_HEAD: str = "clip"
+    # Phase E — global editorial planner (single LLM call per clip). ON.
+    CLIPAI_EDITORIAL_PLANNER: bool = True
     # Emergency rollback — forces the legacy ``reframe_segmenter`` path
-    # for one release after Phase E flips the defaults.
+    # for one release after Phase E flipped the defaults. Default OFF.
     CLIPAI_LEGACY_REFRAME: bool = False
 
     # Content-type routing for solver tuning (off by default until tested)

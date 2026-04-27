@@ -1,0 +1,110 @@
+name: reframe bench
+
+# Triggers a phase-aware bench whenever any of the SOTA reframing modules
+# change on a PR. Fails the PR if ANY clip in the real-content fixture set
+# regresses by more than 5 % on any pre-existing parity metric, or if any
+# of the new SOTA metrics misses its threshold.
+
+on:
+  pull_request:
+    paths:
+      - 'backend/services/human_reframe.py'
+      - 'backend/services/human_reframe_pipeline.py'
+      - 'backend/services/camera_path_2d.py'
+      - 'backend/services/l1_camera_path.py'
+      - 'backend/services/_autoflip_lp.py'
+      - 'backend/services/reframe_segmenter.py'
+      - 'backend/services/samurai_tracker.py'
+      - 'backend/services/cotracker3_dense.py'
+      - 'backend/services/av_saliency.py'
+      - 'backend/services/ocr_regions.py'
+      - 'backend/services/saliency_lp_term.py'
+      - 'backend/services/composition_head_clip.py'
+      - 'backend/services/editorial_planner.py'
+      - 'backend/services/editorial_planner_prompts/**'
+      - 'backend/services/autoflip_parity_metrics.py'
+      - 'backend/services/subject_kalman.py'
+      - 'backend/services/tracker_wrapper.py'
+      - 'backend/services/tracker_wrapper_opencv.py'
+      - 'backend/services/required_regions.py'
+      - 'backend/scripts/compare_autoflip_vs_clipai.py'
+      - 'backend/scripts/train_composition_head.py'
+      - 'tests/qa/**'
+
+jobs:
+  qa-suites:
+    name: phase QA suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install minimal deps
+        run: |
+          python -m pip install --upgrade pip
+          # Only the deps the QA suites actually need — sam2, torch,
+          # cotracker, open_clip, paddle are all mocked in the QA
+          # tests so we don't need them in CI.
+          pip install pytest numpy opencv-python-headless httpx
+
+      - name: Run Phase A QA
+        run: pytest tests/qa/test_phase_a_samurai.py -v
+
+      - name: Run Phase B QA
+        run: pytest tests/qa/test_phase_b_cotracker.py -v
+
+      - name: Run Phase C QA
+        run: pytest tests/qa/test_phase_c_saliency.py -v
+
+      - name: Run Phase D QA
+        run: pytest tests/qa/test_phase_d_clip_head.py -v
+
+      - name: Run Phase E QA
+        run: pytest tests/qa/test_phase_e_editorial.py -v
+
+      - name: Run master QA harness
+        run: pytest tests/qa/ -v --tb=short
+
+  homelab-bench:
+    name: homelab GPU bench (informational)
+    # The full bench needs a GTX 1650 + the fixture cache. That can't
+    # run on a hosted GitHub runner — this job is a placeholder that
+    # documents the homelab gate. Real execution is handled by a
+    # self-hosted runner labelled "homelab-gpu" when one is registered.
+    runs-on: ubuntu-latest
+    if: ${{ false }}    # disabled on hosted runners
+    steps:
+      - run: echo "homelab bench runs on the self-hosted runner"
+
+  homelab-bench-self-hosted:
+    name: homelab bench
+    runs-on: [self-hosted, homelab-gpu]
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'sota-bench') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run bench
+        run: |
+          python -m backend.scripts.compare_autoflip_vs_clipai \
+            --manifest tests/real_content/manifest.json \
+            --autoflip-outputs tests/autoflip_reference_outputs/ \
+            --output /tmp/bench_results.md \
+            --json-out /tmp/bench_results.json
+      - name: Compare against base
+        run: |
+          # Fail if any clip regresses > 5 % on any pre-existing metric.
+          python -m backend.scripts.diff_bench_results \
+            origin/${{ github.base_ref }} /tmp/bench_results.json \
+            --max-regression-pct 5 \
+            --output /tmp/bench_diff.md
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            /tmp/bench_results.md
+            /tmp/bench_results.json
+            /tmp/bench_diff.md

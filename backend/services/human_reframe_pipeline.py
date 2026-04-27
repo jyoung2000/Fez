@@ -44,15 +44,27 @@ logger = logging.getLogger(__name__)
 # ── Allowlist ────────────────────────────────────────────────────
 #
 # Content types the human-reframe path is cleared for in production.
-# Bench evidence (2026-04-23 + 2026-04-24):
-#   * multi_speaker_panel — panel_breakfast_club_10s scored within
-#     spec on every axis; panel_joebudden_10s within spec on all but
-#     jitter.
-#   * talking_head — synthetic talking-head fixture passes every
-#     axis after the head_rate=1.0 false-positive fix.
+#
+# Phase E (2026-SOTA rollout): the allowlist now covers every
+# content type because the editorial planner (Phase E) provides a
+# per-genre playbook that drives the LP solver from a single LLM
+# call. The previous gate (multi_speaker_panel + talking_head only)
+# was needed when the only "genre intelligence" was the per-content-
+# type code in genre_refinements.py — that limitation no longer
+# applies. See docs/sota_reframe_rollout.md for the migration ADR.
+#
+# Emergency rollback: set CLIPAI_LEGACY_REFRAME=1 to force the
+# legacy reframe_segmenter path for one release.
 HUMAN_REFRAME_ALLOWED_CONTENT_TYPES: frozenset[str] = frozenset({
-    "multi_speaker_panel",
-    "talking_head",
+    "multi_speaker_panel", "talking_head",
+    "podcast", "vlog", "interview",
+    "narrative", "documentary", "cinematic_dialogue",
+    "music_video", "concert", "performance",
+    "sports", "sports_basketball", "sports_racing",
+    "gaming", "gameplay",
+    "anime", "animation", "animation_dialogue",
+    "tutorial",
+    "debate",
 })
 
 
