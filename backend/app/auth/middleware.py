@@ -68,6 +68,13 @@ _PUBLIC_EXACT = {
 # below in ``dispatch`` and re-enter the auth flow.
 _PUBLIC_GET_EXACT = {
     "/api/site-config",
+    # Read-only deploy-verification probe for the 2026 SOTA reframing
+    # validation. Returns paths + boolean flags, no secrets, no
+    # subprocess on the success path. Public so the verify script
+    # (run from the Unraid host outside the browser session) can
+    # confirm the image was built correctly. Mutating bench endpoints
+    # stay auth-protected.
+    "/api/diagnostics/sota-bench-status",
 }
 
 _PUBLIC_PREFIXES = (
