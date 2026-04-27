@@ -1619,6 +1619,18 @@ async def run_sota_bench(request: Request):
                     pass
 
     async def event_stream() -> AsyncGenerator[str, None]:
+        # Yield an immediate "connected" sentinel BEFORE doing anything
+        # risky. This guarantees the client sees at least one chunk so
+        # ERR_INCOMPLETE_CHUNKED_ENCODING is never a generic mystery —
+        # if the next event is an error, the operator sees it in the
+        # log panel.
+        yield _sse_event("log", {
+            "line": (
+                f"[sota-bench] connected; repo_root={repo_root!r} "
+                f"qa_runner={qa_runner_path!r} "
+                f"qa_runner_exists={os.path.exists(qa_runner_path)}"
+            ),
+        })
         try:
             async for evt in _do_stream():
                 yield evt
@@ -1626,8 +1638,11 @@ async def run_sota_bench(request: Request):
             # Any uncaught error becomes a visible SSE event rather
             # than a torn chunked-encoding stream that the browser
             # surfaces as ``ERR_INCOMPLETE_CHUNKED_ENCODING``.
+            import traceback
+            tb = traceback.format_exc()
             logger.exception("[sota-bench] event_stream crashed: %s", exc)
-            yield _sse_event("log", {"line": f"!! event_stream error: {exc}"})
+            for tline in tb.splitlines():
+                yield _sse_event("log", {"line": f"!! {tline}"})
             yield _sse_event("complete", {
                 "ok": False,
                 "stage": "event_stream",
