@@ -122,54 +122,65 @@ def _check_modules_present(modules: list[str]) -> dict:
     return out
 
 
+def _p(*args, **kwargs) -> None:
+    """``print`` with ``flush=True`` so output streams through pipes.
+
+    The diagnostics SSE endpoint reads our stdout line-by-line; without
+    flush, prints sit in a 4 KB buffer and the GUI looks frozen.
+    """
+    kwargs.setdefault("flush", True)
+    print(*args, **kwargs)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--json-out", default=None)
     args = parser.parse_args()
 
-    print("=" * 78)
-    print("ClipAI 2026 SOTA Reframing — Master QA Harness")
-    print("=" * 78)
-    print()
+    _p("=" * 78)
+    _p("ClipAI 2026 SOTA Reframing - Master QA Harness")
+    _p("=" * 78)
+    _p()
 
     results = []
     overall_pass = True
     for p in PHASES:
-        print(f"Phase {p['phase']}: {p['name']}")
-        print("-" * 78)
+        _p(f"Phase {p['phase']}: {p['name']}")
+        _p("-" * 78)
 
         # 1. Module presence
         modcheck = _check_modules_present(p["modules"])
         if modcheck["missing"]:
-            print(f"  modules MISSING: {modcheck['missing']}")
+            _p(f"  modules MISSING: {modcheck['missing']}")
             overall_pass = False
             results.append({
                 "phase": p["phase"], "ok": False,
                 "reason": "missing_modules",
                 "modules_missing": modcheck["missing"],
             })
-            print()
+            _p()
             continue
-        print(f"  modules: {len(modcheck['present'])} present")
+        _p(f"  modules: {len(modcheck['present'])} present")
 
         # 2. Run pytest. We require failed == 0 and that
-        # passed + skipped meets the suite's expected size — skips are
+        # passed + skipped meets the suite's expected size - skips are
         # legitimate when a test depends on an optional sandbox dep
         # (e.g. pydantic_settings). The homelab gate covers the
         # skipped-here cases against the real environment.
+        _p(f"  running {p['suite']} ...")
         r = _run_pytest(p["suite"])
         run_total = r["passed"] + r["skipped"]
         ok = r["exit_code"] == 0 and r["failed"] == 0 and run_total >= p["min_tests"]
         if not ok:
             overall_pass = False
         status = "PASS" if ok else "FAIL"
-        print(
+        _p(
             f"  suite: {r['summary_line']}  ({r['elapsed_sec']}s)   [{status}]"
         )
         if r["failed"] > 0:
-            print(f"  >>> {r['failed']} test(s) FAILED — see {p['suite']}")
+            _p(f"  >>> {r['failed']} test(s) FAILED - see {p['suite']}")
         if run_total < p["min_tests"]:
-            print(
+            _p(
                 f"  >>> only {run_total}/{p['min_tests']} expected tests "
                 f"ran (passed={r['passed']} skipped={r['skipped']})"
             )
@@ -182,26 +193,26 @@ def main() -> int:
             "min_tests": p["min_tests"],
             "elapsed_sec": r["elapsed_sec"],
         })
-        print()
+        _p()
 
-    print("=" * 78)
+    _p("=" * 78)
     if overall_pass:
-        print("OVERALL: PASS — all five phase QA suites green.")
-        print()
-        print("Next step: run the homelab bench against the fixture set.")
-        print("           See tests/qa/MASTER_QA_HARNESS.md for the procedure.")
+        _p("OVERALL: PASS - all five phase QA suites green.")
+        _p()
+        _p("Next step: run the homelab bench against the fixture set.")
+        _p("           See tests/qa/MASTER_QA_HARNESS.md for the procedure.")
     else:
-        print("OVERALL: FAIL — at least one phase regressed.")
-        print()
-        print("Do NOT push. Read the failures above and fix the offending phase.")
-    print("=" * 78)
+        _p("OVERALL: FAIL - at least one phase regressed.")
+        _p()
+        _p("Do NOT push. Read the failures above and fix the offending phase.")
+    _p("=" * 78)
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps({
             "ok": overall_pass,
             "phases": results,
         }, indent=2))
-        print(f"\nWrote JSON report to {args.json_out}")
+        _p(f"\nWrote JSON report to {args.json_out}")
 
     return 0 if overall_pass else 1
 

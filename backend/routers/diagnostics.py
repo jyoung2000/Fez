@@ -1568,19 +1568,42 @@ async def run_sota_bench(request: Request):
         cmd: list[str], *, env: dict | None = None,
     ) -> AsyncGenerator[str, None]:
         """Run a subprocess and yield each stdout line as an SSE log event."""
+        # Force-unbuffered Python so the child's stdout reaches us
+        # line-by-line. Without this the child's prints sit in a 4 KB
+        # buffer and the SSE connection looks frozen — the browser /
+        # reverse proxy gives up after ~30 s with a network error.
+        sub_env = {
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+            **(env or {}),
+        }
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=repo_root,
-            env={**os.environ, **(env or {})},
+            env=sub_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
         try:
             assert proc.stdout is not None
+            last_emit = time.monotonic()
             while True:
-                line = await proc.stdout.readline()
+                # readline times out gracefully; emit a heartbeat every
+                # ~5 s so the connection stays alive even when the
+                # subprocess is silent (e.g. waiting for a slow model
+                # download or a long pytest collection).
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    yield _sse_event("heartbeat", {
+                        "elapsed_sec": round(time.monotonic() - last_emit, 1),
+                    })
+                    continue
                 if not line:
                     break
+                last_emit = time.monotonic()
                 yield _sse_event("log", {"line": line.decode(errors="replace").rstrip()})
             await proc.wait()
             yield _sse_event("exit_code", {"code": proc.returncode})
@@ -1599,7 +1622,7 @@ async def run_sota_bench(request: Request):
         })
         qa_failed = False
         async for evt in _stream_subprocess(
-            ["python", "-m", "tests.qa.run_all_phases"],
+            ["python", "-u", "-m", "tests.qa.run_all_phases"],
         ):
             yield evt
             try:
@@ -1646,7 +1669,7 @@ async def run_sota_bench(request: Request):
         }
         bench_failed = False
         bench_cmd = [
-            "python", "-m", "backend.scripts.compare_autoflip_vs_clipai",
+            "python", "-u", "-m", "backend.scripts.compare_autoflip_vs_clipai",
             "--manifest", manifest,
             "--output", "/tmp/sota_bench_results.md",
             "--json-out", "/tmp/sota_bench_results.json",

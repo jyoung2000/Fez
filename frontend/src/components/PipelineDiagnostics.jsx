@@ -424,10 +424,6 @@ export default function PipelineDiagnostics() {
                 ...prev,
                 { phase: evt.data.phase, label: evt.data.label, status: 'running' },
               ]);
-              setSotaLogs((prev) => [
-                ...prev,
-                { kind: 'phase', text: `▶ ${evt.data.label}` },
-              ]);
             } else if (evt.type === 'phase_result') {
               setSotaPhases((prev) =>
                 prev.map((p) =>
@@ -439,8 +435,10 @@ export default function PipelineDiagnostics() {
             } else if (evt.type === 'exit_code') {
               setSotaLogs((prev) => [
                 ...prev,
-                { kind: 'meta', text: `→ process exited with code ${evt.data.code}` },
+                { kind: 'meta', text: `(process exited with code ${evt.data.code})` },
               ]);
+            } else if (evt.type === 'heartbeat') {
+              // Keep the connection alive; do not surface to user.
             } else if (evt.type === 'complete') {
               setSotaResult(evt.data);
             }
@@ -550,16 +548,16 @@ export default function PipelineDiagnostics() {
         )}
       </div>
 
-      {/* \u2500\u2500 2026 SOTA Reframing \u2014 1-click QA + bench runner \u2500\u2500\u2500\u2500\u2500 */}
+      {/* SOTA Reframing 2026 \u2014 1-click QA + bench runner */}
       <div style={{ ...cardStyle, marginTop: 12 }}>
         <div style={{
           fontSize: 12, fontWeight: 600, color: 'var(--text-primary)',
           marginBottom: 4,
         }}>
-          2026 SOTA Reframing \u2014 Validate
+          2026 SOTA Reframing - Validate
         </div>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
-          Runs the local Phase A\u2013E QA harness (101 mocked unit tests) and then the
+          Runs the local Phase A-E QA harness (101 mocked unit tests) and then the
           real-content fixture bench with every SOTA flag (SAMURAI tracking,
           CoTracker3 dense, AV saliency, CLIP composition head, editorial planner)
           turned ON. The QA stage is fast (~5 s); the bench stage needs the GPU
