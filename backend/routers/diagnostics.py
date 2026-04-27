@@ -1834,6 +1834,25 @@ async def sota_bench_status():
     except Exception as exc:
         sub_err = f"subprocess plumbing failed: {exc!r}"
 
+    # ``shutil.which("pytest")`` returns None when the pytest binary
+    # script is not on PATH — but in our container pytest is invoked
+    # via ``python -m pytest``, so the binary isn't required. Probe
+    # by importing the module instead.
+    pytest_available = False
+    pytest_version = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pytest", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        pytest_available = proc.returncode == 0
+        if pytest_available:
+            pytest_version = out.decode(errors="replace").strip().splitlines()[-1]
+    except Exception:
+        pass
+
     # Try to import the harness module to see if the path works.
     import_ok = False
     import_err = ""
@@ -1856,6 +1875,7 @@ async def sota_bench_status():
     return {
         "ok": all([
             os.path.exists(qa_runner), sub_ok, import_ok, len(suite_files) >= 5,
+            pytest_available,
         ]),
         "repo_root": repo_root,
         "qa_runner_path": qa_runner,
@@ -1863,7 +1883,9 @@ async def sota_bench_status():
         "qa_dir_exists": os.path.isdir(qa_dir),
         "suite_files": suite_files,
         "python": sys.executable,
-        "pytest_available": shutil.which("pytest") is not None,
+        "pytest_available": pytest_available,
+        "pytest_version": pytest_version,
+        "pytest_binary_on_path": shutil.which("pytest") is not None,
         "subprocess_plumbing": {
             "ok": sub_ok, "stdout": sub_stdout, "stderr": sub_err,
         },

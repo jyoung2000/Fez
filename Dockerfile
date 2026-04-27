@@ -156,6 +156,10 @@ COPY tests/qa/ ./tests/qa/
 # Make ``tests`` importable as a top-level package (the QA runner uses
 # ``python -m tests.qa.run_all_phases``).
 RUN touch ./tests/__init__.py
+# Operator helper scripts (verify_sota_bench.sh etc) so they can be
+# invoked via `docker compose exec app bash scripts/<name>.sh`.
+COPY scripts/ ./scripts/
+RUN chmod +x ./scripts/*.sh 2>/dev/null || true
 
 # Copy built frontend from stage 1
 COPY --from=frontend-build /app/frontend/dist ./static
