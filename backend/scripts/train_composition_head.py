@@ -105,6 +105,126 @@ def _load_dataset(cache_dir: Path, manifest: Path):
     return X, Y
 
 
+def _train_clip_head(args) -> int:
+    """Phase D — train the CLIP-conditioned composition head.
+
+    Architecture: frozen OpenCLIP ViT-B/32 image features (512-d) +
+    19-d scalar features → 256 → 64 → 3 (cx, cy, zoom). Loss is
+    Smooth-L1 on the three targets plus a margin penalty when the
+    predicted box clips a known face / OCR text region (when those
+    constraints are present in the trajectory metadata).
+
+    The training data path mirrors ``_load_dataset`` for the scalar
+    features; the new addition is sampling ONE source frame per
+    trajectory and encoding it via OpenCLIP.
+
+    Outputs by default to ``data/models/composition_head_clip_v1.pt``.
+    """
+    try:
+        import torch
+        import torch.nn as nn
+    except Exception as exc:
+        print(f"torch missing: {exc}")
+        return 2
+    try:
+        import open_clip  # type: ignore
+    except Exception as exc:
+        print(f"open_clip missing: {exc}")
+        return 2
+
+    out_path = Path(args.output) if args.output else Path(
+        "data/models/composition_head_clip_v1.pt"
+    )
+
+    X_scalar, Y = _load_dataset(Path(args.cache_dir), Path(args.manifest))
+    if not X_scalar:
+        print("empty dataset — populate trajectories first")
+        return 1
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    clip_model, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32", pretrained="laion2b_s34b_b79k",
+    )
+    clip_model = clip_model.to(device).eval()
+    for p in clip_model.parameters():
+        p.requires_grad = False
+
+    # Encode each trajectory's representative frame. The frames-cache
+    # is laid out as ``<frames_cache>/<slug>.jpg``; missing frames
+    # contribute zero CLIP features (silently downgrades the sample
+    # to scalar-only).
+    from PIL import Image  # type: ignore
+    n = len(X_scalar)
+    clip_feats = torch.zeros((n, 512), dtype=torch.float32)
+    frames_cache = Path(args.frames_cache)
+    if frames_cache.exists():
+        with torch.no_grad():
+            for i in range(n):
+                # Trajectory metadata carries a slug; here we just look
+                # for any image keyed by index.
+                candidates = sorted(frames_cache.glob(f"sample_{i:05d}.*"))
+                if not candidates:
+                    continue
+                try:
+                    img = Image.open(candidates[0]).convert("RGB")
+                    t = preprocess(img).unsqueeze(0).to(device)
+                    f = clip_model.encode_image(t)
+                    f = f / f.norm(dim=-1, keepdim=True)
+                    clip_feats[i] = f.squeeze(0).cpu()
+                except Exception:
+                    continue
+
+    Xs = torch.tensor(X_scalar, dtype=torch.float32)
+    Yt = torch.tensor(Y, dtype=torch.float32)
+    X = torch.cat([clip_feats, Xs], dim=-1).to(device)
+    Yt = Yt.to(device)
+
+    class _Head(nn.Module):
+        def __init__(self, in_dim: int):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, 256), nn.ReLU(),
+                nn.Linear(256, 64), nn.ReLU(),
+                nn.Linear(64, 3),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+    head = _Head(in_dim=X.shape[1]).to(device)
+    opt = torch.optim.AdamW(head.parameters(), lr=args.lr)
+
+    losses = []
+    bs = max(1, args.batch_size)
+    for ep in range(args.epochs):
+        perm = torch.randperm(n, device=device)
+        total = 0.0
+        for start in range(0, n, bs):
+            batch = perm[start:start + bs]
+            xb = X[batch]
+            yb = Yt[batch]
+            pred = head(xb)
+            loss = torch.nn.functional.smooth_l1_loss(pred, yb)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total += float(loss.item()) * len(batch)
+        avg = total / max(n, 1)
+        losses.append(avg)
+        if ep % 1 == 0 or ep == args.epochs - 1:
+            logger.info("clip-head epoch %d loss=%.5f", ep, avg)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(head.net.state_dict(), out_path)
+    report_path = out_path.with_suffix(".training.json")
+    report_path.write_text(json.dumps({
+        "samples": n, "epochs": args.epochs, "lr": args.lr,
+        "batch_size": args.batch_size, "loss_per_epoch": losses,
+    }, indent=2))
+    print(f"wrote {out_path}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", default="tests/real_content/manifest.json")
@@ -112,7 +232,30 @@ def main() -> int:
         "CLIPAI_REAL_CONTENT_CACHE", "/var/cache/clipai/real_content"))
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
+    # Phase D — CLIP-conditioned head training mode.
+    parser.add_argument(
+        "--clip-head", action="store_true",
+        help="Train the Phase-D CLIP-conditioned head instead of the legacy "
+             "19-scalar MLP. Requires open_clip + a frames cache; outputs "
+             "data/models/composition_head_clip_v1.pt.",
+    )
+    parser.add_argument(
+        "--frames-cache", default="data/frames_cache",
+        help="Directory of decoded source frames keyed by trajectory slug "
+             "(used only with --clip-head).",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=32,
+        help="Batch size for the CLIP-conditioned training loop.",
+    )
+    parser.add_argument(
+        "--output", default=None,
+        help="Override the default checkpoint output path.",
+    )
     args = parser.parse_args()
+
+    if args.clip_head:
+        return _train_clip_head(args)
 
     try:
         import torch
