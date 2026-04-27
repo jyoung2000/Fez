@@ -33,6 +33,8 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
+
 from backend.services._autoflip_lp import solve_autoflip_lp_2d
 from backend.services.reframe_config import ReframeConfig, get_default_config
 
@@ -363,6 +365,7 @@ def solve_2d_camera_path(
     config: Optional[ReframeConfig] = None,
     predictor: "Optional[object]" = None,
     primary_slot_by_t: Optional[dict] = None,
+    camera_motion: "Optional[np.ndarray]" = None,
 ) -> CameraPath2D:
     """Solve a 2-D camera path for a segment of ``faces_by_frame``.
 
@@ -408,6 +411,20 @@ def solve_2d_camera_path(
                                    crop_w_frac=crop_w_frac, config=config)
     ty, loy, hiy = _build_y_bounds(faces_by_frame,
                                    crop_h_frac=crop_h_frac, config=config)
+
+    # Phase B: subtract source-camera motion from targets BEFORE the
+    # smoothness LP scores them. ``camera_motion`` is the cumulative
+    # translation in source-frame coordinates (pixels) per frame; we
+    # convert to fractional units and add to each target so that "hold
+    # steady" actually holds steady when the source camera is panning.
+    if camera_motion is not None and len(camera_motion) == n:
+        cm_arr = np.asarray(camera_motion, dtype=float).reshape(-1, 2)
+        # Convert pixels → fractional source-frame coords.
+        cm_x_frac = cm_arr[:, 0] / max(float(source_w), 1.0)
+        cm_y_frac = cm_arr[:, 1] / max(float(source_h), 1.0)
+        for i in range(n):
+            tx[i] = max(lox[i], min(hix[i], tx[i] - float(cm_x_frac[i])))
+            ty[i] = max(loy[i], min(hiy[i], ty[i] - float(cm_y_frac[i])))
 
     # Fix 3.4: blend Kalman-predicted targets with raw targets so the
     # camera leads rather than reacts. Gated by uncertainty so a

@@ -178,6 +178,34 @@ class KalmanSubject:
         self.P = (I - K @ H) @ P_pred
         self.last_t = t
 
+    def observe_dense(
+        self,
+        t: float,
+        dense_points: "np.ndarray",
+        visibility: "Optional[np.ndarray]" = None,
+        *,
+        source: str = "cotracker3",
+    ) -> bool:
+        """Phase B: consume dense per-subject keypoints as one observation.
+
+        Uses a Huber-weighted median over the visible points (drops the
+        20 % lowest-visibility points first). Returns ``True`` when an
+        observation was applied, ``False`` when too few points survived
+        (caller should fall back to bbox center).
+        """
+        try:
+            from backend.services.cotracker3_dense import (
+                kalman_observation_from_dense,
+            )
+        except ImportError:
+            return False
+        obs = kalman_observation_from_dense(dense_points, visibility)
+        if obs is None:
+            return False
+        cx, cy = obs
+        self.observe(t, cx, cy, source=source)
+        return True
+
     def predict(self, t: float) -> tuple[float, float, float]:
         """Predict state at time ``t``.
 
