@@ -44,8 +44,15 @@ def _build_x_expression(segments: list[dict], src_w: int, crop_w: int) -> str:
     centred on that x, clamped so the crop window stays inside the
     source frame.
 
-    The output is a nested if() expression of the form:
-        if(lt(t,e1), x1, if(lt(t,e2), x2, ... last_x))
+    The output is a FLAT SUM of ``x_i * between(t, start_i, end_i)``
+    terms. Since segments don't overlap, exactly one between() returns
+    1 at any given t and the rest return 0, so the sum equals the
+    correct x for that time.
+
+    The previous implementation nested if(lt(t, end), x, ...) and hit
+    ffmpeg's expression-parser depth limit (around 96 levels) on long
+    clips with many segments. The flat sum has no recursion depth so
+    it scales to thousands of segments cleanly.
     """
     if not segments:
         # Centre crop fallback when segments are missing.
@@ -58,19 +65,24 @@ def _build_x_expression(segments: list[dict], src_w: int, crop_w: int) -> str:
         clamped = max(0, min(max_x, int(round(x - half))))
         return clamped
 
-    parts = []
-    for s in segments:
+    parts = sorted(segments, key=lambda s: float(s.get("start", 0.0)))
+    terms = []
+    for s in parts:
+        start = float(s.get("start", 0.0))
         end = float(s.get("end", 0.0))
-        x = float(s.get("subject_x", src_w / 2.0))
-        parts.append((end, _clamp(x)))
-    parts.sort(key=lambda p: p[0])
+        if end <= start:
+            continue
+        x = _clamp(float(s.get("subject_x", src_w / 2.0)))
+        terms.append(f"{x}*between(t,{start:.3f},{end:.3f})")
 
-    # Build right-to-left: ... if(lt(t, e_n-1), x_n-1, x_n) ...
-    last_x = parts[-1][1]
-    expr = str(last_x)
-    for end, x in reversed(parts[:-1]):
-        expr = f"if(lt(t,{end:.3f}),{x},{expr})"
-    return expr
+    if not terms:
+        return str((src_w - crop_w) // 2)
+
+    # The expression sits inside single quotes in the -vf string, so
+    # commas inside between(...) are not interpreted as filter-arg
+    # separators by ffmpeg's outer parser. The terms join with '+'
+    # because '+' is never an argument separator.
+    return "+".join(terms)
 
 
 def _probe_source(input_path: Path) -> tuple[int, int, float]:
