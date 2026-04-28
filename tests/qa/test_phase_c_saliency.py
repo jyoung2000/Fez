@@ -344,13 +344,16 @@ class TestTextClipRateMetric:
 
 
 class TestConfigFlag:
-    def test_saliency_enabled_default_off(self):
+    def test_saliency_enabled_default_on_after_phase_e(self):
+        """Phase C shipped CLIPAI_SALIENCY_ENABLED default-OFF.
+        Phase E flipped it ON; this test now checks the shipped default.
+        """
         try:
             from backend.config import Settings
         except ModuleNotFoundError as exc:
             pytest.skip(f"backend.config deps missing: {exc}")
         s = Settings()
-        assert s.CLIPAI_SALIENCY_ENABLED is False
+        assert s.CLIPAI_SALIENCY_ENABLED is True
 
 
 if __name__ == "__main__":

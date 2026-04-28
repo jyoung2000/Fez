@@ -218,15 +218,17 @@ class TestTrainingScript:
 
 
 class TestConfigFlag:
-    def test_composition_head_default_legacy(self):
+    def test_composition_head_default_clip_after_phase_e(self):
+        """Phase D shipped CLIPAI_COMPOSITION_HEAD default 'legacy'.
+        Phase E flipped it to 'clip'; this test checks the shipped default.
+        Set CLIPAI_COMPOSITION_HEAD=legacy to opt out per-deploy.
+        """
         try:
             from backend.config import Settings
         except ModuleNotFoundError as exc:
             pytest.skip(f"backend.config deps missing: {exc}")
         s = Settings()
-        # Phase D ships with default 'legacy' so the trained head is
-        # opt-in until Phase E.
-        assert s.CLIPAI_COMPOSITION_HEAD == "legacy"
+        assert s.CLIPAI_COMPOSITION_HEAD == "clip"
 
 
 if __name__ == "__main__":
