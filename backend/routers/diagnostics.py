@@ -2479,12 +2479,20 @@ async def sota_clip_bench(request: Request):
             "status": "fail" if render_failed else "pass",
         })
 
+        # Both the bench results AND the preview are downloadable in
+        # the GUI even when one of the two fails — the operator can
+        # always grab whatever DID succeed.
+        results_md_url = f"/api/diagnostics/sota-clip-results/{token}.md"
+        results_json_url = f"/api/diagnostics/sota-clip-results/{token}.json"
         if render_failed or not os.path.isfile(preview_path):
             yield _sse_event("complete", {
                 "ok": True, "stage": "sota_bench",
+                "results_md_url": results_md_url,
+                "results_json_url": results_json_url,
                 "message": (
                     "Bench OK but preview render failed — see ffmpeg "
-                    "output above. Bench metric results are still valid."
+                    "output above. The bench metric results below "
+                    "are still valid."
                 ),
             })
         else:
@@ -2493,10 +2501,13 @@ async def sota_clip_bench(request: Request):
                 "ok": True, "stage": "sota_bench",
                 "preview_url": f"/api/diagnostics/sota-clip-preview/{token}.mp4",
                 "preview_size_mb": round(preview_size_mb, 1),
+                "results_md_url": results_md_url,
+                "results_json_url": results_json_url,
                 "message": (
                     f"SOTA pipeline rendered 9:16 preview "
-                    f"({preview_size_mb:.1f} MB). Watch it inline below or "
-                    f"download to verify framing decisions look human-quality."
+                    f"({preview_size_mb:.1f} MB). Watch the video inline "
+                    "below, or use the buttons to download the preview MP4 "
+                    "+ metric reports."
                 ),
             })
 
@@ -2536,6 +2547,47 @@ async def sota_clip_preview(token: str, request: Request):
         # Allow the browser <video> element to seek without redownloading.
         headers={"Accept-Ranges": "bytes", "Cache-Control": "no-cache"},
     )
+
+
+def _serve_sota_results(token: str, suffix: str, media_type: str):
+    """Shared body for the markdown + JSON results download endpoints.
+
+    Returns the file inline (not as attachment) so the browser can
+    preview the markdown / JSON in a tab; the front-end download
+    button uses the ``download`` attribute for actual save-to-disk.
+    """
+    from fastapi.responses import FileResponse, Response
+    info = _SOTA_CLIP_UPLOADS.get(token)
+    if info is None:
+        return Response(status_code=404, content="upload token not found")
+    path = f"/tmp/sota_clip_{token}_results.{suffix}"
+    if not os.path.isfile(path):
+        return Response(
+            status_code=404,
+            content=(
+                f"results.{suffix} not generated yet. Run /sota-clip-bench "
+                "first."
+            ),
+        )
+    base = os.path.splitext(info.get("filename") or "clip")[0]
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=f"sota_results_{base}.{suffix}",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@router.get("/sota-clip-results/{token}.md")
+async def sota_clip_results_md(token: str):
+    """Serve the human-readable markdown bench rollup for a token."""
+    return _serve_sota_results(token, "md", "text/markdown; charset=utf-8")
+
+
+@router.get("/sota-clip-results/{token}.json")
+async def sota_clip_results_json(token: str):
+    """Serve the machine-readable JSON metric dump for a token."""
+    return _serve_sota_results(token, "json", "application/json")
 
 
 @router.get("/auth-cache")

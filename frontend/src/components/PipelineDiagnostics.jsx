@@ -1013,8 +1013,8 @@ export default function PipelineDiagnostics() {
           </div>
         )}
 
-        {/* 9:16 SOTA preview MP4 - the visual proof the pipeline worked */}
-        {sotaResult?.preview_url && (
+        {/* Results + 9:16 preview - the bundle that proves the run worked */}
+        {(sotaResult?.preview_url || sotaResult?.results_md_url) && (
           <div style={{
             marginTop: 12, padding: 12,
             background: 'var(--bg-base)',
@@ -1025,42 +1025,108 @@ export default function PipelineDiagnostics() {
               fontSize: 12, fontWeight: 600,
               color: 'var(--text-primary)', marginBottom: 8,
             }}>
-              9:16 SOTA preview
-              {sotaResult.preview_size_mb ? ` (${sotaResult.preview_size_mb} MB)` : ''}
+              Run artifacts
             </div>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
-              The actual reframed output of the SOTA pipeline applied to your
-              uploaded clip. Watch for: subject stays in frame, no jitter on
-              speaker turns, no faces clipped at the edges, A/B cuts on speaker
-              changes (panel content), tight on speaker / wide on
-              dialogue silence.
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
+              The bench scored framing decisions; the rendered MP4 lets you
+              eyeball the actual output. Watch for: subject stays in frame,
+              no jitter on speaker turns, no faces clipped at the edges,
+              A/B cuts on speaker changes (panel content), tight on speaker
+              / wide on dialogue silence.
             </div>
-            <video
-              key={sotaResult.preview_url}
-              src={sotaResult.preview_url}
-              controls
-              playsInline
-              preload="metadata"
-              style={{
-                width: '100%', maxWidth: 360, maxHeight: 640,
-                background: '#000', borderRadius: 'var(--radius-sm)',
-                display: 'block',
-              }}
-            />
-            <div style={{ marginTop: 8 }}>
-              <a
-                href={sotaResult.preview_url}
-                download
-                style={{
-                  ...smallBtnStyle,
-                  display: 'inline-block',
-                  textDecoration: 'none',
-                  padding: '4px 12px',
-                }}
-              >
-                Download MP4
-              </a>
+
+            {/* Big, prominent download buttons */}
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+              {sotaResult.preview_url && (
+                <a
+                  href={sotaResult.preview_url}
+                  download
+                  style={{
+                    ...smallBtnStyle,
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    background: 'var(--accent-cyan)', color: '#fff',
+                    border: '1px solid var(--accent-cyan)',
+                    textDecoration: 'none',
+                    padding: '8px 16px', fontSize: 12, fontWeight: 600,
+                  }}
+                  title="Download the SOTA-rendered 9:16 MP4"
+                >
+                  ⬇ Download 9:16 video
+                  {sotaResult.preview_size_mb
+                    ? ` (${sotaResult.preview_size_mb} MB)` : ''}
+                </a>
+              )}
+              {sotaResult.results_md_url && (
+                <a
+                  href={sotaResult.results_md_url}
+                  download
+                  style={{
+                    ...smallBtnStyle,
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    textDecoration: 'none',
+                    padding: '8px 16px', fontSize: 12, fontWeight: 600,
+                  }}
+                  title="Download the bench's markdown rollup"
+                >
+                  ⬇ Download results.md
+                </a>
+              )}
+              {sotaResult.results_json_url && (
+                <a
+                  href={sotaResult.results_json_url}
+                  download
+                  style={{
+                    ...smallBtnStyle,
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    textDecoration: 'none',
+                    padding: '8px 16px', fontSize: 12, fontWeight: 600,
+                  }}
+                  title="Download the bench's machine-readable JSON metrics"
+                >
+                  ⬇ Download results.json
+                </a>
+              )}
+              {sotaResult.results_md_url && (
+                <a
+                  href={sotaResult.results_md_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{
+                    ...smallBtnStyle,
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    textDecoration: 'none',
+                    padding: '8px 16px', fontSize: 12, fontWeight: 600,
+                  }}
+                  title="Open the markdown in a new tab without downloading"
+                >
+                  ↗ View results.md
+                </a>
+              )}
             </div>
+
+            {/* Inline player */}
+            {sotaResult.preview_url && (
+              <>
+                <div style={{
+                  fontSize: 11, fontWeight: 600,
+                  color: 'var(--text-secondary)', marginBottom: 6,
+                }}>
+                  Watch the 9:16 preview
+                </div>
+                <video
+                  key={sotaResult.preview_url}
+                  src={sotaResult.preview_url}
+                  controls
+                  playsInline
+                  preload="metadata"
+                  style={{
+                    width: '100%', maxWidth: 360, maxHeight: 640,
+                    background: '#000', borderRadius: 'var(--radius-sm)',
+                    display: 'block',
+                  }}
+                />
+              </>
+            )}
           </div>
         )}
       </div>
