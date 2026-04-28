@@ -378,13 +378,34 @@ export default function PipelineDiagnostics() {
     }
   }, [testIncludeWhisper, testTranslation]);
 
-  // ── 2026 SOTA Reframing — 1-click QA + bench runner ───────────────
+  // ── 2026 SOTA Reframing - 1-click QA + bench runner ───────────────
   const [sotaRunning, setSotaRunning] = useState(false);
   const [sotaSkipBench, setSotaSkipBench] = useState(false);
   const [sotaPhases, setSotaPhases] = useState([]);
   const [sotaLogs, setSotaLogs] = useState([]);
   const [sotaResult, setSotaResult] = useState(null);
   const sotaLogRef = React.useRef(null);
+
+  // ── SOTA clip-test (upload + run on user-supplied MP4) ───────────
+  const [sotaClipFile, setSotaClipFile] = useState(null);
+  const [sotaClipContentType, setSotaClipContentType] = useState('default');
+  const [sotaClipUploadProgress, setSotaClipUploadProgress] = useState(null); // 0..100 or null
+  const sotaClipFileInputRef = React.useRef(null);
+
+  const SOTA_CONTENT_TYPES = [
+    { value: 'default', label: 'Auto / default' },
+    { value: 'multi_speaker_panel', label: 'Multi-speaker panel' },
+    { value: 'talking_head', label: 'Talking head' },
+    { value: 'vlog', label: 'Vlog' },
+    { value: 'narrative', label: 'Narrative / cinema' },
+    { value: 'music_video', label: 'Music video / concert' },
+    { value: 'sports', label: 'Sports' },
+    { value: 'gaming', label: 'Gaming / gameplay' },
+    { value: 'anime', label: 'Anime / animation' },
+    { value: 'tutorial', label: 'Tutorial / how-to' },
+    { value: 'podcast', label: 'Podcast' },
+    { value: 'interview', label: 'Interview' },
+  ];
 
   React.useEffect(() => {
     if (sotaLogRef.current) {
@@ -545,6 +566,114 @@ export default function PipelineDiagnostics() {
     }
   }, [sotaSkipBench]);
 
+  // ── Upload + run SOTA pipeline on a user-supplied MP4 ─────────────
+  const runSotaClipTest = useCallback(async () => {
+    if (!sotaClipFile) return;
+    setSotaRunning(true);
+    setSotaPhases([]);
+    setSotaLogs([]);
+    setSotaResult(null);
+    setSotaClipUploadProgress(0);
+
+    try {
+      // Step 1: upload the file. Use XMLHttpRequest so we can track
+      // progress (fetch + ReadableStream upload progress is still
+      // patchy across browsers).
+      setSotaLogs((prev) => [...prev, {
+        kind: 'meta',
+        text: `[upload] sending ${sotaClipFile.name} (${(sotaClipFile.size / 1_048_576).toFixed(1)} MB) ...`,
+      }]);
+
+      const uploadJson = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        const formData = new FormData();
+        formData.append('file', sotaClipFile);
+        formData.append('content_type', sotaClipContentType || 'default');
+        xhr.open('POST', '/api/diagnostics/sota-clip-upload');
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable) {
+            setSotaClipUploadProgress(
+              Math.round((ev.loaded / ev.total) * 100),
+            );
+          }
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try { resolve(JSON.parse(xhr.responseText)); }
+            catch (e) { reject(new Error(`bad upload response: ${e.message}`)); }
+          } else {
+            reject(new Error(`upload HTTP ${xhr.status}: ${xhr.responseText}`));
+          }
+        };
+        xhr.onerror = () => reject(new Error('upload network error'));
+        xhr.send(formData);
+      });
+
+      setSotaClipUploadProgress(null);
+      if (!uploadJson.ok) {
+        throw new Error(uploadJson.error || 'upload rejected');
+      }
+      setSotaLogs((prev) => [...prev, {
+        kind: 'meta',
+        text: `[upload] done. token=${uploadJson.token?.slice(0, 8)}... slug=${uploadJson.slug} size=${uploadJson.size_mb} MB`,
+      }]);
+
+      // Step 2: SSE-stream the bench against the uploaded clip.
+      const benchResp = await fetch('/api/diagnostics/sota-clip-bench', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: uploadJson.token }),
+      });
+      if (!benchResp.ok || !benchResp.body) {
+        throw new Error(`bench HTTP ${benchResp.status}`);
+      }
+      const reader = benchResp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const evt = JSON.parse(line.slice(6));
+            if (evt.type === 'phase_start') {
+              setSotaPhases((prev) => [
+                ...prev,
+                { phase: evt.data.phase, label: evt.data.label, status: 'running' },
+              ]);
+            } else if (evt.type === 'phase_result') {
+              setSotaPhases((prev) =>
+                prev.map((p) => p.phase === evt.data.phase ? { ...p, status: evt.data.status } : p),
+              );
+            } else if (evt.type === 'log') {
+              setSotaLogs((prev) => [...prev, { kind: 'log', text: evt.data.line }]);
+            } else if (evt.type === 'exit_code') {
+              setSotaLogs((prev) => [...prev, {
+                kind: 'meta', text: `(process exited with code ${evt.data.code})`,
+              }]);
+            } else if (evt.type === 'heartbeat') {
+              // silent
+            } else if (evt.type === 'complete') {
+              setSotaResult(evt.data);
+            }
+          } catch { /* malformed - skip */ }
+        }
+      }
+    } catch (e) {
+      setSotaResult({
+        ok: false,
+        message: `Clip test failed: ${e.message}`,
+      });
+    } finally {
+      setSotaClipUploadProgress(null);
+      setSotaRunning(false);
+    }
+  }, [sotaClipFile, sotaClipContentType]);
+
   return (
     <div style={{ marginBottom: 32 }}>
       <h3 style={{ fontSize: 14, marginBottom: 16, color: 'var(--text-secondary)' }}>
@@ -687,6 +816,141 @@ export default function PipelineDiagnostics() {
             ? (sotaSkipBench ? 'Running QA...' : 'Running QA + bench...')
             : (sotaSkipBench ? 'Run QA harness' : 'Run QA + SOTA bench')}
         </button>
+
+        {/* ── Clip-test: upload an MP4 and run the SOTA pipeline on it ── */}
+        <div style={{
+          marginTop: 4, marginBottom: 12, paddingTop: 12,
+          borderTop: '1px dashed var(--border)',
+        }}>
+          <div style={{
+            fontSize: 12, fontWeight: 600, color: 'var(--text-primary)',
+            marginBottom: 4,
+          }}>
+            Test on your own MP4
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
+            Drop in an MP4 / MOV / WebM / MKV and the SOTA reframing pipeline
+            runs on just that clip with all Phase A-E flags ON. Skips the
+            fixture cache entirely. Auth required (you are logged in).
+          </div>
+
+          {/* Hidden native file input + visible "Choose..." trigger */}
+          <input
+            ref={sotaClipFileInputRef}
+            type="file"
+            accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv"
+            onChange={(e) => {
+              const f = e.target.files?.[0] || null;
+              setSotaClipFile(f);
+              if (!f) setSotaClipUploadProgress(null);
+            }}
+            disabled={sotaRunning}
+            style={{ display: 'none' }}
+          />
+
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10, flexWrap: 'wrap' }}>
+            <button
+              onClick={() => sotaClipFileInputRef.current?.click()}
+              disabled={sotaRunning}
+              style={{
+                ...smallBtnStyle,
+                padding: '4px 12px',
+                cursor: sotaRunning ? 'default' : 'pointer',
+              }}
+            >
+              {sotaClipFile ? 'Change file...' : 'Choose MP4...'}
+            </button>
+            {sotaClipFile && (
+              <span style={{
+                fontSize: 11, fontFamily: 'var(--font-mono)',
+                color: 'var(--text-secondary)',
+              }}>
+                {sotaClipFile.name} ({(sotaClipFile.size / 1_048_576).toFixed(1)} MB)
+              </span>
+            )}
+            {sotaClipFile && !sotaRunning && (
+              <button
+                onClick={() => {
+                  setSotaClipFile(null);
+                  if (sotaClipFileInputRef.current) {
+                    sotaClipFileInputRef.current.value = '';
+                  }
+                }}
+                style={{
+                  ...smallBtnStyle, padding: '2px 8px', fontSize: 10,
+                }}
+                title="Clear selected file"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+
+          {sotaClipFile && (
+            <div style={{ marginBottom: 10 }}>
+              <label style={{
+                display: 'block', fontSize: 11,
+                color: 'var(--text-secondary)', marginBottom: 4,
+              }}>
+                Content type (drives the editorial planner's per-genre playbook):
+              </label>
+              <select
+                value={sotaClipContentType}
+                onChange={(e) => setSotaClipContentType(e.target.value)}
+                disabled={sotaRunning}
+                style={{
+                  width: '100%', maxWidth: 360, padding: '6px 10px',
+                  fontSize: 11, fontFamily: 'var(--font-mono)',
+                  background: 'var(--bg-elevated)',
+                  color: 'var(--text-primary)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-sm)',
+                  cursor: sotaRunning ? 'default' : 'pointer',
+                }}
+              >
+                {SOTA_CONTENT_TYPES.map(({ value, label }) => (
+                  <option key={value} value={value}>{label}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          <button
+            onClick={runSotaClipTest}
+            disabled={sotaRunning || !sotaClipFile}
+            style={{
+              ...smallBtnStyle,
+              background: (sotaRunning || !sotaClipFile)
+                ? 'var(--bg-elevated)' : 'var(--accent-cyan)',
+              color: (sotaRunning || !sotaClipFile)
+                ? 'var(--text-muted)' : '#fff',
+              cursor: (sotaRunning || !sotaClipFile) ? 'default' : 'pointer',
+              padding: '6px 16px',
+            }}
+          >
+            {sotaRunning
+              ? (sotaClipUploadProgress !== null
+                  ? `Uploading ${sotaClipUploadProgress}%...`
+                  : 'Running SOTA pipeline...')
+              : 'Upload + Run SOTA pipeline on this MP4'}
+          </button>
+
+          {sotaClipUploadProgress !== null && (
+            <div style={{
+              marginTop: 8, height: 6,
+              background: 'var(--bg-base)',
+              borderRadius: 'var(--radius-sm)',
+              overflow: 'hidden',
+            }}>
+              <div style={{
+                height: '100%',
+                width: `${sotaClipUploadProgress}%`,
+                background: 'var(--accent-cyan)',
+                transition: 'width 0.2s ease',
+              }} />
+            </div>
+          )}
+        </div>
 
         {sotaPhases.length > 0 && (
           <div style={{

@@ -10,7 +10,7 @@ import time
 from typing import AsyncGenerator
 
 import httpx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, File, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from backend.app.auth.deps import require_admin
@@ -2055,6 +2055,371 @@ async def sota_bench_qa_sync():
         "stderr": err.decode(errors="replace"),
         "exit_code": proc.returncode,
     }
+
+
+# ── SOTA bench: upload a single MP4 and run the SOTA pipeline on it ──
+#
+# Two-step flow because SSE responses can't easily share a request
+# with a multipart body:
+#   1. POST /sota-clip-upload (multipart) → saves the file, returns a
+#      token + the slug it was filed under.
+#   2. POST /sota-clip-bench (json {token}) → SSE streams the QA
+#      harness + a bench run against a synthesized manifest pointing
+#      at JUST the uploaded clip.
+#
+# Uploads are stored under the regular fixture cache so the bench
+# script can find them via its existing CLIPAI_REAL_CONTENT_CACHE
+# resolution. Tokens live in process memory and are TTL-bounded so
+# orphaned uploads from disconnected clients are reaped.
+
+
+import secrets as _secrets
+import time as _time
+
+# token -> {path: str, slug: str, size: int, created_at: float, content_type: str}
+_SOTA_CLIP_UPLOADS: dict = {}
+_SOTA_CLIP_TTL_SEC = 3600  # 1 hour - enough to upload, run a bench, view
+
+
+def _reap_old_uploads() -> None:
+    """Drop tokens whose files were uploaded > TTL ago. Called opportunistically."""
+    now = _time.monotonic()
+    stale = [t for t, info in _SOTA_CLIP_UPLOADS.items()
+             if now - info.get("created_at", 0) > _SOTA_CLIP_TTL_SEC]
+    for t in stale:
+        info = _SOTA_CLIP_UPLOADS.pop(t, None)
+        if info and info.get("path"):
+            try:
+                os.unlink(info["path"])
+            except Exception:
+                pass
+
+
+@router.post("/sota-clip-upload")
+async def sota_clip_upload(
+    file: UploadFile = File(...),
+    content_type: str = "default",
+):
+    """Upload a single MP4 for the SOTA reframing pipeline test.
+
+    Saves the file under the fixture cache directory with a synthesized
+    slug (``sota_clip_<token>``). The companion endpoint
+    ``/sota-clip-bench`` runs the bench against just this clip.
+
+    ``content_type`` (form field, optional) maps to the manifest's
+    ``target_clipcontenttype`` so the editorial planner picks the
+    right per-genre playbook (e.g. ``multi_speaker_panel``,
+    ``music_video``, ``sports``, ``gaming``, ``anime``, ``narrative``,
+    ``vlog``, ``tutorial``, or ``default``).
+
+    Auth required (cookie session) — same as the rest of /api/*.
+    """
+    _reap_old_uploads()
+
+    if not file.filename:
+        return {"ok": False, "error": "no filename"}
+    fname_lower = file.filename.lower()
+    if not any(fname_lower.endswith(ext) for ext in (".mp4", ".mov", ".webm", ".mkv")):
+        return {
+            "ok": False,
+            "error": (
+                f"unsupported extension on {file.filename!r}. "
+                "Accepted: mp4, mov, webm, mkv."
+            ),
+        }
+
+    cache_dir = os.environ.get(
+        "CLIPAI_REAL_CONTENT_CACHE", "/var/cache/clipai/real_content",
+    )
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": f"cannot create {cache_dir}: {exc}"}
+
+    token = _secrets.token_urlsafe(12)
+    slug = f"sota_clip_{token}"
+    ext = "mp4"   # bench script's slug→path resolution always appends `.mp4`
+    fpath = os.path.join(cache_dir, f"{slug}.{ext}")
+
+    try:
+        bytes_written = 0
+        with open(fpath, "wb") as out:
+            while True:
+                chunk = await file.read(1 << 20)  # 1 MB chunks
+                if not chunk:
+                    break
+                out.write(chunk)
+                bytes_written += len(chunk)
+    except Exception as exc:
+        try:
+            os.unlink(fpath)
+        except Exception:
+            pass
+        return {"ok": False, "error": f"write failed: {exc}"}
+
+    _SOTA_CLIP_UPLOADS[token] = {
+        "path": fpath,
+        "slug": slug,
+        "size": bytes_written,
+        "filename": file.filename,
+        "content_type": content_type or "default",
+        "created_at": _time.monotonic(),
+    }
+    return {
+        "ok": True,
+        "token": token,
+        "slug": slug,
+        "size_mb": round(bytes_written / 1_048_576, 2),
+        "filename": file.filename,
+        "saved_to": fpath,
+    }
+
+
+@router.post("/sota-clip-bench")
+async def sota_clip_bench(request: Request):
+    """SSE-stream a bench run against a previously-uploaded clip.
+
+    Body: ``{"token": "<from /sota-clip-upload>"}``. Generates a
+    synthetic manifest, runs the QA harness, then runs the SOTA
+    bench against just the one uploaded clip.
+    """
+    import sys as _sys  # local — pinned to the running uvicorn's interpreter
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    token = (body.get("token") or "").strip()
+    info = _SOTA_CLIP_UPLOADS.get(token)
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo_root = os.path.dirname(repo_root)
+    qa_runner_path = os.path.join(repo_root, "tests", "qa", "run_all_phases.py")
+
+    cache_dir = os.environ.get(
+        "CLIPAI_REAL_CONTENT_CACHE", "/var/cache/clipai/real_content",
+    )
+
+    async def _stream_subprocess(
+        cmd: list, *, env: dict | None = None,
+    ) -> AsyncGenerator[str, None]:
+        sub_env = {
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+            **(env or {}),
+        }
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=repo_root, env=sub_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            assert proc.stdout is not None
+            last_emit = time.monotonic()
+            while True:
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    yield _sse_event("heartbeat", {
+                        "elapsed_sec": round(time.monotonic() - last_emit, 1),
+                    })
+                    continue
+                if not line:
+                    break
+                last_emit = time.monotonic()
+                yield _sse_event("log", {
+                    "line": line.decode(errors="replace").rstrip(),
+                })
+            await proc.wait()
+            yield _sse_event("exit_code", {"code": proc.returncode})
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        yield _sse_event("log", {
+            "line": (
+                f"[sota-clip] connected; cache_dir={cache_dir!r} "
+                f"qa_runner_exists={os.path.exists(qa_runner_path)} "
+                f"token_valid={info is not None}"
+            ),
+        })
+
+        if info is None:
+            yield _sse_event("phase_start", {
+                "phase": "preflight", "label": "Validating upload token...",
+            })
+            yield _sse_event("log", {
+                "line": (
+                    "!! token not found or expired. "
+                    "Upload the MP4 again via the file picker."
+                ),
+            })
+            yield _sse_event("phase_result", {
+                "phase": "preflight", "status": "fail",
+            })
+            yield _sse_event("complete", {
+                "ok": False, "stage": "preflight",
+                "message": "Upload token not found or expired (1h TTL).",
+            })
+            return
+
+        if not os.path.isfile(info["path"]):
+            yield _sse_event("log", {
+                "line": f"!! uploaded file vanished from {info['path']}",
+            })
+            yield _sse_event("complete", {
+                "ok": False, "stage": "preflight",
+                "message": "Uploaded MP4 disappeared before the bench could run.",
+            })
+            _SOTA_CLIP_UPLOADS.pop(token, None)
+            return
+
+        try:
+            async for evt in _do_stream():
+                yield evt
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            logger.exception("[sota-clip-bench] event_stream crashed: %s", exc)
+            for tline in tb.splitlines():
+                yield _sse_event("log", {"line": f"!! {tline}"})
+            yield _sse_event("complete", {
+                "ok": False, "stage": "event_stream",
+                "message": f"Internal error: {exc!s}.",
+            })
+
+    async def _do_stream() -> AsyncGenerator[str, None]:
+        # ── Phase 1: QA harness (validates SOTA modules) ─────────
+        if os.path.exists(qa_runner_path):
+            yield _sse_event("phase_start", {
+                "phase": "qa_harness",
+                "label": "Running tests/qa/run_all_phases (mocks; ~5 s)...",
+            })
+            qa_failed = False
+            async for evt in _stream_subprocess(
+                [_sys.executable, "-u", "-m", "tests.qa.run_all_phases"],
+            ):
+                yield evt
+                try:
+                    parsed = json.loads(evt[6:])
+                    if parsed.get("type") == "exit_code":
+                        qa_failed = parsed["data"]["code"] != 0
+                except Exception:
+                    pass
+            yield _sse_event("phase_result", {
+                "phase": "qa_harness",
+                "status": "fail" if qa_failed else "pass",
+            })
+            if qa_failed:
+                yield _sse_event("complete", {
+                    "ok": False, "stage": "qa_harness",
+                    "message": "QA harness failed - bench skipped.",
+                })
+                return
+
+        # ── Phase 2: synthesize manifest + run bench on the upload ──
+        manifest = {
+            "schema": 1,
+            "notes": "SOTA-bench: synthetic manifest for one user-uploaded clip",
+            "cache_dir_env": "CLIPAI_REAL_CONTENT_CACHE",
+            "cache_dir_default": cache_dir,
+            "clips": [{
+                "slug": info["slug"],
+                "source_url": "",
+                "sha256": "",
+                "ext": "mp4",
+                "duration_sec": 0,
+                "content_type": info.get("content_type") or "default",
+                "subtype": None,
+                "target_clipcontenttype": info.get("content_type") or "default",
+                "description": (
+                    f"User-uploaded test clip ({info.get('filename', 'unknown')})"
+                ),
+                "ground_truth_vertical_url": None,
+            }],
+        }
+        manifest_path = f"/tmp/sota_clip_{token}_manifest.json"
+        try:
+            with open(manifest_path, "w") as mf:
+                json.dump(manifest, mf, indent=2)
+        except Exception as exc:
+            yield _sse_event("complete", {
+                "ok": False, "stage": "manifest",
+                "message": f"could not write synthetic manifest: {exc}",
+            })
+            return
+
+        yield _sse_event("phase_start", {
+            "phase": "sota_bench",
+            "label": (
+                f"Running SOTA reframing pipeline on {info['filename']!r} "
+                f"({info['size'] / 1_048_576:.1f} MB) with all Phase A-E "
+                "flags ON. Live progress below..."
+            ),
+        })
+
+        bench_env = {
+            "CLIPAI_TRACKER_BACKEND": "samurai",
+            "CLIPAI_DENSE_POINT_TRACKING": "1",
+            "CLIPAI_SALIENCY_ENABLED": "1",
+            "CLIPAI_COMPOSITION_HEAD": "clip",
+            "CLIPAI_EDITORIAL_PLANNER": "1",
+            "CLIPAI_HUMAN_REFRAME_PIPELINE": "1",
+            "CLIPAI_REAL_CONTENT_CACHE": cache_dir,
+        }
+        bench_failed = False
+        bench_cmd = [
+            _sys.executable, "-u", "-m",
+            "backend.scripts.compare_autoflip_vs_clipai",
+            "--manifest", manifest_path,
+            "--filter-slugs", info["slug"],
+            "--output", f"/tmp/sota_clip_{token}_results.md",
+            "--json-out", f"/tmp/sota_clip_{token}_results.json",
+        ]
+        async for evt in _stream_subprocess(bench_cmd, env=bench_env):
+            yield evt
+            try:
+                parsed = json.loads(evt[6:])
+                if parsed.get("type") == "exit_code":
+                    bench_failed = parsed["data"]["code"] != 0
+            except Exception:
+                pass
+        yield _sse_event("phase_result", {
+            "phase": "sota_bench",
+            "status": "fail" if bench_failed else "pass",
+            "results_md": f"/tmp/sota_clip_{token}_results.md",
+            "results_json": f"/tmp/sota_clip_{token}_results.json",
+        })
+
+        if bench_failed:
+            yield _sse_event("complete", {
+                "ok": False, "stage": "sota_bench",
+                "message": (
+                    "Bench failed - see streaming output above for the "
+                    "specific error. Most likely the uploaded MP4 codec "
+                    "isn't supported by the analysis pipeline."
+                ),
+            })
+        else:
+            yield _sse_event("complete", {
+                "ok": True, "stage": "sota_bench",
+                "message": (
+                    f"SOTA pipeline ran end-to-end on {info['filename']!r}. "
+                    f"Results: /tmp/sota_clip_{token}_results.md (markdown) "
+                    f"and /tmp/sota_clip_{token}_results.json (machine-readable)."
+                ),
+            })
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/auth-cache")
