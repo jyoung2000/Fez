@@ -21,6 +21,14 @@ services:
       # user's view even though the underlying job files survive.
       - ./data/auth:/data/auth
       - whisper_models:/root/.cache/huggingface
+      # 2026 SOTA reframing bench fixture cache. The "Run QA + SOTA
+      # bench" GUI button reads MP4 fixtures + extraction caches
+      # from this volume. Auto-created on first run; populate by
+      # running ``bash tests/real_content/fetch.sh`` ON THE HOST
+      # after editing the manifest's source_url fields. The bench
+      # will report "manifest empty / no fixtures" cleanly when the
+      # directory is empty - it does not crash.
+      - ./data/real_content_cache:/var/cache/clipai/real_content
     environment:
       - PYTHONUNBUFFERED=1
       - NVIDIA_VISIBLE_DEVICES=all
@@ -35,6 +43,9 @@ services:
       - CLIPAI_EDITORIAL_PRIOR=1
       - CLIPAI_THIRDS_BIAS=1
       - CLIPAI_GAZE_LEAD_ROOM_V2=1
+      # 2026 SOTA reframing bench: where the bench finds fixture
+      # MP4s + extraction cache. Maps to the volume mount above.
+      - CLIPAI_REAL_CONTENT_CACHE=/var/cache/clipai/real_content
     # Enable GPU passthrough when NVIDIA Container Toolkit is installed.
     # If no GPU is available, the container still starts normally on CPU.
     deploy:

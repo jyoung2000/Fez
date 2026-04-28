@@ -156,6 +156,15 @@ COPY tests/qa/ ./tests/qa/
 # Make ``tests`` importable as a top-level package (the QA runner uses
 # ``python -m tests.qa.run_all_phases``).
 RUN touch ./tests/__init__.py
+# Real-content bench manifest. Tiny JSON file (~5 KB) listing the
+# fixture clips the bench scores against; the actual MP4s stay
+# external and are mounted from the host (see docker-compose.yml's
+# CLIPAI_REAL_CONTENT_CACHE volume + env var).
+COPY tests/real_content/manifest.json ./tests/real_content/manifest.json
+# Make sure the AutoFlip-reference-outputs directory exists so the
+# bench's --autoflip-outputs default path doesn't hit
+# FileNotFoundError.
+RUN mkdir -p ./tests/autoflip_reference_outputs ./tests/real_content
 # Operator helper scripts (verify_sota_bench.sh etc) so they can be
 # invoked via `docker compose exec app bash scripts/<name>.sh`.
 COPY scripts/ ./scripts/

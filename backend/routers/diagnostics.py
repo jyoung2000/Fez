@@ -1726,12 +1726,103 @@ async def run_sota_bench(request: Request):
             })
             return
 
+        # ── Phase 2 pre-flight: manifest + fixture cache ─────────────
+        # Surface clear, actionable errors BEFORE we spawn the bench.
+        # Otherwise the script crashes with a generic FileNotFoundError
+        # or "manifest not found" and the operator has to dig through
+        # the SSE log to figure out what's missing.
+        manifest_abs = manifest if os.path.isabs(manifest) else os.path.join(
+            repo_root, manifest,
+        )
+        manifest_present = os.path.isfile(manifest_abs)
+        cache_dir = os.environ.get(
+            "CLIPAI_REAL_CONTENT_CACHE", "/var/cache/clipai/real_content",
+        )
+        cache_present = os.path.isdir(cache_dir)
+        cache_files = []
+        if cache_present:
+            try:
+                cache_files = [
+                    f for f in os.listdir(cache_dir)
+                    if not f.startswith(".") and not f.endswith(".part")
+                ]
+            except Exception:
+                cache_files = []
+
+        if not manifest_present:
+            yield _sse_event("phase_start", {
+                "phase": "sota_bench",
+                "label": "Pre-flight: locating fixture manifest...",
+            })
+            yield _sse_event("log", {
+                "line": f"!! manifest not found at {manifest_abs}",
+            })
+            yield _sse_event("log", {
+                "line": (
+                    "!! The image was built before the SOTA bench manifest "
+                    "landed. Rebuild with: docker compose down && "
+                    "docker compose build --no-cache && docker compose up -d"
+                ),
+            })
+            yield _sse_event("phase_result", {
+                "phase": "sota_bench", "status": "fail",
+            })
+            yield _sse_event("complete", {
+                "ok": False, "stage": "sota_bench",
+                "message": (
+                    f"Bench manifest missing in image at {manifest_abs}. "
+                    "Rebuild the container."
+                ),
+            })
+            return
+
+        if not cache_files:
+            yield _sse_event("phase_start", {
+                "phase": "sota_bench",
+                "label": "Pre-flight: locating fixture cache...",
+            })
+            yield _sse_event("log", {
+                "line": (
+                    f"!! fixture cache at {cache_dir} is empty"
+                    if cache_present
+                    else f"!! fixture cache directory {cache_dir} does not exist"
+                ),
+            })
+            yield _sse_event("log", {
+                "line": (
+                    "!! The bench needs MP4 fixtures listed in "
+                    "tests/real_content/manifest.json. Populate the cache "
+                    "by running ON THE HOST: "
+                    "bash tests/real_content/fetch.sh"
+                ),
+            })
+            yield _sse_event("log", {
+                "line": (
+                    "!! (You may also need to fill in source_url + sha256 "
+                    "fields in the manifest first - they ship blank.)"
+                ),
+            })
+            yield _sse_event("phase_result", {
+                "phase": "sota_bench", "status": "fail",
+            })
+            yield _sse_event("complete", {
+                "ok": False, "stage": "sota_bench",
+                "message": (
+                    f"Fixture cache at {cache_dir} is empty. "
+                    "Populate it via tests/real_content/fetch.sh on the host. "
+                    "The QA harness portion above PASSED - the deploy is "
+                    "healthy; the fixture step is opt-in."
+                ),
+            })
+            return
+
         # ── Phase 2: full SOTA fixture bench ────────────────────────
         yield _sse_event("phase_start", {
             "phase": "sota_bench",
             "label": (
-                "Running compare_autoflip_vs_clipai with all Phase A-E "
-                "flags ON (homelab GPU; this can take several minutes)…"
+                f"Running compare_autoflip_vs_clipai on {len(cache_files)} "
+                "fixture(s) with all Phase A-E flags ON (homelab GPU; this "
+                "can take several minutes)..."
             ),
         })
         bench_env = {
@@ -1741,6 +1832,10 @@ async def run_sota_bench(request: Request):
             "CLIPAI_COMPOSITION_HEAD": "clip",
             "CLIPAI_EDITORIAL_PLANNER": "1",
             "CLIPAI_HUMAN_REFRAME_PIPELINE": "1",
+            # The bench script reads this to find fixture MP4s + write
+            # its extraction cache. Inherits whatever the container is
+            # configured with (default /var/cache/clipai/real_content).
+            "CLIPAI_REAL_CONTENT_CACHE": cache_dir,
         }
         bench_failed = False
         bench_cmd = [
