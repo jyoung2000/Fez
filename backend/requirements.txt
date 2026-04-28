@@ -36,3 +36,11 @@ torch>=2.0.0
 # Enabled via CLIPAI_FACE_EMBEDDING=arcface (default: sface).
 insightface==0.7.3
 onnxruntime>=1.17.0
+
+# pytest is needed at runtime by the 1-click "2026 SOTA Reframing
+# Validate" button in Settings -> Advanced. The button spawns
+# `python -m pytest tests/qa/test_phase_*.py` to exercise the
+# Phase A-E mock-heavy unit tests. ~2 MB; never imported by the
+# production pipeline — only invoked on demand by the diagnostics
+# router.
+pytest>=8.0.0

@@ -108,6 +108,7 @@ def _run_pytest(suite_path: str) -> dict:
         "exit_code": proc.returncode,
         "elapsed_sec": round(elapsed, 2),
         "summary_line": summary_line,
+        "stdout_tail": "\n".join(out.splitlines()[-25:]),
     }
 
 
@@ -184,6 +185,14 @@ def main() -> int:
                 f"  >>> only {run_total}/{p['min_tests']} expected tests "
                 f"ran (passed={r['passed']} skipped={r['skipped']})"
             )
+            # Surface the pytest stdout tail so the operator can see
+            # why no tests ran (e.g. pytest not installed, import
+            # error, collection failure).
+            tail = r.get("stdout_tail") or ""
+            if tail.strip():
+                _p("  >>> last 25 lines of pytest output:")
+                for tline in tail.splitlines():
+                    _p(f"      {tline}")
         results.append({
             "phase": p["phase"],
             "ok": ok,
