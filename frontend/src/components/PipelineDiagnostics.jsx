@@ -1012,6 +1012,57 @@ export default function PipelineDiagnostics() {
             {sotaResult.ok ? '\u2705 ' : '\u274c '}{sotaResult.message}
           </div>
         )}
+
+        {/* 9:16 SOTA preview MP4 - the visual proof the pipeline worked */}
+        {sotaResult?.preview_url && (
+          <div style={{
+            marginTop: 12, padding: 12,
+            background: 'var(--bg-base)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius-sm)',
+          }}>
+            <div style={{
+              fontSize: 12, fontWeight: 600,
+              color: 'var(--text-primary)', marginBottom: 8,
+            }}>
+              9:16 SOTA preview
+              {sotaResult.preview_size_mb ? ` (${sotaResult.preview_size_mb} MB)` : ''}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
+              The actual reframed output of the SOTA pipeline applied to your
+              uploaded clip. Watch for: subject stays in frame, no jitter on
+              speaker turns, no faces clipped at the edges, A/B cuts on speaker
+              changes (panel content), tight on speaker / wide on
+              dialogue silence.
+            </div>
+            <video
+              key={sotaResult.preview_url}
+              src={sotaResult.preview_url}
+              controls
+              playsInline
+              preload="metadata"
+              style={{
+                width: '100%', maxWidth: 360, maxHeight: 640,
+                background: '#000', borderRadius: 'var(--radius-sm)',
+                display: 'block',
+              }}
+            />
+            <div style={{ marginTop: 8 }}>
+              <a
+                href={sotaResult.preview_url}
+                download
+                style={{
+                  ...smallBtnStyle,
+                  display: 'inline-block',
+                  textDecoration: 'none',
+                  padding: '4px 12px',
+                }}
+              >
+                Download MP4
+              </a>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

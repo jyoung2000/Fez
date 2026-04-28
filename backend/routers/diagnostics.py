@@ -2405,13 +2405,98 @@ async def sota_clip_bench(request: Request):
                     "isn't supported by the analysis pipeline."
                 ),
             })
-        else:
+            return
+
+        # ── Phase 3: render the 9:16 preview MP4 ───────────────────
+        # The bench wrote per-clip extraction artifacts to
+        # <cache_dir>/extractions/<sha>/. Compute the same sha and
+        # find segments.json there, then ffmpeg-crop the source into
+        # a 9:16 preview the operator can actually watch.
+        import hashlib
+        preview_path = f"/tmp/sota_clip_{token}_preview.mp4"
+        try:
+            sha = hashlib.sha256()
+            with open(info["path"], "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    sha.update(chunk)
+            sha_hex = sha.hexdigest()
+        except Exception as exc:
+            yield _sse_event("log", {"line": f"!! could not hash upload: {exc}"})
             yield _sse_event("complete", {
                 "ok": True, "stage": "sota_bench",
                 "message": (
-                    f"SOTA pipeline ran end-to-end on {info['filename']!r}. "
-                    f"Results: /tmp/sota_clip_{token}_results.md (markdown) "
-                    f"and /tmp/sota_clip_{token}_results.json (machine-readable)."
+                    f"Bench OK; preview render skipped (hash failed). "
+                    f"Results: /tmp/sota_clip_{token}_results.md"
+                ),
+            })
+            return
+
+        segments_path = os.path.join(
+            cache_dir, "extractions", sha_hex, "segments.json",
+        )
+        yield _sse_event("phase_start", {
+            "phase": "preview_render",
+            "label": (
+                f"Rendering 9:16 preview MP4 from segments.json "
+                f"(this is the actual SOTA reframing output you can "
+                f"watch to verify)..."
+            ),
+        })
+        if not os.path.isfile(segments_path):
+            yield _sse_event("log", {
+                "line": f"!! segments.json not found at {segments_path}",
+            })
+            yield _sse_event("phase_result", {
+                "phase": "preview_render", "status": "fail",
+            })
+            yield _sse_event("complete", {
+                "ok": True, "stage": "sota_bench",
+                "message": (
+                    "Bench OK but preview render skipped — segments.json "
+                    "missing. Bench results are still valid; the preview "
+                    "video is opt-in."
+                ),
+            })
+            return
+
+        render_failed = False
+        render_cmd = [
+            _sys.executable, "-u", "-m", "backend.scripts.sota_render_preview",
+            "--input", info["path"],
+            "--segments", segments_path,
+            "--output", preview_path,
+        ]
+        async for evt in _stream_subprocess(render_cmd):
+            yield evt
+            try:
+                parsed = json.loads(evt[6:])
+                if parsed.get("type") == "exit_code":
+                    render_failed = parsed["data"]["code"] != 0
+            except Exception:
+                pass
+        yield _sse_event("phase_result", {
+            "phase": "preview_render",
+            "status": "fail" if render_failed else "pass",
+        })
+
+        if render_failed or not os.path.isfile(preview_path):
+            yield _sse_event("complete", {
+                "ok": True, "stage": "sota_bench",
+                "message": (
+                    "Bench OK but preview render failed — see ffmpeg "
+                    "output above. Bench metric results are still valid."
+                ),
+            })
+        else:
+            preview_size_mb = os.path.getsize(preview_path) / 1_048_576
+            yield _sse_event("complete", {
+                "ok": True, "stage": "sota_bench",
+                "preview_url": f"/api/diagnostics/sota-clip-preview/{token}.mp4",
+                "preview_size_mb": round(preview_size_mb, 1),
+                "message": (
+                    f"SOTA pipeline rendered 9:16 preview "
+                    f"({preview_size_mb:.1f} MB). Watch it inline below or "
+                    f"download to verify framing decisions look human-quality."
                 ),
             })
 
@@ -2419,6 +2504,37 @@ async def sota_clip_bench(request: Request):
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/sota-clip-preview/{token}.mp4")
+async def sota_clip_preview(token: str, request: Request):
+    """Serve the 9:16 SOTA-rendered preview MP4 for an upload token.
+
+    Auth required (cookie session) — same as the upload + bench
+    endpoints. The token is single-use-ish: it persists for the
+    upload's TTL (1 h) and points at the rendered preview produced
+    by the ``/sota-clip-bench`` endpoint's render phase.
+    """
+    from fastapi.responses import FileResponse, Response
+    info = _SOTA_CLIP_UPLOADS.get(token)
+    if info is None:
+        return Response(status_code=404, content="upload token not found")
+    preview_path = f"/tmp/sota_clip_{token}_preview.mp4"
+    if not os.path.isfile(preview_path):
+        return Response(
+            status_code=404,
+            content=(
+                "preview not yet rendered. Run /sota-clip-bench first; "
+                "the render is the final phase of that flow."
+            ),
+        )
+    return FileResponse(
+        preview_path,
+        media_type="video/mp4",
+        filename=f"sota_preview_{info.get('filename', 'clip')}",
+        # Allow the browser <video> element to seek without redownloading.
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "no-cache"},
     )
 
 
