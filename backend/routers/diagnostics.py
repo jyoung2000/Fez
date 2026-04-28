@@ -1689,9 +1689,15 @@ async def run_sota_bench(request: Request):
             "phase": "qa_harness",
             "label": "Running tests/qa/run_all_phases (mocks; ~5 s)...",
         })
+        # Use sys.executable so we hit the same Python that's running
+        # uvicorn. The container has python3 (not python) on PATH, so
+        # ``["python", ...]`` would fail with FileNotFoundError. The
+        # /sota-bench-status probe also uses sys.executable for the
+        # same reason.
+        import sys as _sys
         qa_failed = False
         async for evt in _stream_subprocess(
-            ["python", "-u", "-m", "tests.qa.run_all_phases"],
+            [_sys.executable, "-u", "-m", "tests.qa.run_all_phases"],
         ):
             yield evt
             try:
@@ -1738,7 +1744,8 @@ async def run_sota_bench(request: Request):
         }
         bench_failed = False
         bench_cmd = [
-            "python", "-u", "-m", "backend.scripts.compare_autoflip_vs_clipai",
+            _sys.executable, "-u", "-m",
+            "backend.scripts.compare_autoflip_vs_clipai",
             "--manifest", manifest,
             "--output", "/tmp/sota_bench_results.md",
             "--json-out", "/tmp/sota_bench_results.json",
