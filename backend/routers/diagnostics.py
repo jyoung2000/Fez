@@ -2583,6 +2583,128 @@ async def sota_clip_bench(request: Request):
     )
 
 
+@router.post("/sota-clip-ab")
+async def sota_clip_ab(request: Request):
+    """Render a 3-up A/B/C preview MP4 for a previously-uploaded clip.
+
+    Body: ``{"token": "<from /sota-clip-upload>"}``. SSE-streams the
+    render phase; the final ``complete`` event has the MP4 path the UI
+    can play via the existing ``/sota-clip-ab-preview/{token}.mp4``
+    endpoint.
+    """
+    import sys as _sys
+    from fastapi.responses import StreamingResponse
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    token = (body.get("token") or "").strip()
+    info = _SOTA_CLIP_UPLOADS.get(token)
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo_root = os.path.dirname(repo_root)
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        if info is None:
+            yield _sse_event("complete", {
+                "ok": False, "stage": "preflight",
+                "message": "Upload token not found or expired (1 h TTL).",
+            })
+            return
+        if not os.path.isfile(info["path"]):
+            yield _sse_event("complete", {
+                "ok": False, "stage": "preflight",
+                "message": "Uploaded MP4 vanished from disk.",
+            })
+            return
+
+        out_path = f"/tmp/sota_clip_{token}_ab.mp4"
+        yield _sse_event("phase_start", {
+            "phase": "ab_render",
+            "label": (
+                "Rendering 3-up A/B/C preview "
+                "(3 ffmpeg passes + hstack stitch)..."
+            ),
+        })
+
+        cmd = [
+            _sys.executable, "-u", "-m",
+            "backend.scripts.render_ab_preview",
+            "--source", info["path"],
+            "--out", out_path,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=repo_root,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                yield _sse_event("log", {
+                    "line": line.decode(errors="replace").rstrip(),
+                })
+            await proc.wait()
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        if proc.returncode == 0 and os.path.isfile(out_path):
+            yield _sse_event("phase_result", {
+                "phase": "ab_render", "status": "pass",
+                "ab_preview_path": out_path,
+            })
+            yield _sse_event("complete", {
+                "ok": True, "stage": "ab_render",
+                "ab_preview_path": out_path,
+                "message": "3-up preview rendered.",
+            })
+        else:
+            yield _sse_event("phase_result", {
+                "phase": "ab_render", "status": "fail",
+            })
+            yield _sse_event("complete", {
+                "ok": False, "stage": "ab_render",
+                "message": (
+                    f"render exited {proc.returncode}; see streaming "
+                    f"output above for the ffmpeg error."
+                ),
+            })
+
+    return StreamingResponse(
+        event_stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/sota-clip-ab-preview/{token}.mp4")
+async def sota_clip_ab_preview(token: str, request: Request):
+    """Serve the rendered 3-up A/B/C preview MP4 for an upload token."""
+    from fastapi.responses import FileResponse, Response
+    info = _SOTA_CLIP_UPLOADS.get(token)
+    if info is None:
+        return Response(status_code=404, content="upload token not found")
+    path = f"/tmp/sota_clip_{token}_ab.mp4"
+    if not os.path.isfile(path):
+        return Response(
+            status_code=404,
+            content="A/B preview not yet rendered. POST /sota-clip-ab first.",
+        )
+    return FileResponse(
+        path, media_type="video/mp4",
+        filename=f"sota_ab_{info.get('filename', 'clip')}",
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "no-cache"},
+    )
+
+
 @router.get("/sota-clip-preview/{token}.mp4")
 async def sota_clip_preview(token: str, request: Request):
     """Serve the 9:16 SOTA-rendered preview MP4 for an upload token.
