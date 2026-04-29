@@ -511,6 +511,22 @@ class AIOrchestrator:
             "is_thinking": provider.is_thinking_model,
         }
 
+    @property
+    def vision_provider(self):
+        """Return the first active provider that supports vision.
+
+        Used by :func:`apply_visual_verification` (Task 6 wiring).
+        Returns ``None`` when no vision-capable provider is configured
+        — the verifier wrapper handles ``None`` cleanly by skipping.
+        Walks the active chain in priority order (degraded /
+        unreachable providers excluded) so verification follows the
+        same chain-of-trust as scene description.
+        """
+        for provider in self._get_active_chain():
+            if getattr(provider, "supports_vision", False):
+                return provider
+        return None
+
     def _get_active_chain(self) -> list[AIProvider]:
         chain = []
         skipped = []
@@ -838,6 +854,8 @@ class AIOrchestrator:
         viral_score_min: int = 0,
         viral_score_max: int = 100,
         min_relevance: int = 0,
+        frames=None,
+        cancel_check=None,
     ) -> tuple[list[ClipCandidate], str]:
         """Returns (clips, provider_name_used).
 
@@ -858,7 +876,8 @@ class AIOrchestrator:
             DEFAULT_VIRAL_CLIP_PROMPT, get_genre_prompt,
         )
         from backend.services.clip_scoring import (
-            finalize_clip_scores, four_axis_scoring_enabled,
+            apply_visual_verification, finalize_clip_scores,
+            four_axis_scoring_enabled,
         )
         if custom_user_prompt and custom_user_prompt != DEFAULT_VIRAL_CLIP_PROMPT:
             clip_prompt = custom_user_prompt
@@ -1029,6 +1048,62 @@ class AIOrchestrator:
         # so even if a timeout fires, we have whatever completed.
         _partial_clips: list = []
 
+        async def _run_visual_verification(verified_clips, label):
+            """Task 6 — fire the visual verifier after finalize_clip_scores.
+
+            Snapshots viral_score per clip, calls the wrapped verifier
+            (no-op when the flag is off / no provider / no frames),
+            then writes a ``visual_verification`` block into
+            ``score_diagnostics`` so the UI badge has the data it
+            needs without modifying ``verify_clips_visually`` itself.
+            """
+            if not verified_clips:
+                return verified_clips
+            vp = self.vision_provider
+            pre_scores = {id(c): int(c.viral_score) for c in verified_clips}
+            verified_clips = await apply_visual_verification(
+                verified_clips,
+                frames or [],
+                vp,
+                cancel_check=cancel_check or self._cancel_check,
+            )
+            n_changed = 0
+            for clip in verified_clips:
+                pre = pre_scores.get(id(clip))
+                if pre is None:
+                    continue
+                post = int(clip.viral_score)
+                if vp is None or not frames:
+                    note = "skipped"
+                elif post == pre:
+                    note = "unchanged"
+                elif post > pre:
+                    note = "boosted"
+                    n_changed += 1
+                else:
+                    note = "lowered"
+                    n_changed += 1
+                diag = dict(getattr(clip, "score_diagnostics", None) or {})
+                diag["visual_verification"] = {
+                    "pre_score": pre,
+                    "post_score": post,
+                    "delta": post - pre,
+                    "note": note,
+                }
+                clip.score_diagnostics = diag
+            if progress_callback:
+                if vp is None or not frames:
+                    progress_callback(
+                        f"Visual verification skipped ({label}: "
+                        f"{'no vision provider' if vp is None else 'no frames'})"
+                    )
+                else:
+                    progress_callback(
+                        f"Visual verification adjusted {n_changed} of "
+                        f"{len(verified_clips)} clip scores ({label})"
+                    )
+            return verified_clips
+
         for provider in self._get_active_chain():
             pname = provider.provider_name
             # Compute Ollama timeout: sequential windows need much more time
@@ -1064,6 +1139,7 @@ class AIOrchestrator:
                 # axes are all zero (legacy clip path).
                 if four_axis_scoring_enabled():
                     finalize_clip_scores(result, content_type, focus_mode=is_focus_mode)
+                result = await _run_visual_verification(result, label="primary")
                 return result, self._get_task_model(provider, "clips")
             except asyncio.TimeoutError:
                 elapsed = time.monotonic() - t0
@@ -1079,6 +1155,7 @@ class AIOrchestrator:
                     )
                     if four_axis_scoring_enabled():
                         finalize_clip_scores(deduped, content_type, focus_mode=is_focus_mode)
+                    deduped = await _run_visual_verification(deduped, label="partial-timeout")
                     return deduped, f"{self._get_task_model(provider, 'clips')} (partial)"
                 logger.warning("Clip detection via %s timed out after %ds", pname, timeout)
                 self._circuit_breaker.record_failure(pname)
@@ -1096,6 +1173,9 @@ class AIOrchestrator:
             )
             if four_axis_scoring_enabled():
                 finalize_clip_scores(_partial_clips, content_type, focus_mode=is_focus_mode)
+            _partial_clips = await _run_visual_verification(
+                _partial_clips, label="all-providers-failed",
+            )
             return _partial_clips, "partial"
         raise AllProvidersFailedError("All providers failed for viral clip detection")
 
