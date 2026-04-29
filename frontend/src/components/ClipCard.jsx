@@ -403,6 +403,34 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
                 Relevance: {clip.focus_relevance}/100
               </span>
             )}
+            {/* Task 6 — visual verification badge. The orchestrator
+                writes score_diagnostics.visual_verification with
+                {pre_score, post_score, delta, note} after running
+                apply_visual_verification. */}
+            {(() => {
+              const vv = diag.visual_verification;
+              if (!vv || vv.note === 'skipped') return null;
+              const isUp = (vv.delta || 0) >= 0;
+              const color = isUp ? 'var(--success, #34c759)' : 'var(--warning, #ff9f0a)';
+              const symbol = isUp ? '✓' : '↓';
+              const label = isUp ? 'Verified' : 'Verified';
+              const tip = (
+                `Visual verifier: ${vv.pre_score} → ${vv.post_score} (${vv.delta >= 0 ? '+' : ''}${vv.delta})`
+              );
+              return (
+                <span
+                  className="badge"
+                  title={tip}
+                  style={{
+                    background: 'transparent',
+                    color,
+                    border: `1px solid ${color}`,
+                  }}
+                >
+                  {symbol} {label}
+                </span>
+              );
+            })()}
           </>
         )}
       </div>
