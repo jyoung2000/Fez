@@ -117,37 +117,66 @@ _REQUIRED_CACHE_FILES = (
 # inside the target range AND its segments_under_1s_rate is under the
 # allowed ceiling. Jalon can tune these after the first real run.
 
+# Task 4: every zone now also bounds the four real-content metrics
+# (face_clipping_rate, saliency_in_crop_fraction, text_region_clipping_rate,
+# identity_switch_count). Genre-appropriate values: panel/animation_dialogue
+# stricter on face clipping; sports looser; music_video looser on text.
+# Metric thresholds default to the values in the prompt's Task 4 spec.
 TARGET_ZONES: dict[str, dict[str, float]] = {
     "multi_speaker_panel": {
         "median_hold_min": 3.0,
         "median_hold_max": 6.0,
         "under_1s_max": 0.05,
+        "face_clipping_rate_max": 0.05,
+        "saliency_in_crop_min": 0.80,
+        "text_clipping_rate_max": 0.05,
+        "identity_switch_per_min_max": 2.0,
     },
     "animation": {
         # Action anime: short cuts are the norm
         "median_hold_min": 0.8,
         "median_hold_max": 2.0,
         "under_1s_max": 0.10,
+        "face_clipping_rate_max": 0.10,
+        "saliency_in_crop_min": 0.65,
+        "text_clipping_rate_max": 0.10,
+        "identity_switch_per_min_max": 5.0,
     },
     "animation_dialogue": {
         "median_hold_min": 2.5,
         "median_hold_max": 5.0,
         "under_1s_max": 0.05,
+        "face_clipping_rate_max": 0.05,
+        "saliency_in_crop_min": 0.80,
+        "text_clipping_rate_max": 0.05,
+        "identity_switch_per_min_max": 2.0,
     },
     "sports_basketball": {
         "median_hold_min": 1.5,
         "median_hold_max": 3.5,
         "under_1s_max": 0.10,
+        "face_clipping_rate_max": 0.15,
+        "saliency_in_crop_min": 0.60,
+        "text_clipping_rate_max": 0.10,
+        "identity_switch_per_min_max": 5.0,
     },
     "sports_racing": {
         "median_hold_min": 2.5,
         "median_hold_max": 5.0,
         "under_1s_max": 0.05,
+        "face_clipping_rate_max": 0.15,
+        "saliency_in_crop_min": 0.60,
+        "text_clipping_rate_max": 0.10,
+        "identity_switch_per_min_max": 5.0,
     },
     "sports": {
         "median_hold_min": 2.0,
         "median_hold_max": 4.5,
         "under_1s_max": 0.08,
+        "face_clipping_rate_max": 0.15,
+        "saliency_in_crop_min": 0.60,
+        "text_clipping_rate_max": 0.10,
+        "identity_switch_per_min_max": 5.0,
     },
     # Music video is handled with a subtype split below; these are
     # the defaults when no subtype is pinned.
@@ -155,30 +184,62 @@ TARGET_ZONES: dict[str, dict[str, float]] = {
         "median_hold_min": 1.0,
         "median_hold_max": 4.5,
         "under_1s_max": 0.15,
+        "face_clipping_rate_max": 0.10,
+        "saliency_in_crop_min": 0.65,
+        "text_clipping_rate_max": 0.20,
+        "identity_switch_per_min_max": 5.0,
     },
     "music_video_performance": {
         "median_hold_min": 1.0,
         "median_hold_max": 2.5,
         "under_1s_max": 0.15,
+        "face_clipping_rate_max": 0.10,
+        "saliency_in_crop_min": 0.65,
+        "text_clipping_rate_max": 0.20,
+        "identity_switch_per_min_max": 5.0,
     },
     "music_video_narrative": {
         "median_hold_min": 2.5,
         "median_hold_max": 5.0,
         "under_1s_max": 0.05,
+        "face_clipping_rate_max": 0.10,
+        "saliency_in_crop_min": 0.70,
+        "text_clipping_rate_max": 0.20,
+        "identity_switch_per_min_max": 3.0,
+    },
+    # Default zone — used when target_clipcontenttype is unknown so
+    # verdicts never come back UNKNOWN for a successful run.
+    "default": {
+        "median_hold_min": 1.5,
+        "median_hold_max": 5.5,
+        "under_1s_max": 0.10,
+        "max_acceleration": 15.0,
+        "max_jerk": 15.0,
+        "face_clipping_rate_max": 0.10,
+        "saliency_in_crop_min": 0.65,
+        "text_clipping_rate_max": 0.10,
+        "identity_switch_per_min_max": 5.0,
     },
 }
 
 
-def target_zone_for(clip: dict) -> Optional[dict[str, float]]:
+def target_zone_for(clip: dict) -> dict[str, float]:
     """Look up the target zone for a clip, falling back through
-    (clipcontenttype + subtype) → clipcontenttype → None."""
+    (clipcontenttype + subtype) → clipcontenttype → "default" zone.
+
+    Task 4: this never returns ``None`` anymore — unknown content
+    types fall back to the ``"default"`` zone so verdicts cannot be
+    UNKNOWN for a clip that ran successfully.
+    """
     ct = clip.get("target_clipcontenttype") or ""
     sub = clip.get("subtype") or ""
     if ct == "music_video" and sub:
         key = f"music_video_{sub}"
         if key in TARGET_ZONES:
             return TARGET_ZONES[key]
-    return TARGET_ZONES.get(ct)
+    if ct in TARGET_ZONES:
+        return TARGET_ZONES[ct]
+    return TARGET_ZONES["default"]
 
 
 # ─────────────────── Scoring ───────────────────
@@ -313,8 +374,20 @@ def score_timeline(
 
 
 def verdict_for(metrics: dict[str, Any], zone: Optional[dict[str, float]]) -> str:
-    """Return PASS / MARGINAL / MISS / UNKNOWN for a (clip, tool) pair."""
-    if not metrics or metrics.get("n_segments", 0) == 0:
+    """Return PASS / MARGINAL / MISS / UNKNOWN for a (clip, tool) pair.
+
+    Task 4 verdict logic:
+      - All hold-zone bounds passed AND no Task 2 metric out of zone
+        → PASS.
+      - Hold zone passed but at least one Task 2 metric out of zone
+        → MARGINAL (silently-bad clip; good pacing, wrong subjects).
+      - Hold zone failed (median or under_1s out of range) → MISS.
+      - No metrics computed (empty events) → UNKNOWN. Empty data is
+        not a silent metric.
+    """
+    if not metrics:
+        return "UNKNOWN"
+    if metrics.get("n_segments", 0) == 0:
         return "UNKNOWN"
     if zone is None:
         return "UNKNOWN"
@@ -324,8 +397,42 @@ def verdict_for(metrics: dict[str, Any], zone: Optional[dict[str, float]]) -> st
         return "UNKNOWN"
     in_median = zone["median_hold_min"] <= median <= zone["median_hold_max"]
     under_ok = under <= zone["under_1s_max"]
-    if in_median and under_ok:
+    hold_zone_pass = in_median and under_ok
+
+    # Task 2 metrics — only enforced when measured (None = not measured).
+    extra_failures: list[str] = []
+    face_max = zone.get("face_clipping_rate_max")
+    sal_min = zone.get("saliency_in_crop_min")
+    text_max = zone.get("text_clipping_rate_max")
+    id_per_min_max = zone.get("identity_switch_per_min_max")
+
+    fc = metrics.get("face_clipping_rate")
+    if face_max is not None and fc is not None and fc > face_max:
+        extra_failures.append("face_clipping_rate")
+    sal = metrics.get("saliency_in_crop_fraction")
+    if sal_min is not None and sal is not None and sal < sal_min:
+        extra_failures.append("saliency_in_crop_fraction")
+    tc = metrics.get("text_region_clipping_rate")
+    if text_max is not None and tc is not None and tc > text_max:
+        extra_failures.append("text_region_clipping_rate")
+    id_sw = metrics.get("identity_switch_count")
+    if id_per_min_max is not None and id_sw is not None:
+        # Need clip duration to convert switch count to per-minute rate.
+        # Use n_segments × median_hold as a duration proxy when explicit
+        # duration isn't surfaced — the bench's events are 1-per-frame
+        # so the last - first timestamp would be more accurate, but
+        # n_segments × median is good enough for the threshold check.
+        n_seg = metrics.get("n_segments") or 0
+        med = median or 0.0
+        approx_minutes = max((n_seg * med) / 60.0, 1.0 / 60.0)
+        per_min = id_sw / approx_minutes
+        if per_min > id_per_min_max:
+            extra_failures.append("identity_switch_count")
+
+    if hold_zone_pass and not extra_failures:
         return "PASS"
+    if hold_zone_pass and extra_failures:
+        return "MARGINAL"
     if in_median or under_ok:
         return "MARGINAL"
     return "MISS"

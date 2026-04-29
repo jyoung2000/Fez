@@ -159,6 +159,90 @@ def test_extract_per_frame_data_from_payload_missing_keys():
     }
 
 
+# ──────────────────────────────────────────────────────────────────
+# Task 4 — default zone + verdict downgrades on new metrics
+# ──────────────────────────────────────────────────────────────────
+
+
+class TestTargetZoneFallback:
+    def test_target_zone_unknown_falls_back_to_default(self):
+        from backend.scripts.compare_autoflip_vs_clipai import (
+            TARGET_ZONES, target_zone_for,
+        )
+        zone = target_zone_for({"target_clipcontenttype": "some_made_up_type"})
+        assert zone is TARGET_ZONES["default"]
+
+    def test_target_zone_known_returns_specific(self):
+        from backend.scripts.compare_autoflip_vs_clipai import (
+            TARGET_ZONES, target_zone_for,
+        )
+        zone = target_zone_for({"target_clipcontenttype": "multi_speaker_panel"})
+        assert zone is TARGET_ZONES["multi_speaker_panel"]
+
+
+class TestVerdictDowngrades:
+    def _good_hold(self):
+        return {
+            "n_segments": 10, "median_hold_sec": 4.0,
+            "segments_under_1s_rate": 0.02,
+        }
+
+    def test_pass_with_all_metrics_in_zone(self):
+        from backend.scripts.compare_autoflip_vs_clipai import (
+            TARGET_ZONES, verdict_for,
+        )
+        m = self._good_hold() | {
+            "face_clipping_rate": 0.01, "saliency_in_crop_fraction": 0.95,
+            "text_region_clipping_rate": 0.0, "identity_switch_count": 0,
+        }
+        assert verdict_for(m, TARGET_ZONES["multi_speaker_panel"]) == "PASS"
+
+    def test_downgrades_on_face_clipping(self):
+        from backend.scripts.compare_autoflip_vs_clipai import (
+            TARGET_ZONES, verdict_for,
+        )
+        m = self._good_hold() | {
+            "face_clipping_rate": 0.15, "saliency_in_crop_fraction": 0.95,
+            "text_region_clipping_rate": 0.0, "identity_switch_count": 0,
+        }
+        assert verdict_for(m, TARGET_ZONES["multi_speaker_panel"]) == "MARGINAL"
+
+    def test_downgrades_on_low_saliency(self):
+        from backend.scripts.compare_autoflip_vs_clipai import (
+            TARGET_ZONES, verdict_for,
+        )
+        m = self._good_hold() | {
+            "face_clipping_rate": 0.0, "saliency_in_crop_fraction": 0.50,
+            "text_region_clipping_rate": 0.0, "identity_switch_count": 0,
+        }
+        assert verdict_for(m, TARGET_ZONES["multi_speaker_panel"]) == "MARGINAL"
+
+    def test_unknown_only_when_no_events(self):
+        from backend.scripts.compare_autoflip_vs_clipai import (
+            TARGET_ZONES, verdict_for,
+        )
+        # n_segments=0 → UNKNOWN.
+        assert verdict_for(
+            {"n_segments": 0}, TARGET_ZONES["default"],
+        ) == "UNKNOWN"
+
+    def test_default_zone_pass_for_unknown_content_type(self):
+        """Pre-Task-4 this clip would have been UNKNOWN. Now the
+        default zone catches it."""
+        from backend.scripts.compare_autoflip_vs_clipai import (
+            target_zone_for, verdict_for,
+        )
+        clip = {"target_clipcontenttype": "made_up_genre"}
+        zone = target_zone_for(clip)
+        m = {
+            "n_segments": 8, "median_hold_sec": 3.0,
+            "segments_under_1s_rate": 0.05,
+            "face_clipping_rate": 0.02, "saliency_in_crop_fraction": 0.85,
+            "text_region_clipping_rate": 0.01, "identity_switch_count": 1,
+        }
+        assert verdict_for(m, zone) == "PASS"
+
+
 def test_extract_per_frame_data_from_payload_present_keys():
     """When the cache payload includes the four fields, they pass through."""
     from backend.scripts.compare_autoflip_vs_clipai import (
