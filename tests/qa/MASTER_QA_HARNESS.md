@@ -44,6 +44,39 @@ sandboxed CI).
 |                                    |       | LP soft-prior integration, allowlist |
 |                                    |       | removal, cache key stability,        |
 |                                    |       | Phase E config defaults.             |
+| `test_naive_baseline_reference.py` | 9     | Naive baseline reference generator   |
+|                                    |       | (Task 5, Path B fallback).           |
+| `test_autoflip_reference_real.py`  | 15    | Real MediaPipe AutoFlip reference    |
+|                                    |       | generator (Task 5A, Path A) —        |
+|                                    |       | docker invocation mocked, parser +   |
+|                                    |       | manifest + tool-label propagation    |
+|                                    |       | exercised end-to-end.                |
+| `test_clip_verifier_wiring.py`     | 8     | Visual clip verifier wrapper +       |
+|                                    |       | feature-flag plumbing (Task 6).      |
+| `test_clip_verifier_integration.py`| 10    | End-to-end wiring of the visual      |
+|                                    |       | verifier into ai_orchestrator —      |
+|                                    |       | confirms detect_viral_clips invokes  |
+|                                    |       | apply_visual_verification on the     |
+|                                    |       | nominal, partial-results, and        |
+|                                    |       | all-providers-failed paths.          |
+
+### Real AutoFlip availability
+
+The bench's "AutoFlip" column is the published 2020 MediaPipe
+reframer when `tests/autoflip_reference_outputs/<slug>.json` carries
+`"tool": "autoflip_real"`. When the JSON's tool field is
+`naive_baseline`, the column is the strawman center-crop tracker —
+the rollup labels it `autoflip (naive)` and emits a warning so SOTA
+claims aren't accidentally made against it. To regenerate references
+against real AutoFlip:
+
+```bash
+make autoflip-references-build   # one-time, ~30-60 minutes
+make autoflip-references         # produces autoflip_real JSONs
+```
+
+See `infra/autoflip/README.md` for build details and the prebuilt-
+binary fallback (Path A2).
 
 ## Per-phase gating
 

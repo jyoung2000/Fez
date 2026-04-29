@@ -1,0 +1,30 @@
+# Synthetic AutoFlip ExternalRenderFrame text-format sample (Task 5A).
+# Three frames, drift left to right. Used by
+# tests/qa/test_autoflip_reference_real.py to validate the parser.
+render_frame {
+  rect {
+    x: 0.20
+    y: 0.0
+    width: 0.5625
+    height: 1.0
+  }
+  timestamp_us: 0
+}
+render_frame {
+  rect {
+    x: 0.30
+    y: 0.0
+    width: 0.5625
+    height: 1.0
+  }
+  timestamp_us: 33333
+}
+render_frame {
+  rect {
+    x: 0.40
+    y: 0.0
+    width: 0.5625
+    height: 1.0
+  }
+  timestamp_us: 66666
+}
