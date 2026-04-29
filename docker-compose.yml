@@ -118,6 +118,24 @@ services:
       retries: 8
       start_period: 45s
 
+  # MediaPipe AutoFlip CPU sidecar for the SOTA reframing bench
+  # (Task 5A). Opt-in via the "bench" profile so default-up flows do
+  # not pull or build it. Writes per-clip reference JSONs into
+  # tests/autoflip_reference_outputs/. See infra/autoflip/README.md.
+  autoflip:
+    image: clipai/autoflip:local
+    container_name: clipai-autoflip
+    build:
+      context: ./infra/autoflip
+      dockerfile: Dockerfile
+    profiles: ["bench"]
+    volumes:
+      # Source MP4s — read-only so the binary can never modify
+      # fixture inputs.
+      - ./data/real_content_cache:/data:ro
+      # Per-clip reference JSON + intermediate pbtxt metadata.
+      - ./tests/autoflip_reference_outputs:/output
+
 
 volumes:
   ollama_models:

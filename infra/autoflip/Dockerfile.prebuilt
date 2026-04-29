@@ -1,0 +1,43 @@
+# Path A2 fallback: prebuilt MediaPipe AutoFlip binary.
+#
+# Use this when the Bazel build in Dockerfile cannot complete in the
+# homelab (>2h, OOM, missing dependency). You MUST supply both
+# AUTOFLIP_BINARY_URL (https mirror you trust) and AUTOFLIP_BINARY_SHA256
+# (sha256 of that binary) at build time:
+#
+#   docker build \
+#     -f infra/autoflip/Dockerfile.prebuilt \
+#     --build-arg AUTOFLIP_BINARY_URL=https://your-mirror/run_autoflip \
+#     --build-arg AUTOFLIP_BINARY_SHA256=<sha256> \
+#     -t clipai/autoflip:local infra/autoflip
+#
+# The prompt deliberately leaves these blank — there is no public
+# MediaPipe AutoFlip binary release. Either build the Bazel image once
+# from a workstation and push it to your private registry, or extract
+# the binary from a CI artifact you control. NEVER curl an unaudited
+# binary from a random GitHub Actions run.
+
+FROM ubuntu:22.04
+
+ARG AUTOFLIP_BINARY_URL=""
+ARG AUTOFLIP_BINARY_SHA256=""
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg curl ca-certificates \
+        libopencv-core4.5d libopencv-imgproc4.5d \
+        libopencv-imgcodecs4.5d libopencv-videoio4.5d \
+        libopencv-calib3d4.5d libopencv-features2d4.5d \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN test -n "${AUTOFLIP_BINARY_URL}" \
+    || (echo "ERROR: AUTOFLIP_BINARY_URL not set. See infra/autoflip/README.md." && exit 1)
+RUN test -n "${AUTOFLIP_BINARY_SHA256}" \
+    || (echo "ERROR: AUTOFLIP_BINARY_SHA256 not set. See infra/autoflip/README.md." && exit 1)
+
+RUN curl -fsSL -o /usr/local/bin/run_autoflip "${AUTOFLIP_BINARY_URL}" \
+    && echo "${AUTOFLIP_BINARY_SHA256}  /usr/local/bin/run_autoflip" | sha256sum -c - \
+    && chmod +x /usr/local/bin/run_autoflip
+
+ENTRYPOINT ["/usr/local/bin/run_autoflip"]
