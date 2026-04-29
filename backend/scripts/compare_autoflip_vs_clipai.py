@@ -202,26 +202,63 @@ def _derive_crop_centers_pct(events: list[dict]) -> list[float]:
     return [float(e.get("crop_cx", 0.5)) * 100.0 for e in events]
 
 
-def score_timeline(events: list[dict]) -> dict[str, Any]:
+def score_timeline(
+    events: list[dict],
+    *,
+    face_bboxes_per_frame: Optional[list] = None,
+    saliency_peaks_per_second: Optional[list] = None,
+    text_regions_per_frame: Optional[list] = None,
+    identity_timeline: Optional[list] = None,
+    crop_width_pct: float = 56.25,
+) -> dict[str, Any]:
     """Run every applicable parity metric over an AutoFlip-shape
     event list.
 
-    Returns a dict ready to paste into the markdown rollup.
+    Args:
+        events: AutoFlip-shape event list (one per frame).
+        face_bboxes_per_frame: Optional per-event face bboxes
+            ``[(x, y, w, h), ...]`` in % of source width. ``None``
+            means the metric was not measured (older extraction
+            cache); the result key is then ``None`` instead of ``0.0``.
+        saliency_peaks_per_second: Optional per-second top peak list
+            ``[[(x_pct, y_pct, score), ...], ...]``.
+        text_regions_per_frame: Optional per-event text bboxes
+            (% of source width).
+        identity_timeline: Optional per-frame slot-bbox dict
+            ``[{"t": float, "slots": {slot_id: (x, y, w, h)}}, ...]``.
+        crop_width_pct: Crop width in % of source. Default 56.25 =
+            9:16 crop on a 16:9 source. Override for wider crops.
+
+    Returns a dict ready to paste into the markdown rollup. Keys for
+    optional metrics are ``None`` when their input was ``None`` —
+    this distinguishes "not measured" from "measured zero" so the
+    verdict logic doesn't silently grade missing data as a free pass.
     """
     from backend.services.autoflip_parity_metrics import (
         cut_to_hold_ratio,
+        face_clipping_rate,
+        identity_switch_count,
         max_acceleration,
         max_jerk,
         overlap_count,
+        saliency_in_crop_fraction,
+        text_region_clipping_rate,
     )
 
     if not events:
         return {
             "n_segments": 0,
             "note": "empty event list",
+            # Even on empty events we surface the keys with None so
+            # downstream code doesn't have to KeyError-guard.
+            "face_clipping_rate": None,
+            "saliency_in_crop_fraction": None,
+            "text_region_clipping_rate": None,
+            "identity_switch_count": None,
         }
 
     crop_centers = _derive_crop_centers_pct(events)
+    timestamps = [float(e.get("t", 0.0)) for e in events]
     hold = cut_to_hold_ratio(events)
 
     # overlap_count consumes (start, end) spans; derive from the
@@ -231,6 +268,30 @@ def score_timeline(events: list[dict]) -> dict[str, Any]:
         segment_starts = [float(events[0]["t"])]
     segment_ends = segment_starts[1:] + [float(events[-1]["t"])]
     spans = list(zip(segment_starts, segment_ends))
+
+    # Optional metrics: only compute when the caller actually has data.
+    face_clip: Optional[float] = None
+    if face_bboxes_per_frame is not None:
+        face_clip = face_clipping_rate(
+            crop_centers, crop_width_pct, face_bboxes_per_frame,
+        )
+
+    sal_in_crop: Optional[float] = None
+    if saliency_peaks_per_second is not None:
+        sal_in_crop = saliency_in_crop_fraction(
+            crop_centers, crop_width_pct, saliency_peaks_per_second,
+            timestamps=timestamps,
+        )
+
+    text_clip: Optional[float] = None
+    if text_regions_per_frame is not None:
+        text_clip = text_region_clipping_rate(
+            crop_centers, crop_width_pct, text_regions_per_frame,
+        )
+
+    id_switches: Optional[int] = None
+    if identity_timeline is not None:
+        id_switches = identity_switch_count(identity_timeline)
 
     return {
         "n_segments": hold.get("n_segments", 0),
@@ -243,6 +304,11 @@ def score_timeline(events: list[dict]) -> dict[str, Any]:
         "max_acceleration": max_acceleration(crop_centers),
         "max_jerk": max_jerk(crop_centers),
         "overlap_count": overlap_count(spans),
+        # New Task 2 metrics. None means "not measured this run."
+        "face_clipping_rate": face_clip,
+        "saliency_in_crop_fraction": sal_in_crop,
+        "text_region_clipping_rate": text_clip,
+        "identity_switch_count": id_switches,
     }
 
 
@@ -946,7 +1012,41 @@ def _extract_and_cache(
 def _load_cached_extraction(clip_cache: Path) -> dict:
     metadata = json.loads((clip_cache / "metadata.json").read_text())
     segments = json.loads((clip_cache / "segments.json").read_text())
-    return {"metadata": metadata, "segments": segments}
+    payload: dict[str, Any] = {"metadata": metadata, "segments": segments}
+    # Task 2 per-frame data — optional. When the cache predates these
+    # fields the keys stay missing; ``extract_per_frame_data_from_payload``
+    # returns None for each so the metrics report "not measured" instead
+    # of "perfect."
+    for fname, key in (
+        ("face_bboxes_per_frame.json", "face_bboxes_per_frame"),
+        ("saliency_peaks_per_second.json", "saliency_peaks_per_second"),
+        ("text_regions_per_frame.json", "text_regions_per_frame"),
+        ("identity_timeline.json", "identity_timeline"),
+    ):
+        path = clip_cache / fname
+        if path.is_file():
+            try:
+                payload[key] = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "extraction cache: failed to load %s: %s", fname, exc,
+                )
+    return payload
+
+
+def extract_per_frame_data_from_payload(payload: dict) -> dict[str, Optional[list]]:
+    """Return the four optional per-frame structures Task 2 metrics need.
+
+    Older extraction caches don't have these — for those, every value
+    is ``None``. The bench treats ``None`` as "not measured" which keeps
+    missing data from being silently scored as a perfect zero.
+    """
+    return {
+        "face_bboxes_per_frame": payload.get("face_bboxes_per_frame"),
+        "saliency_peaks_per_second": payload.get("saliency_peaks_per_second"),
+        "text_regions_per_frame": payload.get("text_regions_per_frame"),
+        "identity_timeline": payload.get("identity_timeline"),
+    }
 
 
 def run_clipai_on_clip(
@@ -957,6 +1057,7 @@ def run_clipai_on_clip(
     cache_dir: Optional[Path] = None,
     cache_embeddings: bool = False,
     force_reextract: bool = False,
+    extras_out: Optional[dict] = None,
 ) -> Optional[list[dict]]:
     """Produce a ClipAI timeline event list for a clip.
 
@@ -1049,6 +1150,8 @@ def run_clipai_on_clip(
     events = reframe_segments_to_events(
         segments, src_w, src_h, fps, aspect_ratio="9:16",
     )
+    if extras_out is not None:
+        extras_out.update(extract_per_frame_data_from_payload(payload))
     return events
 
 
@@ -1332,6 +1435,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 result.notes.append(
                     f"no clip at {_candidate}"
                 )
+        ca_extras: dict = {}
         ca_events = run_clipai_on_clip(
             clip,
             video_path=_video_path,
@@ -1339,6 +1443,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             cache_dir=extraction_cache_dir,
             cache_embeddings=args.cache_embeddings,
             force_reextract=args.force_reextract,
+            extras_out=ca_extras,
         )
         if ca_events is None:
             if args.dry_run:
@@ -1346,7 +1451,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             else:
                 result.notes.append("clipai_skipped")
         else:
-            result.clipai = score_timeline(ca_events)
+            result.clipai = score_timeline(ca_events, **ca_extras)
 
         # Optional human ground truth
         gt_events = load_ground_truth_timeline(clip, gt_dir)
