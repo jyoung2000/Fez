@@ -9,6 +9,23 @@ the existing hook-strength / retention adjustments still apply on top of
 the composite, so the LLM's per-axis judgement remains the dominant
 signal but local heuristics can nudge it.
 
+Task 6 (visual verification): ``apply_visual_verification`` wraps
+``backend.services.clip_verifier.verify_clips_visually`` with the
+``CLIPAI_USE_VISUAL_CLIP_VERIFIER`` flag. Callers in possession of the
+extracted FrameData and a vision provider can run this after
+``finalize_clip_scores`` to nudge ``viral_score`` per the verifier's
+hook/conclusion analysis. Capped at 8 clips per call to bound latency.
+
+Task 6 (retention audit): ``backend.services.retention_predictor`` is
+NOT a composite-score input. It is consumed by the
+``GET /api/jobs/{job_id}/retention`` endpoint
+(``backend.routers.clips.get_retention_predictions``) which runs the
+predictor on demand and returns predictions for the UI's retention
+panel. Folding it into ``composite_score`` would require threading
+the transcript + scenes into this module, which is a larger refactor
+deferred to a future task. The audit confirms predictions ARE used
+(for display) — they are not silently dropped.
+
 Backward compatibility: when all four axis scores are zero (legacy
 clips that never went through the new prompt) we leave ``viral_score``
 untouched.
@@ -212,6 +229,58 @@ def finalize_clip_scores(
         })
         clip.score_diagnostics = diag
     return clips
+
+
+def visual_clip_verifier_enabled() -> bool:
+    """Task 6 feature flag — defaults ON.
+
+    Off-state (``CLIPAI_USE_VISUAL_CLIP_VERIFIER=0``) skips the vision
+    API call entirely so production can disable verification without
+    redeploying when API budgets are tight.
+    """
+    return _flag_enabled("CLIPAI_USE_VISUAL_CLIP_VERIFIER", True)
+
+
+async def apply_visual_verification(
+    clips: list[ClipCandidate],
+    frames: list,
+    vision_provider,
+    *,
+    max_clips_to_verify: int = 8,
+    cancel_check=None,
+) -> list[ClipCandidate]:
+    """Task 6 — wrap ``verify_clips_visually`` with the feature flag.
+
+    When ``CLIPAI_USE_VISUAL_CLIP_VERIFIER=0``, no vision API call
+    fires and ``clips`` is returned unchanged. Any verifier exception
+    is logged and the clip list is returned unchanged so verification
+    can never abort an export.
+
+    Capped at ``max_clips_to_verify`` (default 8) to keep latency
+    bounded — each verified clip costs one vision-API call.
+    """
+    if not visual_clip_verifier_enabled():
+        logger.info(
+            "Visual clip verification disabled "
+            "(CLIPAI_USE_VISUAL_CLIP_VERIFIER=0); skipping",
+        )
+        return clips
+    if not clips or vision_provider is None:
+        return clips
+    try:
+        from backend.services.clip_verifier import verify_clips_visually
+        verified = await verify_clips_visually(
+            clips, frames, vision_provider,
+            cancel_check=cancel_check,
+            max_clips_to_verify=max_clips_to_verify,
+        )
+        return verified
+    except Exception as exc:
+        logger.warning(
+            "Visual clip verification crashed (%s); leaving scores unchanged",
+            exc,
+        )
+        return clips
 
 
 def deduplicate_overlapping_clips(
