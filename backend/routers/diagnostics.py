@@ -2322,6 +2322,71 @@ async def sota_clip_bench(request: Request):
                 })
                 return
 
+        # ── Phase 1.5: auto-classify (Task 3) ───────────────────────
+        # When the user picked "default" / "Auto-detect", run a fast
+        # sparse-sampling classifier and substitute its result into
+        # the manifest. Confidence < 0.5 falls back to the literal
+        # "default" string so the bench stays in the default-zone
+        # playbook rather than locking in a wrong genre.
+        resolved_content_type = info.get("content_type") or "default"
+        autoclass_label = ""
+        autoclass_confidence: float = 0.0
+        if (info.get("content_type") or "default") == "default":
+            yield _sse_event("phase_start", {
+                "phase": "auto_classify",
+                "label": "Auto-classifying clip (sparse sample, ≤30s)...",
+            })
+            try:
+                from backend.services.quick_classify import (
+                    quick_classify_video,
+                )
+                profile = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: quick_classify_video(info["path"], job_id=token),
+                )
+                autoclass_label = str(getattr(profile, "content_type", "") or "")
+                autoclass_confidence = float(
+                    getattr(profile, "confidence", 0.0) or 0.0
+                )
+            except Exception as exc:
+                yield _sse_event("log", {
+                    "line": (
+                        f"!! [autoclass] crashed: {exc!s} — "
+                        f"falling back to default playbook"
+                    ),
+                })
+                autoclass_label = ""
+                autoclass_confidence = 0.0
+
+            if autoclass_label and autoclass_confidence >= 0.5:
+                resolved_content_type = autoclass_label
+                yield _sse_event("phase_result", {
+                    "phase": "auto_classify",
+                    "status": "pass",
+                    "detected_content_type": autoclass_label,
+                    "confidence": autoclass_confidence,
+                })
+                yield _sse_event("log", {
+                    "line": (
+                        f"[autoclass] detected: {autoclass_label} "
+                        f"(confidence {autoclass_confidence:.2f})"
+                    ),
+                })
+            else:
+                yield _sse_event("phase_result", {
+                    "phase": "auto_classify",
+                    "status": "fail",
+                    "detected_content_type": autoclass_label,
+                    "confidence": autoclass_confidence,
+                })
+                yield _sse_event("log", {
+                    "line": (
+                        f"[autoclass] confidence too low "
+                        f"({autoclass_confidence:.2f}); falling back to "
+                        f"default playbook"
+                    ),
+                })
+
         # ── Phase 2: synthesize manifest + run bench on the upload ──
         manifest = {
             "schema": 1,
@@ -2334,9 +2399,9 @@ async def sota_clip_bench(request: Request):
                 "sha256": "",
                 "ext": "mp4",
                 "duration_sec": 0,
-                "content_type": info.get("content_type") or "default",
+                "content_type": resolved_content_type,
                 "subtype": None,
-                "target_clipcontenttype": info.get("content_type") or "default",
+                "target_clipcontenttype": resolved_content_type,
                 "description": (
                     f"User-uploaded test clip ({info.get('filename', 'unknown')})"
                 ),
