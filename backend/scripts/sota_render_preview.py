@@ -39,41 +39,83 @@ OUTPUT_H = 1920
 def _build_x_expression(segments: list[dict], src_w: int, crop_w: int) -> str:
     """Build an ffmpeg crop-x expression that picks the right x per second.
 
-    Each segment's ``subject_x`` is the pixel position of the subject
-    centroid in the SOURCE frame. We crop a window of width ``crop_w``
-    centred on that x, clamped so the crop window stays inside the
-    source frame.
+    Each keypoint produced by ``build_camera_path_keypoints`` is the
+    pixel position of the subject centroid at a given time in the
+    SOURCE frame. We crop a window of width ``crop_w`` centred on that
+    x, clamped so the crop window stays inside the source frame.
 
-    The output is a FLAT SUM of ``x_i * between(t, start_i, end_i)``
-    terms. Since segments don't overlap, exactly one between() returns
-    1 at any given t and the rest return 0, so the sum equals the
-    correct x for that time.
+    The output is a FLAT SUM of piecewise-LINEAR lerp terms gated by
+    half-open ``gte(t,t0)*lt(t,t1)`` intervals, plus a final
+    ``gte(t,t_last)`` hold so the crop doesn't snap back to 0 past the
+    last keypoint. Adjacent intervals are non-overlapping, so exactly
+    one term is non-zero at any given t and the sum equals the
+    interpolated x for that time. The flat sum has no recursion
+    depth, so it scales to thousands of keypoints without hitting
+    ffmpeg's expression-parser depth limit.
 
-    The previous implementation nested if(lt(t, end), x, ...) and hit
-    ffmpeg's expression-parser depth limit (around 96 levels) on long
-    clips with many segments. The flat sum has no recursion depth so
-    it scales to thousands of segments cleanly.
+    For segments with a ``motion_path`` the renderer draws a smooth
+    pan along the path. For segments with ``ease_in_ms > 0`` at a
+    motivated cut, the keypoint builder emits smoothstep samples so
+    the linear lerp between them traces an S-curve.
+
+    For OLD cached ``segments.json`` blobs that pre-date the
+    ``motion_path`` serialization, every segment falls back to a
+    held ``(start, subject_x)`` → ``(end, subject_x)`` keypoint pair,
+    so the rendered preview is bit-identical to the legacy
+    step-function behavior.
     """
     if not segments:
         # Centre crop fallback when segments are missing.
         return str((src_w - crop_w) // 2)
 
-    half = crop_w // 2
+    half = crop_w / 2.0
     max_x = max(0, src_w - crop_w)
 
     def _clamp(x: float) -> int:
-        clamped = max(0, min(max_x, int(round(x - half))))
-        return clamped
+        return max(0, min(max_x, int(round(x - half))))
 
-    parts = sorted(segments, key=lambda s: float(s.get("start", 0.0)))
-    terms = []
-    for s in parts:
-        start = float(s.get("start", 0.0))
-        end = float(s.get("end", 0.0))
-        if end <= start:
+    # Lazy import: the renderer is occasionally invoked on hosts
+    # without the full backend stack installed, but
+    # ``export_autoflip_compatible`` is pure Python with no heavy
+    # dependencies so the import is safe.
+    from backend.scripts.export_autoflip_compatible import (
+        build_camera_path_keypoints,
+    )
+
+    keypoints = build_camera_path_keypoints(segments)
+    if not keypoints:
+        return str((src_w - crop_w) // 2)
+
+    # Single keypoint → degenerate hold.
+    if len(keypoints) == 1:
+        x = _clamp(keypoints[0][1])
+        t0 = float(keypoints[0][0])
+        return f"{x}*gte(t,{t0:.3f})"
+
+    terms: list[str] = []
+    for i in range(len(keypoints) - 1):
+        t0 = float(keypoints[i][0])
+        t1 = float(keypoints[i + 1][0])
+        if t1 <= t0:
             continue
-        x = _clamp(float(s.get("subject_x", src_w / 2.0)))
-        terms.append(f"{x}*between(t,{start:.3f},{end:.3f})")
+        x0 = _clamp(keypoints[i][1])
+        x1 = _clamp(keypoints[i + 1][1])
+        if x0 == x1:
+            terms.append(f"{x0}*gte(t,{t0:.3f})*lt(t,{t1:.3f})")
+        else:
+            dx = x1 - x0
+            dt = t1 - t0
+            terms.append(
+                f"({x0}+({dx})*(t-{t0:.3f})/({dt:.3f}))"
+                f"*gte(t,{t0:.3f})*lt(t,{t1:.3f})"
+            )
+
+    # Tail hold so x doesn't drop to 0 once we pass the last keypoint
+    # (ffmpeg keeps evaluating the expression for the trailing tail of
+    # the source clip).
+    t_last = float(keypoints[-1][0])
+    x_last = _clamp(keypoints[-1][1])
+    terms.append(f"{x_last}*gte(t,{t_last:.3f})")
 
     if not terms:
         return str((src_w - crop_w) // 2)

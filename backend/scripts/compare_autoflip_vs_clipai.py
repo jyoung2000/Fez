@@ -503,13 +503,50 @@ def _serialize_anime_anchors(anchors: list) -> list[dict]:
 
 
 def _serialize_reframe_segments(segments: list) -> list[dict]:
-    """Emit a JSON-friendly list of dicts for ``segments.json``. Only
-    the fields the translator + scoring layer care about are pinned;
-    the rest are dropped so embeddings / numpy arrays never leak
-    into the cache blob.
+    """Emit a JSON-friendly list of dicts for ``segments.json``.
+
+    Only the fields the translator + scoring layer care about are
+    pinned; the rest are dropped so embeddings / numpy arrays never
+    leak into the cache blob.
+
+    ``motion_path`` and ``hard_constraints`` are passed through so the
+    diagnostic preview renderer and the events translator can use the
+    same per-frame camera path the production export pipeline uses
+    (see ``render_plan_keyframes.keyframes_from_cached_render_plan``
+    and the smooth interpolation in
+    ``export_autoflip_compatible.build_camera_path_keypoints``).
+    Each motion_path entry is normalized to a JSON-friendly list of
+    ``[t, x]`` (or ``[t, x, y]`` when y is present); ``None`` is
+    preserved when the source segment has no path so back-compat with
+    callers that test ``"motion_path" in seg`` is maintained.
     """
     out: list[dict] = []
     for s in segments or []:
+        raw_path = getattr(s, "motion_path", None)
+        motion_path: Optional[list] = None
+        if raw_path:
+            motion_path = []
+            for entry in raw_path:
+                # Each entry is (t, x) or (t, x, y); preserve y if present.
+                try:
+                    items = [float(v) for v in entry]
+                except (TypeError, ValueError):
+                    continue
+                if len(items) >= 2:
+                    motion_path.append(items[:3])
+
+        raw_hc = getattr(s, "hard_constraints", None)
+        hard_constraints: Optional[list] = None
+        if raw_hc:
+            hard_constraints = []
+            for hc in raw_hc:
+                try:
+                    items = [float(v) for v in hc]
+                except (TypeError, ValueError):
+                    continue
+                if len(items) >= 4:
+                    hard_constraints.append(items[:4])
+
         out.append({
             "start": float(getattr(s, "start", 0.0)),
             "end": float(getattr(s, "end", 0.0)),
@@ -522,6 +559,8 @@ def _serialize_reframe_segments(segments: list) -> list[dict]:
             "ease_in_ms": int(getattr(s, "ease_in_ms", 0) or 0),
             "strategy": str(getattr(s, "strategy", "stationary") or "stationary"),
             "content_type": str(getattr(s, "content_type", "unknown") or "unknown"),
+            "motion_path": motion_path,
+            "hard_constraints": hard_constraints,
         })
     return out
 
