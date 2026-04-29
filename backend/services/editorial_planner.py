@@ -49,9 +49,21 @@ import os
 import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# Behind ``CLIPAI_USE_EDITORIAL_X_TARGETING=1`` (default ON):
+# when callers pass a ``subject_position_lookup`` to
+# :func:`apply_plan_to_lp_targets` the LLM-planned shot subjects
+# steer the LP's x targets via overrides, soft pulls, and lead-room
+# offsets. With the flag OFF the function falls back to the legacy
+# zoom-only behavior even when a lookup is passed — production
+# safety valve for surprise regressions.
+USE_EDITORIAL_X_TARGETING = (
+    os.environ.get("CLIPAI_USE_EDITORIAL_X_TARGETING", "1").strip() == "1"
+)
 
 
 # ── Constants / cache dir ────────────────────────────────────────────
@@ -400,6 +412,26 @@ _FRAMING_TO_ZOOM = {
 }
 
 
+_LEAD_ROOM_OFFSET_FRAC = 0.05
+_REACTION_HARD_OVERRIDE_HALF_S = 0.4   # 800 ms total window
+_DEFAULT_AB_CUT_LOCKIN_S = 0.4
+
+
+def _lead_room_offset_fraction(sx_norm: float) -> float:
+    """Decide which third of the frame ``sx_norm`` falls in.
+
+    Returns ±5% of source width as a fraction (positive = shift target
+    right, negative = shift left). Centered subject → 0. Matches the
+    spec table in Task 1.1: subject in left third → camera target
+    shifts right (frees lead-room on the right of the crop).
+    """
+    if sx_norm < 1.0 / 3.0:
+        return _LEAD_ROOM_OFFSET_FRAC
+    if sx_norm > 2.0 / 3.0:
+        return -_LEAD_ROOM_OFFSET_FRAC
+    return 0.0
+
+
 def apply_plan_to_lp_targets(
     plan: EditorialPlan,
     timestamps: list,
@@ -409,45 +441,164 @@ def apply_plan_to_lp_targets(
     framing_weight: float = 0.5,
     lo_bounds_x: Optional[list] = None,
     hi_bounds_x: Optional[list] = None,
+    subject_position_lookup: Optional[
+        Callable[[str, float], Optional[tuple[float, float]]]
+    ] = None,
+    source_width: int = 1920,
+    lockin_s: float = _DEFAULT_AB_CUT_LOCKIN_S,
 ) -> tuple:
     """Apply the editorial plan as soft priors to per-frame LP targets.
 
     For each frame, finds the active editorial shot and:
-      * Adjusts ``tx`` toward the framing's target zoom-equivalent x
-        (no-op if framing doesn't translate to an x adjustment, which
-        is most cases — framing primarily drives the LP's zoom
-        constraint not its x target).
-      * Records the framing zoom hint so the camera-path solver's
-        zoom-curve consumer can apply it.
 
-    Returns ``(tx_new, ty_new, zoom_hints_per_frame)``. ``zoom_hints``
-    is a list of floats matching the ``timestamps`` length — one
-    target zoom per frame from the planned framing.
+    * **Framing** drives a per-frame zoom hint (medium → 0.85, etc.).
+    * When ``subject_position_lookup`` is provided AND the
+      ``CLIPAI_USE_EDITORIAL_X_TARGETING`` flag is ON:
+
+      - ``ab_cut`` shots **hard-override** ``tx`` toward the
+        ``ab_target`` (or ``subject``) for the first ``lockin_s``
+        seconds of the shot, then decay to a soft pull weighted by
+        ``framing_weight``. Each ab_cut adds a discontinuity mark at
+        ``shot.start`` so the LP solver can split the path there.
+      - ``reaction`` shots with ``reaction_at`` set hard-override
+        ``tx`` toward ``shot.subject`` for an 800 ms window centered
+        on the reaction beat. ``reaction_at`` adds a discontinuity
+        mark.
+      - Plain ``subject`` (no ab_cut) → soft pull with
+        ``blend = 1 - framing_weight``.
+      - ``framing == "tight"`` plus a known subject → additional
+        ±5% lead-room offset (away from the frame edge the subject
+        sits near).
+
+    Args:
+        plan: The :class:`EditorialPlan` from the LLM.
+        timestamps: Per-frame timestamps in seconds (length N).
+        tx: Per-frame existing LP x targets (0-1 source-fraction). May
+            be ``None`` / empty — initialized to 0 in that case.
+        ty: Per-frame existing LP y targets (0-1 source-fraction).
+        framing_weight: Soft-blend weight for non-ab-cut subjects.
+            ``blend = framing_weight`` keeps the original tracker;
+            ``blend = 0`` is a hard override. Decays from 0 to
+            ``framing_weight`` over ``lockin_s`` after each ab_cut.
+        subject_position_lookup: Closure from
+            :func:`build_subject_position_lookup`. ``None`` falls back
+            to legacy zoom-only behavior.
+        source_width: Source frame width in pixels (for normalizing
+            the lookup's pixel returns into 0-1 source-fractions).
+        lockin_s: Hard-override window after each ab_cut.
+
+    Returns:
+        ``(tx_new, ty_new, zoom_hints_per_frame, discontinuity_marks)``.
+
+        ``discontinuity_marks`` is a sorted, deduped (within 50 ms)
+        list of timestamps where the LP solver should be allowed to
+        introduce a hard cut. Empty when no editorial overrides fired.
     """
     n = len(timestamps)
     tx_new = list(tx) if tx else [0.0] * n
     ty_new = list(ty) if ty else [0.0] * n
     zoom_hints: list = [1.0] * n
+    discontinuity_marks: list[float] = []
     if not plan.shots:
-        return tx_new, ty_new, zoom_hints
-    # Build a quick lookup: list of (start, end, shot) sorted by start.
+        return tx_new, ty_new, zoom_hints, discontinuity_marks
+
+    # Honor the flag at the soft-prior layer: even if a caller passed
+    # a lookup, the env-var off-state preserves legacy zoom-only output
+    # so production can disable the new behavior without redeploying.
+    use_x_targeting = (
+        USE_EDITORIAL_X_TARGETING and subject_position_lookup is not None
+    )
+
+    sw = max(1, int(source_width))
     shots = sorted(plan.shots, key=lambda s: s.start)
+
+    # Pre-resolve subject positions per shot so lookups happen at the
+    # event timestamp (start / reaction_at), not at every frame.
+    shot_meta: list[dict] = []
+    for s in shots:
+        meta: dict = {"shot": s, "ab_pos": None, "reaction_pos": None,
+                      "subject_pos_at_start": None}
+        if use_x_targeting:
+            ab_label = s.ab_target or s.subject
+            if s.ab_cut and ab_label:
+                pos = subject_position_lookup(ab_label, float(s.start))
+                if pos is not None:
+                    meta["ab_pos"] = (pos[0] / sw, pos[1] / sw)
+                    discontinuity_marks.append(float(s.start))
+            if s.intent == "reaction" and s.reaction_at is not None and s.subject:
+                pos = subject_position_lookup(s.subject, float(s.reaction_at))
+                if pos is not None:
+                    meta["reaction_pos"] = (pos[0] / sw, pos[1] / sw)
+                    discontinuity_marks.append(float(s.reaction_at))
+            if s.subject and not s.ab_cut:
+                pos = subject_position_lookup(s.subject, float(s.start))
+                if pos is not None:
+                    meta["subject_pos_at_start"] = (pos[0] / sw, pos[1] / sw)
+        shot_meta.append(meta)
+
+    # Walk frames, applying overrides per the active shot's metadata.
     j = 0
     for i, t in enumerate(timestamps):
-        # Advance j to the active shot.
         while j + 1 < len(shots) and shots[j + 1].start <= t:
             j += 1
         s = shots[j]
         if not (s.start - 1e-3 <= t <= s.end + 1e-3):
             continue
         zoom_hints[i] = _FRAMING_TO_ZOOM.get(s.framing, 1.0)
-        # Future: subject-specific x adjustments (e.g. for "ab_cut" to
-        # speaker_2, override tx to speaker_2's last-known position).
-        # That requires the subject-position lookup table from
-        # subject_track.py; we leave it unimplemented at this layer
-        # because the LP solver's existing predictor blend already
-        # handles per-subject re-targeting via primary_slot_by_t.
-    return tx_new, ty_new, zoom_hints
+
+        if not use_x_targeting:
+            continue
+
+        meta = shot_meta[j]
+        applied_x: Optional[float] = None
+        applied_y: Optional[float] = None
+        blend: float = framing_weight
+
+        # 1. Reaction-beat hard window (highest priority — 800 ms
+        # centered on reaction_at trumps everything else for that
+        # frame).
+        if meta["reaction_pos"] is not None and s.reaction_at is not None:
+            if abs(t - float(s.reaction_at)) <= _REACTION_HARD_OVERRIDE_HALF_S:
+                applied_x, applied_y = meta["reaction_pos"]
+                blend = 0.0
+
+        # 2. AB-cut lock-in (hard for lockin_s, then decays to
+        # framing_weight).
+        if applied_x is None and meta["ab_pos"] is not None:
+            dt_in = float(t) - float(s.start)
+            if dt_in >= -1e-6:
+                applied_x, applied_y = meta["ab_pos"]
+                if dt_in < lockin_s:
+                    blend = 0.0
+                else:
+                    blend = framing_weight
+
+        # 3. Plain subject — soft pull when ab_cut isn't set.
+        if applied_x is None and meta["subject_pos_at_start"] is not None:
+            applied_x, applied_y = meta["subject_pos_at_start"]
+            blend = framing_weight
+
+        if applied_x is None:
+            continue
+
+        # Lead-room rule: tight framing + known subject → shift target
+        # ±5% of source width away from the source-frame edge the
+        # subject is near.
+        if s.framing == "tight":
+            applied_x = applied_x + _lead_room_offset_fraction(applied_x)
+
+        tx_new[i] = applied_x * (1.0 - blend) + tx_new[i] * blend
+        if applied_y is not None:
+            ty_new[i] = applied_y * (1.0 - blend) + ty_new[i] * blend
+
+    # Sort + dedupe marks within 50 ms of each other.
+    marks_sorted = sorted(discontinuity_marks)
+    deduped: list[float] = []
+    for m in marks_sorted:
+        if not deduped or (m - deduped[-1]) > 0.05:
+            deduped.append(m)
+
+    return tx_new, ty_new, zoom_hints, deduped
 
 
 def get_supported_content_types() -> set:

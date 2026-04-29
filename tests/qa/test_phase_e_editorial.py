@@ -213,7 +213,7 @@ class TestLpSoftPrior:
         timestamps = [0.0, 1.0, 2.0, 3.0]
         tx = [0.5, 0.5, 0.5, 0.5]
         ty = [0.5, 0.5, 0.5, 0.5]
-        _, _, zoom = apply_plan_to_lp_targets(plan, timestamps, tx, ty)
+        _, _, zoom, _marks = apply_plan_to_lp_targets(plan, timestamps, tx, ty)
         # Frames 0-1 should map to "tight" zoom (~0.7), 2-3 to "wide" (~1.15).
         assert zoom[0] == pytest.approx(0.70)
         assert zoom[1] == pytest.approx(0.70)
@@ -225,10 +225,11 @@ class TestLpSoftPrior:
             EditorialPlan, apply_plan_to_lp_targets,
         )
         plan = EditorialPlan()
-        _, _, zoom = apply_plan_to_lp_targets(
+        _, _, zoom, marks = apply_plan_to_lp_targets(
             plan, [0.0, 1.0, 2.0], [0.5] * 3, [0.5] * 3,
         )
         assert all(z == 1.0 for z in zoom)
+        assert marks == []
 
 
 # ──────────────────────────────────────────────────────────────────

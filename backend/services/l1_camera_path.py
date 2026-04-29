@@ -761,6 +761,167 @@ def _dump_solve_csv(
         logger.warning("L1 telemetry dump failed: %s", e)
 
 
+def _solve_camera_path_with_discontinuities(
+    *,
+    face_positions: list[tuple[float, float]],
+    source_width: int,
+    lam: float,
+    hard_features: Optional[list],
+    source_height: int,
+    crop_aspect: float,
+    job_id: str,
+    seg_idx: int,
+    weights: Optional[list[float]],
+    discontinuity_marks: list[float],
+) -> dict:
+    """Split ``face_positions`` at each mark, solve each piece alone.
+
+    Sub-problems are solved by recursing into :func:`solve_camera_path`
+    without ``discontinuity_marks`` so the recursion bottoms out. The
+    LP / Condat solvers are smoothness-preserving, so the only way to
+    get a hard cut at a mark is to refuse to let the solver see across
+    the boundary — the whole point of the marks.
+
+    Result aggregation: each sub-problem produces its own mode. The
+    aggregate is returned as ``mode="tracking"`` with the concatenated
+    path so downstream consumers (the segmenter's per-segment path
+    consumer) treat the segment as a tracking move. ``center`` is the
+    mean of the concatenated path; ``slope`` is 0 (panning at the
+    aggregate level is meaningless across a cut). If any sub-problem
+    is infeasible the overall result is infeasible.
+
+    Marks are sorted and deduped within 50 ms (matches the dedupe
+    window in :func:`apply_plan_to_lp_targets`).
+    """
+    if not face_positions:
+        return solve_camera_path(
+            face_positions=face_positions,
+            source_width=source_width,
+            lam=lam,
+            hard_features=hard_features,
+            source_height=source_height,
+            crop_aspect=crop_aspect,
+            job_id=job_id,
+            seg_idx=seg_idx,
+            weights=weights,
+        )
+
+    # Sort + dedupe marks within 50ms.
+    marks_sorted = sorted(float(m) for m in discontinuity_marks)
+    deduped: list[float] = []
+    for m in marks_sorted:
+        if not deduped or (m - deduped[-1]) > 0.05:
+            deduped.append(m)
+
+    if not deduped:
+        return solve_camera_path(
+            face_positions=face_positions,
+            source_width=source_width,
+            lam=lam,
+            hard_features=hard_features,
+            source_height=source_height,
+            crop_aspect=crop_aspect,
+            job_id=job_id,
+            seg_idx=seg_idx,
+            weights=weights,
+        )
+
+    # Sort positions + weights jointly by timestamp so the split is
+    # well-defined.
+    pairs: list[tuple[int, tuple[float, float]]] = list(enumerate(face_positions))
+    pairs.sort(key=lambda kv: kv[1][0])
+    sorted_idx = [k for k, _ in pairs]
+    sorted_pos = [p for _, p in pairs]
+    sorted_weights: Optional[list[float]] = None
+    if weights is not None and len(weights) == len(face_positions):
+        sorted_weights = [weights[k] for k in sorted_idx]
+
+    # Build splits: each segment is [start_idx, end_idx_exclusive).
+    splits: list[tuple[int, int]] = []
+    cursor = 0
+    for mark in deduped:
+        # First index whose timestamp >= mark.
+        boundary = cursor
+        while boundary < len(sorted_pos) and sorted_pos[boundary][0] < mark:
+            boundary += 1
+        if boundary > cursor:
+            splits.append((cursor, boundary))
+        cursor = boundary
+    if cursor < len(sorted_pos):
+        splits.append((cursor, len(sorted_pos)))
+
+    # Degenerate: all marks fell outside [t_min, t_max] → solve normally.
+    if len(splits) <= 1:
+        return solve_camera_path(
+            face_positions=face_positions,
+            source_width=source_width,
+            lam=lam,
+            hard_features=hard_features,
+            source_height=source_height,
+            crop_aspect=crop_aspect,
+            job_id=job_id,
+            seg_idx=seg_idx,
+            weights=weights,
+        )
+
+    aggregate_path: list[tuple[float, float]] = []
+    any_infeasible = False
+    infeasible_frames: list = []
+    for sub_idx, (a, b) in enumerate(splits):
+        sub_pos = sorted_pos[a:b]
+        sub_weights = sorted_weights[a:b] if sorted_weights is not None else None
+        sub_result = solve_camera_path(
+            face_positions=sub_pos,
+            source_width=source_width,
+            lam=lam,
+            hard_features=hard_features,
+            source_height=source_height,
+            crop_aspect=crop_aspect,
+            job_id=job_id,
+            seg_idx=seg_idx * 100 + sub_idx,
+            weights=sub_weights,
+        )
+        if sub_result.get("mode") == "infeasible":
+            any_infeasible = True
+            infeasible_frames.extend(sub_result.get("infeasible_frames", []))
+            continue
+        path = sub_result.get("path") or []
+        if not path:
+            center = float(sub_result.get("center", source_width / 2.0))
+            path = [(t, center) for (t, _) in sub_pos]
+        aggregate_path.extend(path)
+
+    if any_infeasible and not aggregate_path:
+        return {
+            "mode": "infeasible",
+            "center": source_width / 2.0,
+            "path": [],
+            "slope": 0.0,
+            "ease_in_ms": 0,
+            "infeasible_frames": infeasible_frames,
+        }
+
+    aggregate_path.sort(key=lambda p: p[0])
+    if not aggregate_path:
+        return {
+            "mode": "stationary",
+            "center": source_width / 2.0,
+            "path": [],
+            "slope": 0.0,
+            "ease_in_ms": 0,
+            "infeasible_frames": [],
+        }
+    mean_x = sum(x for _, x in aggregate_path) / len(aggregate_path)
+    return {
+        "mode": "tracking",
+        "center": mean_x,
+        "path": aggregate_path,
+        "slope": 0.0,
+        "ease_in_ms": 0,
+        "infeasible_frames": infeasible_frames,
+    }
+
+
 def solve_camera_path(
     face_positions: list[tuple[float, float]],
     source_width: int = 1920,
@@ -772,6 +933,7 @@ def solve_camera_path(
     seg_idx: int = 0,
     *,
     weights: Optional[list[float]] = None,
+    discontinuity_marks: Optional[list[float]] = None,
 ) -> dict:
     """Solve L1-optimal camera path for a segment.
 
@@ -787,6 +949,12 @@ def solve_camera_path(
         weights: Optional per-frame weights (same length as face_positions).
             When provided, scales the data-fidelity term per frame.
             None = all weights 1.0 (bit-identical to unweighted path).
+        discontinuity_marks: Optional list of timestamps at which the
+            solver is allowed to introduce a hard cut. The path is
+            split at each mark into independent sub-problems whose
+            solutions are concatenated without smoothing across the
+            boundary — exactly what the editorial planner needs for
+            ab_cut beats. Marks are sorted and deduped within 50 ms.
 
     Returns:
         {
@@ -798,6 +966,20 @@ def solve_camera_path(
             "infeasible_frames": [(t, [identities]), ...] — if infeasible,
         }
     """
+    if discontinuity_marks:
+        return _solve_camera_path_with_discontinuities(
+            face_positions=face_positions,
+            source_width=source_width,
+            lam=lam,
+            hard_features=hard_features,
+            source_height=source_height,
+            crop_aspect=crop_aspect,
+            job_id=job_id,
+            seg_idx=seg_idx,
+            weights=weights,
+            discontinuity_marks=discontinuity_marks,
+        )
+
     if not face_positions:
         return {
             "mode": "stationary",
