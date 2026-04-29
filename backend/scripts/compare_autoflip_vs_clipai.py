@@ -256,6 +256,12 @@ class ClipResult:
     ground_truth: Optional[dict[str, Any]] = None
     verdicts: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    # Task 5A — which tool produced the AutoFlip column. One of
+    # "autoflip_real", "autoflip_prebuilt", "naive_baseline", or None
+    # when no AutoFlip JSON was found. The rollup uses this to label
+    # "AutoFlip (real)" vs "AutoFlip (naive)" so SOTA claims aren't
+    # made against a strawman comparator.
+    autoflip_tool: Optional[str] = None
 
 
 def _derive_crop_centers_pct(events: list[dict]) -> list[float]:
@@ -1264,19 +1270,38 @@ def run_clipai_on_clip(
 
 def load_autoflip_timeline(
     clip: dict, autoflip_dir: Path,
-) -> Optional[list[dict]]:
+    *,
+    return_tool: bool = False,
+) -> Optional[list[dict]] | tuple[Optional[list[dict]], Optional[str]]:
+    """Load the AutoFlip-shape event list for one clip.
+
+    When ``return_tool`` is True, returns ``(events, tool_label)``
+    where ``tool_label`` is the JSON's ``tool`` field — typically
+    one of ``autoflip_real``, ``autoflip_prebuilt``, or
+    ``naive_baseline``. The legacy single-return shape is preserved
+    (``return_tool`` defaults to False) so older callers keep working.
+    """
     slug = clip["slug"]
     path = autoflip_dir / f"{slug}.json"
     if not path.is_file():
+        if return_tool:
+            return None, None
         return None
     try:
         payload = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as e:
         logger.warning("[%s] AutoFlip JSON load failed: %s", slug, e)
+        if return_tool:
+            return None, None
         return None
     events = payload.get("events") or []
+    tool = payload.get("tool")
     if not events:
+        if return_tool:
+            return None, tool
         return None
+    if return_tool:
+        return events, tool
     return events
 
 
@@ -1347,11 +1372,25 @@ def render_markdown(
         "target zone from `TARGET_ZONES` when no human ground-truth "
         "sidecar is available.\n"
     )
+    # Task 5A — surface which tool produced each AutoFlip cell so a
+    # SOTA claim isn't accidentally made against the naive strawman.
+    af_tools = [r.autoflip_tool for r in results if r.autoflip_tool]
+    real_count = sum(1 for t in af_tools if t in ("autoflip_real", "autoflip_prebuilt"))
+    naive_count = sum(1 for t in af_tools if t == "naive_baseline")
     out.append(
         f"- Clips scored: **{len(results)}**\n"
         f"- AutoFlip outputs dir: `{autoflip_outputs_dir}`\n"
+        f"- AutoFlip references: {real_count} real, {naive_count} naive_baseline\n"
         f"- ClipAI invocation mode: `{clipai_invocation}`\n"
     )
+    if naive_count > 0 and real_count == 0:
+        out.append(
+            "\n> **Warning** — every AutoFlip column on this run was "
+            "produced by the naive center-crop baseline, not real "
+            "MediaPipe AutoFlip. Run `make autoflip-references` to "
+            "regenerate against the real comparator before making any "
+            "SOTA claims.\n"
+        )
 
     for group, cts in _GROUP_ORDER:
         group_results = by_group.get(group) or []
@@ -1365,9 +1404,20 @@ def render_markdown(
         out.append(
             "|---|---|---|---|---|---|---|---|---|---|\n"
         )
+        # Per-row autoflip label depends on the source JSON's tool
+        # field so the markdown column reads "autoflip (real)" vs
+        # "autoflip (naive)" distinctly.
+        _AUTOFLIP_LABEL_MAP = {
+            "autoflip_real": "autoflip (real)",
+            "autoflip_prebuilt": "autoflip (prebuilt)",
+            "naive_baseline": "autoflip (naive)",
+        }
         for r in group_results:
+            af_label = _AUTOFLIP_LABEL_MAP.get(
+                r.autoflip_tool or "", "autoflip",
+            )
             for tool, label in (
-                ("autoflip", "autoflip"),
+                ("autoflip", af_label),
                 ("clipai", "**clipai**"),
                 ("ground_truth", "ground_truth"),
             ):
@@ -1520,13 +1570,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.clipai_only:
             result.notes.append("autoflip skipped (--clipai-only)")
         else:
-            af_events = load_autoflip_timeline(clip, autoflip_dir)
+            af_events, af_tool = load_autoflip_timeline(
+                clip, autoflip_dir, return_tool=True,
+            )
+            result.autoflip_tool = af_tool
             if af_events is None:
                 result.notes.append(
                     f"no AutoFlip cache at {autoflip_dir}/{slug}.json"
                 )
             else:
                 result.autoflip = score_timeline(af_events)
+                if af_tool == "naive_baseline":
+                    result.notes.append(
+                        "autoflip column is naive_baseline (Path B "
+                        "fallback) — re-run 'make autoflip-references' "
+                        "for real comparison"
+                    )
 
         # ClipAI timeline
         # Resolve the on-disk video path from the real-content dir,
@@ -1604,6 +1663,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "target_clipcontenttype": r.target_clipcontenttype,
                 "subtype": r.subtype,
                 "autoflip": r.autoflip,
+                "autoflip_tool": r.autoflip_tool,
                 "clipai": r.clipai,
                 "ground_truth": r.ground_truth,
                 "verdicts": r.verdicts,
