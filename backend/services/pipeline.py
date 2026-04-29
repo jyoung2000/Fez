@@ -6204,6 +6204,13 @@ async def _run_analysis_inner(job_id: str):
                         chapters=_chapters,
                         trend_context=_trend_context_text,
                         sentiment_timeline=_sentiment_timeline_text,
+                        # Task 6 — feed the visual verifier the
+                        # extracted frames + cancellation primitive.
+                        # apply_visual_verification no-ops cleanly
+                        # when frames is empty / vision_provider is
+                        # None / the feature flag is off.
+                        frames=frames,
+                        cancel_check=cancel_check,
                     )
                 )
                 clips, clips_provider = await asyncio.wait_for(
@@ -6229,6 +6236,8 @@ async def _run_analysis_inner(job_id: str):
                             chapters=_chapters,
                             trend_context=_trend_context_text,
                             sentiment_timeline=_sentiment_timeline_text,
+                            frames=frames,
+                            cancel_check=cancel_check,
                         ),
                         timeout=_SUMMARY_CLIP_TIMEOUT,
                     )
