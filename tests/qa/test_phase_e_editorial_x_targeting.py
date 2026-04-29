@@ -549,15 +549,33 @@ class TestFullPanelSmoke:
         assert before_pts and after_pts
         last_before = before_pts[-1][1]
         first_after = after_pts[0][1]
-        # Lock-in target post-cut is speaker_2's pixel position (1440).
-        # Pre-cut, with soft pull on speaker_1 + framing_weight=0.5 the
-        # tracker landed near 0.375 * 1920 = 720. The boundary jump
-        # therefore should be ≥ 600 px — a smoothness-bounded LP would
-        # spread that move across many frames.
-        assert first_after - last_before > 600, (
+        # Boundary jump expected ≥ 400 px:
+        #
+        #   pre-cut last frame: tx = (1-fw)*input_tx + fw*sx(speaker_1)
+        #                          = 0.5*960 + 0.5*480
+        #                          = 720 px
+        #
+        #   post-cut lock-in (4 frames at 1440), then decay to soft pull:
+        #     decayed tx = 0.5*960 + 0.5*1440 = 1200 px
+        #
+        # With 4 frames of 1440 + 26 frames of 1200, the LP smoothness
+        # term pulls the boundary frame toward the dominant 1200 target.
+        # Observed delta ≈ 480 px in production. The assertion's purpose
+        # is to catch the "LP smoothed across the cut" regression, which
+        # would produce delta ≈ 30 px — far below 400.
+        #
+        # A delta > 400 confirms the discontinuity_marks split is working
+        # (no smoothing across the boundary) without overcommitting to
+        # the specific framing_weight / lockin_s constants the design
+        # picks.
+        assert first_after - last_before > 400, (
             f"expected hard cut at t=2.0; boundary delta only "
             f"{first_after - last_before:.0f}px "
-            f"(last_before={last_before:.0f}, first_after={first_after:.0f})"
+            f"(last_before={last_before:.0f}, first_after={first_after:.0f}). "
+            f"Either the LP is smoothing across discontinuity_marks "
+            f"(regression) or the framing_weight / lockin_s defaults "
+            f"changed (re-derive the expected boundary from the comment "
+            f"block above)."
         )
 
         # Panel-target sanity: after applying overrides ≤ 5% of frames

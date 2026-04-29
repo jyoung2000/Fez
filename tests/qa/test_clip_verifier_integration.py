@@ -52,7 +52,10 @@ needs_orchestrator = pytest.mark.skipif(
 )
 
 
-def _make_clip(viral_score=70, idx=1):
+def _make_clip(
+    viral_score=70, idx=1,
+    hook_score=50, flow_score=50, value_score=50, trend_score=50,
+):
     from backend.models import ClipCandidate
     return ClipCandidate(
         id=idx,
@@ -67,7 +70,8 @@ def _make_clip(viral_score=70, idx=1):
         suggested_caption="cap",
         hook_text="hook",
         why_this_works="why",
-        hook_score=50, flow_score=50, value_score=50, trend_score=50,
+        hook_score=hook_score, flow_score=flow_score,
+        value_score=value_score, trend_score=trend_score,
     )
 
 
@@ -368,7 +372,16 @@ def test_score_diagnostics_records_verification_outcome(monkeypatch):
     """After a successful verification, score_diagnostics carries
     pre/post scores and a note label."""
     monkeypatch.setenv("CLIPAI_USE_VISUAL_CLIP_VERIFIER", "1")
-    clip = _make_clip(viral_score=70)
+    # Per-axis scores must match viral_score so finalize_clip_scores'
+    # composite stays at 70 (composite = sum(axis * weight); weights
+    # sum to 1, so axis=70 across the board → composite=70). Without
+    # this, the composite rewrites viral_score down to ~50 BEFORE the
+    # verifier runs, and the pre_score assertion below fails. The
+    # orchestrator runs finalize_clip_scores → verifier in that order.
+    clip = _make_clip(
+        viral_score=70,
+        hook_score=70, flow_score=70, value_score=70, trend_score=70,
+    )
     provider = _fake_provider(detect_result=[clip])
     orch = _make_orchestrator([provider])
 
