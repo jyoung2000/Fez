@@ -93,9 +93,15 @@ def maybe_override_render_plan(
     reactions: Optional[list] = None,
     config: Optional[ReframeConfig] = None,
     job_id: str = "",
+    saliency_peaks_per_second: Optional[list] = None,
 ) -> RenderPlan:
     """Return ``legacy_rp`` unchanged unless the human-reframe flag is on
     and the inputs are sufficient to produce a better plan.
+
+    ``saliency_peaks_per_second`` (Layer 1, optional): when supplied,
+    the critic auto-repair pass below picks up the saliency-in-crop
+    check and may emit ``saliency_widen`` fixes for windows where the
+    crop excludes the salient region.
 
     The contract: caller can treat this as idempotent and safe — never
     raises, always returns a validated plan. On any failure or coverage
@@ -154,6 +160,7 @@ def maybe_override_render_plan(
         if getattr(config, "critic_mode", "learned") != "off":
             new_rp, fixes, _ = auto_repair_plan(
                 new_rp, dense_faces=list(dense_faces or []), config=config,
+                saliency_peaks_per_second=saliency_peaks_per_second,
             )
             if fixes:
                 logger.info(

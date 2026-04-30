@@ -94,12 +94,54 @@ def _face_at(dense_faces: list, t: float, window: float = 0.15) -> Optional[obje
 # ── Scoring ───────────────────────────────────────────────────────
 
 
+def _saliency_in_crop_at(
+    saliency_peaks_per_second: Optional[list],
+    t: float,
+    crop_left: float,
+    crop_right: float,
+) -> Optional[bool]:
+    """Layer 1: does any top-K saliency peak at second ``int(t)`` lie
+    horizontally inside ``[crop_left, crop_right]``?
+
+    Returns None when no saliency data is available for this second
+    (so the caller treats it as "not measured" rather than a
+    pass/fail). Returns True when ≥1 peak is in-crop, False when peaks
+    exist but all sit outside the crop.
+
+    ``saliency_peaks_per_second[s]`` is a list of ``(x_pct, y_pct,
+    score)`` triples in [0, 100] (the AvSaliency / parity-bench
+    convention). ``crop_left`` / ``crop_right`` are source-frame
+    fractions in [0, 1].
+    """
+    if not saliency_peaks_per_second:
+        return None
+    sec_idx = int(t)
+    if sec_idx < 0 or sec_idx >= len(saliency_peaks_per_second):
+        return None
+    peaks = saliency_peaks_per_second[sec_idx] or []
+    if not peaks:
+        return None
+    left_pct = crop_left * 100.0
+    right_pct = crop_right * 100.0
+    for peak in peaks:
+        if not peak:
+            continue
+        try:
+            px = float(peak[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if left_pct <= px <= right_pct:
+            return True
+    return False
+
+
 def _score_window(
     t0: float, t1: float,
     plan: RenderPlan,
     *,
     dense_faces: list,
     config: ReframeConfig,
+    saliency_peaks_per_second: Optional[list] = None,
 ) -> CriticScore:
     reasons: list = []
     metrics: dict = {}
@@ -108,6 +150,8 @@ def _score_window(
     n_steps = max(2, int(round((t1 - t0) * 10.0)))
     step = (t1 - t0) / n_steps
     cx_samples: list[float] = []
+    saliency_in_crop_hits: int = 0
+    saliency_in_crop_total: int = 0
 
     centering_err = 0.0
     headroom_bad = 0
@@ -177,6 +221,18 @@ def _score_window(
         if face_left < crop_left - 0.02 or face_right > crop_right + 0.02:
             side_clip_bad += 1
 
+        # Layer 1: saliency-in-crop. Check whether any top-K peak at
+        # the current second lies inside the crop. We sample at the
+        # 10 Hz grid above but only count peaks once per crop sample
+        # — a "hit" is when any peak for that second lands in-crop.
+        sal_hit = _saliency_in_crop_at(
+            saliency_peaks_per_second, t, crop_left, crop_right,
+        )
+        if sal_hit is not None:
+            saliency_in_crop_total += 1
+            if sal_hit:
+                saliency_in_crop_hits += 1
+
     # 5. Jitter: stddev of cx changes across the sampled cropping.
     jitter_std = 0.0
     if len(cx_samples) >= 3:
@@ -242,6 +298,17 @@ def _score_window(
         score = 2.0
         reasons.append("subject_missing")
 
+    # Layer 1: saliency-in-crop summary + flag. Only acts when we
+    # actually saw saliency data for ≥3 sample frames in the window
+    # (otherwise the signal is too noisy to penalize on).
+    if saliency_in_crop_total >= 3:
+        sal_in_crop_frac = saliency_in_crop_hits / saliency_in_crop_total
+        metrics["saliency_in_crop_frac"] = round(sal_in_crop_frac, 3)
+        if sal_in_crop_frac < 0.5:
+            # 2-point penalty out of 10. Caps at 2.
+            score -= 2.0
+            reasons.append("saliency_excluded")
+
     return CriticScore(
         t_start=t0, t_end=t1,
         score=max(0.0, min(10.0, score)),
@@ -255,11 +322,19 @@ def score_plan(
     dense_faces: list,
     config: Optional[ReframeConfig] = None,
     window_sec: float = 1.0,
+    saliency_peaks_per_second: Optional[list] = None,
 ) -> list[CriticScore]:
     """Score every ``window_sec``-long window of the plan.
 
     Returns all windows sorted by score ascending, so the lowest-
     scoring windows come first — useful for budgeted auto-repair.
+
+    ``saliency_peaks_per_second`` (Layer 1) is an optional list whose
+    s-th entry is a list of ``(x_pct, y_pct, score)`` peak triples
+    for second ``s``. When present, each window picks up a
+    ``saliency_in_crop_frac`` metric and a ``saliency_excluded``
+    reason when <50% of sampled crops contained any peak. When
+    absent, the saliency check is silently skipped (legacy behavior).
     """
     if config is None:
         config = get_default_config()
@@ -273,6 +348,7 @@ def score_plan(
         scores.append(_score_window(
             t, t_end, plan,
             dense_faces=dense_faces, config=config,
+            saliency_peaks_per_second=saliency_peaks_per_second,
         ))
         t = t_end
     scores.sort(key=lambda s: s.score)
@@ -396,6 +472,24 @@ def attempt_window_fix(
             reason="jitter_damp", new_op=new_op,
         )
 
+    if "saliency_excluded" in score.reasons:
+        # Layer 1 fix: saliency hot-spots fell outside the crop. Widen
+        # the crop to cover the full source frame for this window so
+        # whichever peak the viewer's eye lands on is at least visible.
+        # Wider framing trades subject-prominence for coverage — the
+        # right call when the alternative is excluding the salient
+        # region entirely.
+        new_op = RenderOp(
+            kind=RenderOpKind.WIDE_MASTER,
+            start_sec=score.t_start, end_sec=score.t_end,
+            primary_rect=Rect(x=0.0, y=0.0, w=1.0, h=1.0),
+            strategy_label="critic:saliency_excluded:wide",
+        )
+        return WindowFix(
+            t_start=score.t_start, t_end=score.t_end,
+            reason="saliency_widen", new_op=new_op,
+        )
+
     if "off_center" in score.reasons:
         # Recenter the crop on the face mean over the window.
         face_xs = []
@@ -496,14 +590,23 @@ def auto_repair_plan(
     *,
     dense_faces: list,
     config: Optional[ReframeConfig] = None,
+    saliency_peaks_per_second: Optional[list] = None,
 ) -> tuple[RenderPlan, list[WindowFix], list[CriticScore]]:
     """Run the critic, apply fixes up to the config budget, return
     ``(repaired_plan, applied_fixes, final_scores)``.
 
     Oscillation guard: a window is never repaired twice in one pass.
+
+    ``saliency_peaks_per_second`` (Layer 1) is forwarded to
+    :func:`score_plan`. When provided, low-saliency-in-crop windows
+    flag as ``saliency_excluded`` and become candidates for the
+    wide-framing repair.
     """
     config = config or get_default_config()
-    scores = score_plan(plan, dense_faces=dense_faces, config=config)
+    scores = score_plan(
+        plan, dense_faces=dense_faces, config=config,
+        saliency_peaks_per_second=saliency_peaks_per_second,
+    )
     low = [s for s in scores if s.score < config.critic_threshold]
     budget = int(config.critic_budget_per_clip)
     applied: list[WindowFix] = []
@@ -521,5 +624,8 @@ def auto_repair_plan(
         repaired_plan = apply_window_fix(repaired_plan, fix)
         applied.append(fix)
         repaired_windows.add(key)
-    final = score_plan(repaired_plan, dense_faces=dense_faces, config=config)
+    final = score_plan(
+        repaired_plan, dense_faces=dense_faces, config=config,
+        saliency_peaks_per_second=saliency_peaks_per_second,
+    )
     return repaired_plan, applied, final
