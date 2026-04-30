@@ -19,6 +19,73 @@ logger = logging.getLogger(__name__)
 REGISTRY_USE_HUMAN_WEIGHT = os.environ.get("REGISTRY_USE_HUMAN_WEIGHT", "true").lower() in ("true", "1", "yes")
 REGISTRY_USE_COHESION_GATE = os.environ.get("REGISTRY_USE_COHESION_GATE", "true").lower() in ("true", "1", "yes")
 
+
+# ── XC.1: face-registry burn-in ──────────────────────────────────────
+# Real clips often open on B-roll, a single-host title card, or
+# graphics before the panel actually assembles. Letting those frames
+# influence slot discovery means slots get assigned wrong and stay
+# wrong for the whole clip. The burn-in window says: "ignore the
+# first N seconds when discovering identities; let the panel settle
+# in before fixing slot positions." Frames inside the burn-in are
+# still detected and tracked for downstream consumers — only the
+# clustering input is filtered.
+def _face_registry_burn_in_seconds() -> float:
+    raw = os.environ.get("CLIPAI_FACE_REGISTRY_BURN_IN_S")
+    if raw is None:
+        return 5.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 5.0
+
+
+def apply_face_registry_burn_in(face_results: list) -> list:
+    """Return ``face_results`` with the first ``CLIPAI_FACE_REGISTRY_BURN_IN_S``
+    seconds filtered out for slot-discovery purposes.
+
+    Behavior:
+      * burn-in 0 (or env-cleared) → returns ``face_results`` unchanged
+      * clip shorter than burn-in window → returns ``face_results``
+        unchanged (no point filtering everything away)
+      * post-burn-in subset has fewer than 3 frames with faces → falls
+        back to the unfiltered list so single-speaker / very-short
+        clips still get a registry built
+      * otherwise returns the post-burn-in list
+
+    Callers pass the result to ``build_face_registry`` /
+    ``build_face_registry_with_embeddings``. The full unfiltered list
+    continues to flow into the active-speaker timeline / segmenter.
+    """
+    burn_in = _face_registry_burn_in_seconds()
+    if burn_in <= 0 or not face_results:
+        return list(face_results)
+    timestamps = [
+        float(getattr(fr, "timestamp", 0.0)) for fr in face_results
+    ]
+    if not timestamps:
+        return list(face_results)
+    span = max(timestamps) - min(timestamps)
+    # Need at least burn_in + 0.5 s of additional content for the
+    # filter to make sense. Otherwise we'd discard the whole clip.
+    if span < burn_in + 0.5:
+        return list(face_results)
+    filtered = [
+        fr for fr in face_results
+        if float(getattr(fr, "timestamp", 0.0)) >= burn_in
+    ]
+    n_with_faces = sum(1 for fr in filtered if getattr(fr, "faces", None))
+    if n_with_faces < 3:
+        # Not enough post-burn-in data to cluster reliably. Leaving
+        # the unfiltered list lets the legacy cohesion checks decide.
+        return list(face_results)
+    logger.info(
+        "Face registry burn-in: dropped %d/%d frame results before t=%.1fs "
+        "(%d frames retained for slot discovery)",
+        len(face_results) - len(filtered), len(face_results), burn_in,
+        len(filtered),
+    )
+    return filtered
+
 # ── Cosine-similarity thresholds for face identity matching ──
 # ArcFace 512-d embeddings have tighter within-class / looser between-class
 # distributions than SFace 128-d, so the per-pair similarity thresholds shift.

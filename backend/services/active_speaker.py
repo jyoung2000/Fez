@@ -13,6 +13,7 @@ Pipeline:
   6. Build a timeline: [(timestamp, active_slot_id), ...]
 """
 import logging
+import os
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -1039,6 +1040,37 @@ def build_active_speaker_timeline_v3(
         active_ids = [
             iid for iid, p in id_scores.items() if p >= p_speaking_threshold
         ]
+
+        # XC.3: confidence floor. When EXACTLY ONE identity crosses the
+        # speaking threshold but the runner-up's p_speaking is within
+        # the margin of the winner's, v3 is "unsure" — the two faces
+        # are too close to commit to one. Emit slot=-1 instead of
+        # picking the wrong person. Prevents the wrong-speaker-framed
+        # bug on multi-speaker panels where two faces have very similar
+        # lip motion / audio energy at the same moment.
+        #
+        # Skips the floor when ≥2 identities ALREADY crossed threshold
+        # — that's overlapping speech, not a close call. v3 emits one
+        # SpeakerEvent per overlapping speaker as the test fixture
+        # "test_v3_handles_overlapping_speech" pins.
+        if len(active_ids) == 1:
+            try:
+                margin = float(os.environ.get(
+                    "CLIPAI_ASD_CONFIDENCE_MARGIN", "0.15"
+                ))
+            except ValueError:
+                margin = 0.15
+            sorted_scores = sorted(id_scores.values(), reverse=True)
+            if (
+                margin > 0
+                and len(sorted_scores) >= 2
+                and (sorted_scores[0] - sorted_scores[1]) < margin
+            ):
+                events.append(SpeakerEvent(
+                    start=seg_start, end=seg_end,
+                    slot_id=-1, confidence=float(sorted_scores[0]),
+                ))
+                continue
 
         if not active_ids:
             # Off-camera speaker: transcript says someone spoke but no
