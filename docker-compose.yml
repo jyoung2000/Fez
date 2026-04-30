@@ -29,6 +29,19 @@ services:
       # will report "manifest empty / no fixtures" cleanly when the
       # directory is empty - it does not crash.
       - ./data/real_content_cache:/var/cache/clipai/real_content
+      # AutoFlip reference outputs — bind-mounted from host so the
+      # AutoFlip sidecar (run via docker-out-of-docker) can write
+      # references that this container then reads from the bench.
+      - ./tests/autoflip_reference_outputs:/app/tests/autoflip_reference_outputs
+      # Docker socket — required for /api/diagnostics/build-autoflip-image
+      # and backend/scripts/run_autoflip_reference.py to spawn the
+      # AutoFlip image build + per-clip container runs. SECURITY NOTE:
+      # mounting the host's docker socket gives this container the
+      # ability to spawn arbitrary host-level containers (effectively
+      # root on host). For a homelab behind LAN this is the standard
+      # tradeoff; for anything internet-facing, comment this out and
+      # run ``make autoflip-references`` from the host shell instead.
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - PYTHONUNBUFFERED=1
       - NVIDIA_VISIBLE_DEVICES=all
@@ -46,6 +59,18 @@ services:
       # 2026 SOTA reframing bench: where the bench finds fixture
       # MP4s + extraction cache. Maps to the volume mount above.
       - CLIPAI_REAL_CONTENT_CACHE=/var/cache/clipai/real_content
+      # Host-side paths for docker-out-of-docker invocations.
+      # When the app spawns ``docker run -v <path>:/data`` against
+      # the AutoFlip image, the path is interpreted by the host
+      # docker daemon as a host filesystem path — NOT this container's
+      # mount namespace. We pass the host paths explicitly so
+      # backend/scripts/run_autoflip_reference.py can translate
+      # container paths to their host equivalents at -v time.
+      # ``${PWD}`` resolves to the directory containing this compose
+      # file when ``docker compose up`` runs.
+      - CLIPAI_HOST_REAL_CONTENT_CACHE=${PWD}/data/real_content_cache
+      - CLIPAI_HOST_AUTOFLIP_REF_DIR=${PWD}/tests/autoflip_reference_outputs
+      - CLIPAI_HOST_AUTOFLIP_DOCKERFILE_DIR=${PWD}/infra/autoflip
     # Enable GPU passthrough when NVIDIA Container Toolkit is installed.
     # If no GPU is available, the container still starts normally on CPU.
     deploy:

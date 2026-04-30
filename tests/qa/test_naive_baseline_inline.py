@@ -135,3 +135,65 @@ def test_single_clip_and_manifest_are_mutually_exclusive(tmp_path):
         "--output-dir", str(tmp_path / "refs"),
     ])
     assert rc == 2
+
+
+# ── 6. Container→host path translation for docker-out-of-docker ────────
+
+
+def test_autoflip_container_to_host_path_translation(monkeypatch):
+    """When the app runs ``docker run`` against the host docker
+    daemon, container-side paths must be rewritten to their host
+    equivalents — otherwise the daemon mounts paths that don't exist
+    on the host filesystem and AutoFlip fails with "no such file"."""
+    from pathlib import Path
+    from backend.scripts.run_autoflip_reference import _container_path_to_host
+
+    monkeypatch.setenv(
+        "CLIPAI_REAL_CONTENT_CACHE", "/var/cache/clipai/real_content",
+    )
+    monkeypatch.setenv(
+        "CLIPAI_HOST_REAL_CONTENT_CACHE",
+        "/mnt/user/appdata/clipai/data/real_content_cache",
+    )
+    monkeypatch.setenv(
+        "CLIPAI_HOST_AUTOFLIP_REF_DIR",
+        "/mnt/user/appdata/clipai/tests/autoflip_reference_outputs",
+    )
+
+    # Source video dir maps via the env-var mapping.
+    src = _container_path_to_host(Path("/var/cache/clipai/real_content"))
+    assert str(src) == "/mnt/user/appdata/clipai/data/real_content_cache"
+
+    # Subpath under the mapped root.
+    sub = _container_path_to_host(
+        Path("/var/cache/clipai/real_content/panel.mp4"),
+    )
+    assert str(sub).endswith("/data/real_content_cache/panel.mp4")
+
+    # Reference outputs dir: fixed-path mapping.
+    ref = _container_path_to_host(Path("/app/tests/autoflip_reference_outputs"))
+    assert str(ref) == (
+        "/mnt/user/appdata/clipai/tests/autoflip_reference_outputs"
+    )
+
+    # Unrelated path: returned unchanged.
+    other = _container_path_to_host(Path("/some/other/path"))
+    assert str(other) == "/some/other/path"
+
+
+def test_autoflip_path_translation_no_op_when_env_unset(monkeypatch):
+    """On a developer host with the script run directly (no
+    docker-out-of-docker, no env vars), path translation must be a
+    no-op so existing host-side workflows are unaffected."""
+    from pathlib import Path
+    from backend.scripts.run_autoflip_reference import _container_path_to_host
+
+    for var in (
+        "CLIPAI_REAL_CONTENT_CACHE",
+        "CLIPAI_HOST_REAL_CONTENT_CACHE",
+        "CLIPAI_HOST_AUTOFLIP_REF_DIR",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    p = Path("/some/host/path")
+    assert _container_path_to_host(p) == p

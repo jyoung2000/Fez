@@ -64,6 +64,41 @@ enforce it — the file is still kept and used. Once you record the
 hash, a substituted artifact will fail the build instead of landing
 in production.
 
+## AutoFlip docker-out-of-docker — host-path env vars
+
+The Settings → "Build AutoFlip image" button and the
+`/api/diagnostics/build-autoflip-image` SSE endpoint shell out to
+`docker build` and `docker run` from inside the running app
+container. To make that work end-to-end, three things must hold:
+
+1. **docker CLI** is installed in the app image
+   (`apt-get install docker.io` in both `Dockerfile` and
+   `Dockerfile.gpu`).
+2. **The host's docker socket** is bind-mounted into the app
+   container at `/var/run/docker.sock` (`docker-compose.yml`
+   `app.volumes`). SECURITY NOTE: this gives the container
+   effectively-root on the host. For a homelab behind LAN this is
+   the standard tradeoff; for anything internet-exposed, comment
+   the mount out and run `docker build infra/autoflip/` and
+   `python -m backend.scripts.run_autoflip_reference …` from the
+   host shell instead.
+3. **Host-side path env vars** are set so volume-mount paths can
+   be translated from the app container's mount namespace to the
+   host filesystem (which is what the host docker daemon
+   interprets):
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CLIPAI_HOST_REAL_CONTENT_CACHE` | `${PWD}/data/real_content_cache` | Host path to the bench fixture cache. Used by `_container_path_to_host` to rewrite `/var/cache/clipai/real_content` (the in-container view) to its host-side location for `docker run -v` invocations. |
+| `CLIPAI_HOST_AUTOFLIP_REF_DIR` | `${PWD}/tests/autoflip_reference_outputs` | Host path to the AutoFlip reference output directory, used the same way. |
+| `CLIPAI_HOST_AUTOFLIP_DOCKERFILE_DIR` | `${PWD}/infra/autoflip` | Host path to the AutoFlip sidecar Dockerfile context. The `/build-autoflip-image` endpoint passes this to `docker build`. |
+
+When any of these are unset (typical when running the script from
+a developer's host with python directly), path translation is a
+no-op and the script falls back to passing the supplied paths
+unchanged — preserving backwards-compatibility with host-side
+workflows.
+
 ## Other env vars touched by the SOTA bench
 
 - `CLIPAI_REAL_CONTENT_CACHE` — root for the per-clip extraction

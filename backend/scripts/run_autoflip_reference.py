@@ -104,6 +104,44 @@ def _probe_metadata(video_path: str) -> dict:
     }
 
 
+def _container_path_to_host(container_path: Path) -> Path:
+    """Translate a container path to its host equivalent for ``docker -v``.
+
+    When this script runs inside the app container and shells out to
+    the host docker daemon (via the bind-mounted /var/run/docker.sock),
+    ``docker run -v`` paths are interpreted by the HOST daemon — they
+    are NOT this container's mount namespace. So we have to rewrite
+    container paths back to their host-side originals before passing
+    them to ``docker run``.
+
+    The mapping comes from ``CLIPAI_HOST_*`` env vars set by
+    docker-compose (see the ``app`` service definition). When those
+    aren't set (e.g., running on a developer's host with python
+    directly), the path is returned unchanged.
+    """
+    container_str = str(container_path)
+    mappings: list[tuple[str, str]] = []
+    for container_root_env, host_root_env in [
+        ("CLIPAI_REAL_CONTENT_CACHE", "CLIPAI_HOST_REAL_CONTENT_CACHE"),
+    ]:
+        c = os.environ.get(container_root_env, "")
+        h = os.environ.get(host_root_env, "")
+        if c and h:
+            mappings.append((c.rstrip("/"), h.rstrip("/")))
+    # Fixed-path mappings for paths that don't have an env-var alias.
+    fixed_host_ref = os.environ.get("CLIPAI_HOST_AUTOFLIP_REF_DIR", "")
+    if fixed_host_ref:
+        mappings.append(
+            ("/app/tests/autoflip_reference_outputs", fixed_host_ref.rstrip("/")),
+        )
+    for container_root, host_root in mappings:
+        if container_str == container_root or container_str.startswith(
+            container_root + "/",
+        ):
+            return Path(host_root + container_str[len(container_root):])
+    return container_path
+
+
 def _docker_run(
     *,
     image: str,
@@ -119,13 +157,19 @@ def _docker_run(
     read-write at ``/output`` to mirror the docker-compose service
     layout. Falls back to a non-compose ``docker run`` so the script
     works in environments where docker-compose is not on PATH.
+
+    When invoked from inside a container with the host's docker
+    socket bind-mounted, the source/output paths are translated to
+    their host-side equivalents via :func:`_container_path_to_host`.
     """
     if not shutil.which("docker"):
         raise RuntimeError("docker not on PATH")
+    host_source = _container_path_to_host(source_dir)
+    host_output = _container_path_to_host(output_dir)
     cmd = [
         "docker", "run", "--rm",
-        "-v", f"{source_dir}:/data:ro",
-        "-v", f"{output_dir}:/output",
+        "-v", f"{host_source}:/data:ro",
+        "-v", f"{host_output}:/output",
         image,
         f"--input_video_path=/data/{slug}.{ext}",
         f"--output_video_path=/output/{slug}_autoflip.mp4",

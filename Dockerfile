@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation2 \
     unzip \
     libgl1-mesa-glx libglib2.0-0 \
+    docker.io \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -153,6 +154,12 @@ COPY docs/ ./docs/
 # real container. ~50 KB of Python; never imported at startup, only
 # spawned on demand by the diagnostics router.
 COPY tests/qa/ ./tests/qa/
+# AutoFlip sidecar Dockerfile — shipped INSIDE the app image so the
+# /api/diagnostics/build-autoflip-image endpoint can run
+# ``docker build`` against it without depending on a host-side
+# checkout. Requires the docker CLI (installed above) and the host's
+# Docker socket to be bind-mounted at /var/run/docker.sock.
+COPY infra/ ./infra/
 # Make ``tests`` importable as a top-level package (the QA runner uses
 # ``python -m tests.qa.run_all_phases``).
 RUN touch ./tests/__init__.py

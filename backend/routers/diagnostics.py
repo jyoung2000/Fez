@@ -3028,15 +3028,74 @@ async def build_autoflip_image():
                 except Exception:
                     pass
 
+    # Docker-out-of-docker preflight: docker CLI must be on PATH and
+    # the host's socket must be reachable. Both are satisfied by the
+    # main app Dockerfile (apt-get install docker.io) + docker-compose
+    # bind mount of /var/run/docker.sock.
+    has_docker = bool(__import__("shutil").which("docker"))
+    has_socket = os.path.exists("/var/run/docker.sock")
+    # Host-side path to the AutoFlip Dockerfile context. Set by
+    # docker-compose; when running outside compose (rare in prod),
+    # fall back to the in-container /app/infra/autoflip path which
+    # only works when the daemon is namespace-shared with this
+    # container.
+    host_autoflip_dir = os.environ.get(
+        "CLIPAI_HOST_AUTOFLIP_DOCKERFILE_DIR",
+        "/app/infra/autoflip",
+    )
+
     async def event_stream() -> AsyncGenerator[str, None]:
-        # Phase 1: docker build
+        # Phase 0: preflight
+        yield _sse_event("phase_start", {
+            "phase": "preflight",
+            "label": "Checking docker CLI + socket access...",
+        })
+        if not has_docker:
+            yield _sse_event("phase_result", {
+                "phase": "preflight", "status": "fail",
+                "reason": "docker CLI not on PATH inside this container",
+            })
+            yield _sse_event("complete", {
+                "ok": False, "stage": "preflight",
+                "message": (
+                    "docker CLI not found in the app container. Rebuild "
+                    "the image with the latest Dockerfile (which "
+                    "apt-get installs docker.io)."
+                ),
+            })
+            return
+        if not has_socket:
+            yield _sse_event("phase_result", {
+                "phase": "preflight", "status": "fail",
+                "reason": "/var/run/docker.sock not mounted",
+            })
+            yield _sse_event("complete", {
+                "ok": False, "stage": "preflight",
+                "message": (
+                    "Host docker socket not mounted at /var/run/docker.sock. "
+                    "Add `- /var/run/docker.sock:/var/run/docker.sock` to "
+                    "the app service volumes in docker-compose.yml, then "
+                    "`docker compose up -d` to recreate the container."
+                ),
+            })
+            return
+        yield _sse_event("phase_result", {
+            "phase": "preflight", "status": "pass",
+            "host_autoflip_dir": host_autoflip_dir,
+        })
+
+        # Phase 1: docker build (direct, not via compose). Bypasses
+        # the need for a docker-compose plugin or compose file inside
+        # the container.
         yield _sse_event("phase_start", {
             "phase": "build_autoflip",
             "label": "Building AutoFlip Docker image (~30-60 min on first run)...",
         })
         build_failed = False
         async for evt in _stream_subprocess([
-            "docker", "compose", "--profile", "bench", "build", "autoflip",
+            "docker", "build",
+            "-t", "clipai/autoflip:local",
+            host_autoflip_dir,
         ]):
             yield evt
             try:
@@ -3054,9 +3113,10 @@ async def build_autoflip_image():
                 "ok": False, "stage": "build_autoflip",
                 "message": (
                     "Docker build for the AutoFlip image failed. Inspect "
-                    "the streaming output above; if Docker isn't available "
-                    "in this environment, run the build out-of-band on a "
-                    "host with the daemon."
+                    "the streaming output above. Common causes: numpy not "
+                    "installed at the system Python (fixed in 06dcf4c), "
+                    "Bazel target name moved between MediaPipe tags, or "
+                    "out-of-disk on the host."
                 ),
             })
             return

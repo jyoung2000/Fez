@@ -43,6 +43,10 @@ RUN apt-get update && apt-get install -y \
     libnuma-dev libvpx-dev libfdk-aac-dev \
     # MediaPipe face detection dependencies
     libgl1-mesa-glx libglib2.0-0 \
+    # docker CLI: enables /api/diagnostics/build-autoflip-image and
+    # backend/scripts/run_autoflip_reference.py to spawn host-side
+    # docker builds + container runs via the bind-mounted /var/run/docker.sock.
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # Install nv-codec-headers for NVENC/NVDEC support
@@ -183,6 +187,12 @@ COPY docs/ ./docs/
 # real container. ~50 KB of Python; never imported at startup, only
 # spawned on demand by the diagnostics router.
 COPY tests/qa/ ./tests/qa/
+# AutoFlip sidecar Dockerfile — shipped INSIDE the app image so the
+# /api/diagnostics/build-autoflip-image endpoint can run
+# ``docker build`` against it without a host-side checkout. Requires
+# the host's Docker socket bind-mounted at /var/run/docker.sock and
+# the docker CLI (installed above).
+COPY infra/ ./infra/
 # Make ``tests`` importable as a top-level package (the QA runner uses
 # ``python -m tests.qa.run_all_phases``).
 RUN touch ./tests/__init__.py
