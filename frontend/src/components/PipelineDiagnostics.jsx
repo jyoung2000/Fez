@@ -400,8 +400,8 @@ export default function PipelineDiagnostics() {
 
   // Task B — AutoFlip references badge state. Polled from
   // /api/diagnostics/refs-state on mount + after a build.
+  // (Build action removed in Layer 1 PR; the badge is now read-only.)
   const [refsState, setRefsState] = useState({ expected: 0, real: 0, naive: 0 });
-  const [refsBuilding, setRefsBuilding] = useState(false);
 
   const fetchRefsState = useCallback(async () => {
     try {
@@ -419,54 +419,12 @@ export default function PipelineDiagnostics() {
 
   React.useEffect(() => { fetchRefsState(); }, [fetchRefsState]);
 
-  const handleBuildAutoflip = useCallback(async () => {
-    if (refsBuilding) return;
-    setRefsBuilding(true);
-    setSotaLogs((prev) => [...prev, {
-      kind: 'meta',
-      text: '[build-autoflip] starting Docker build (may take 30-60 min)...',
-    }]);
-    try {
-      const resp = await fetch('/api/diagnostics/build-autoflip-image', {
-        method: 'POST',
-      });
-      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const evt = JSON.parse(line.slice(6));
-            if (evt.type === 'log') {
-              setSotaLogs((prev) => [...prev, { kind: 'log', text: evt.data.line }]);
-            } else if (evt.type === 'phase_result' && evt.data.refs_state) {
-              setRefsState(evt.data.refs_state);
-            } else if (evt.type === 'complete') {
-              if (evt.data.refs_state) setRefsState(evt.data.refs_state);
-              setSotaLogs((prev) => [...prev, {
-                kind: 'meta',
-                text: `[build-autoflip] ${evt.data.message || 'done'}`,
-              }]);
-            }
-          } catch { /* skip malformed */ }
-        }
-      }
-    } catch (e) {
-      setSotaLogs((prev) => [...prev, {
-        kind: 'meta', text: `[build-autoflip] failed: ${e.message}`,
-      }]);
-    } finally {
-      setRefsBuilding(false);
-      fetchRefsState();
-    }
-  }, [refsBuilding, fetchRefsState]);
+  // Layer 1 critic engine replaces what the AutoFlip baseline was
+  // supposed to provide. The "Build AutoFlip image" button + handler
+  // were removed in the L1 PR — AutoFlip is deprecated upstream
+  // (Google sunset, March 2023) and incompatible with our current
+  // OpenCV. Real-content reframing quality is judged by the critic
+  // engine layers (saliency / DOVER / VLM / engagement / brain) now.
 
   const SOTA_CONTENT_TYPES = [
     { value: 'default', label: 'Auto / default' },
@@ -947,20 +905,9 @@ export default function PipelineDiagnostics() {
               }}>
                 {refsState.naive}/{refsState.expected} naive
               </span>
-              {refsState.real === 0 && (
-                <button
-                  onClick={handleBuildAutoflip}
-                  disabled={refsBuilding}
-                  style={{
-                    ...smallBtnStyle,
-                    padding: '2px 10px', fontSize: 10,
-                    cursor: refsBuilding ? 'default' : 'pointer',
-                  }}
-                  title="Build the AutoFlip Docker image and generate real references for the manifest. Takes 30-60 minutes on first build."
-                >
-                  {refsBuilding ? 'Building (30-60 min)...' : 'Build AutoFlip image'}
-                </button>
-              )}
+              {/* AutoFlip Build button removed in Layer 1 PR. The
+                  critic engine (saliency / quality / VLM / engagement)
+                  is the supported quality bar now. */}
             </div>
           )}
 
