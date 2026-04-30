@@ -93,7 +93,12 @@ logger = logging.getLogger("compare_autoflip_vs_clipai")
 #   v5 — Task C: asd_scores.json persisted when the Light-ASD backend
 #        is active so re-runs can reuse cached per-frame speaking
 #        probabilities instead of paying the inference cost twice.
-EXTRACTION_CACHE_VERSION = 5
+#   v6 — Layer 1 (critic engine): saliency_peaks_per_second.json is
+#        produced from AvSaliency / TASED-Net so the saliency-in-crop
+#        critic check has data to work with. The file is required when
+#        ``CLIPAI_SALIENCY_LAYER=1`` (default); a previously-valid v5
+#        cache without the file is invalidated under the new default.
+EXTRACTION_CACHE_VERSION = 6
 
 # Modules whose mtime participates in cache invalidation. If any of
 # these files is newer than the cache's ``cache_version.txt`` then
@@ -162,11 +167,22 @@ def _active_asd_backend() -> str:
     return os.environ.get("CLIPAI_ASD_BACKEND", "light_asd").lower()
 
 
+def _saliency_layer_enabled() -> bool:
+    """Layer 1 toggle. Default ON — the cache always writes
+    ``saliency_peaks_per_second.json`` (empty list on extraction
+    failure) so the schema stays consistent regardless of whether the
+    TASED-Net adapter is actually installed on the host.
+    """
+    return os.environ.get("CLIPAI_SALIENCY_LAYER", "1") == "1"
+
+
 def _required_cache_files() -> tuple:
-    """Required-file list, with the conditional Task C entry applied."""
+    """Required-file list, with the conditional Task C / Layer 1 entries."""
     base = list(_REQUIRED_CACHE_FILES)
     if _active_asd_backend() == "light_asd":
         base.append("asd_scores.json")
+    if _saliency_layer_enabled():
+        base.append("saliency_peaks_per_second.json")
     return tuple(base)
 
 
@@ -322,6 +338,12 @@ class ClipResult:
     # "AutoFlip (real)" vs "AutoFlip (naive)" so SOTA claims aren't
     # made against a strawman comparator.
     autoflip_tool: Optional[str] = None
+    # Layer 1+ critic engine summary. Populated post-scoring by the
+    # main loop. Per-layer subkeys:
+    #   "saliency": {"in_crop_fraction": float | None, ...}
+    # Layers 2-5 add their own subkeys in subsequent PRs. ``None`` here
+    # means the critic engine was disabled or no layer ran.
+    critic: Optional[dict[str, Any]] = None
 
 
 def _derive_crop_centers_pct(events: list[dict]) -> list[float]:
@@ -987,6 +1009,163 @@ def _probe_source_metadata(video_path: Path) -> dict:
     }
 
 
+def _compute_saliency_peaks_per_second(
+    video_path: Path,
+    audio_path: Optional[Path],
+    duration: float,
+    *,
+    slug: str,
+) -> list:
+    """Layer 1: produce per-second saliency peaks for ``video_path``.
+
+    Sampling: one frame per second via ffmpeg, fed into
+    :class:`AvSaliency`. Audio energy at 1 Hz comes from
+    :func:`av_saliency.audio_energy_per_second`.
+
+    Returns ``[]`` on any failure path — missing ffmpeg, ImportError on
+    ``tasednet``, no GPU, OOM. The bench's saliency-in-crop metric and
+    the Layer 1 critic both treat an empty list as "not measured" and
+    silently skip the check, so a homelab without TASED-Net installed
+    still produces a fully-valid v6 cache.
+
+    Output schema matches ``saliency_in_crop_fraction``:
+    ``[[ (x_pct, y_pct, score), ... ]_for_second_0, ...]``.
+    """
+    if not _saliency_layer_enabled():
+        return []
+    try:
+        from backend.services.av_saliency import (
+            AvSaliency, audio_energy_per_second,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[%s] saliency layer: import failed (%s) — empty peaks",
+            slug, exc,
+        )
+        return []
+
+    n_seconds = max(1, int(round(duration)))
+
+    # Audio energy (1 Hz). Tolerates missing wav by passing zeros.
+    audio_energy_1hz: Any = None
+    try:
+        import numpy as _np  # noqa: F401  — used inside the try
+        if audio_path and Path(audio_path).is_file():
+            try:
+                import wave
+                with wave.open(str(audio_path), "rb") as wf:
+                    sr = wf.getframerate()
+                    nchan = wf.getnchannels()
+                    nframes = wf.getnframes()
+                    raw = wf.readframes(nframes)
+                import numpy as np
+                samples = np.frombuffer(raw, dtype=np.int16)
+                if nchan > 1:
+                    samples = samples.reshape(-1, nchan).mean(axis=1)
+                samples = samples.astype(np.float32) / 32768.0
+                audio_energy_1hz = audio_energy_per_second(samples, sr)
+            except Exception as exc:
+                logger.info(
+                    "[%s] saliency layer: audio energy failed (%s) — using zeros",
+                    slug, exc,
+                )
+        if audio_energy_1hz is None:
+            import numpy as np
+            audio_energy_1hz = np.zeros(n_seconds, dtype=np.float32)
+    except Exception as exc:
+        logger.info(
+            "[%s] saliency layer: numpy unavailable (%s) — empty peaks",
+            slug, exc,
+        )
+        return []
+
+    # Frame sampling at 1 fps via ffmpeg. Output goes to a temp dir so
+    # we don't pollute the cache.
+    import shutil as _shutil
+    import subprocess
+    import tempfile
+    if not _shutil.which("ffmpeg"):
+        logger.info(
+            "[%s] saliency layer: ffmpeg not available — empty peaks", slug,
+        )
+        return []
+    tmp = Path(tempfile.mkdtemp(prefix="clipai_saliency_frames_"))
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", str(video_path),
+            "-vf", "fps=1,scale=256:144",
+            str(tmp / "f%04d.png"),
+        ]
+        try:
+            subprocess.run(cmd, check=True, timeout=300, capture_output=True)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            logger.info(
+                "[%s] saliency layer: ffmpeg sampling failed (%s) — empty peaks",
+                slug, exc,
+            )
+            return []
+
+        png_paths = sorted(tmp.glob("f*.png"))
+        if not png_paths:
+            return []
+        try:
+            import numpy as np
+            try:
+                import cv2  # type: ignore
+            except Exception as exc:
+                logger.info(
+                    "[%s] saliency layer: cv2 unavailable (%s) — empty peaks",
+                    slug, exc,
+                )
+                return []
+            frames = np.stack([
+                cv2.cvtColor(cv2.imread(str(p)), cv2.COLOR_BGR2RGB)
+                for p in png_paths
+            ]).astype(np.uint8)
+        except Exception as exc:
+            logger.info(
+                "[%s] saliency layer: frame load failed (%s) — empty peaks",
+                slug, exc,
+            )
+            return []
+
+        # Determine device — fall back to CPU when GPU not visible.
+        from backend.services.av_saliency import _is_gpu_visible
+        device = "cuda" if _is_gpu_visible() else "cpu"
+        try:
+            avs = AvSaliency(device=device)
+            result = avs.predict(frames, audio_energy_1hz)
+        except Exception as exc:
+            logger.warning(
+                "[%s] saliency layer: AvSaliency.predict failed (%s) — empty peaks",
+                slug, exc,
+            )
+            return []
+
+        # Free the model + GPU memory before the LP solver runs.
+        try:
+            del avs
+            if device == "cuda":
+                import torch  # type: ignore
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        # Serialize peaks: each second is a list of [x_pct, y_pct, score].
+        out: list = []
+        for sec_peaks in result.peaks:
+            out.append([
+                [float(x), float(y), float(s)] for (x, y, s) in sec_peaks
+            ])
+        return out
+    finally:
+        try:
+            _shutil.rmtree(tmp, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _extract_audio_wav(video_path: Path, cache_dir: Path) -> Path:
     """Extract mono 16kHz WAV to ``cache_dir/audio.wav`` via ffmpeg.
     Returns the output path. Lazy subprocess so sandbox-safe.
@@ -1185,9 +1364,16 @@ def _extract_and_cache(
     )
 
     # ── Face registry (embedding-based when we have dense data) ──
+    # XC.1: burn-in filter so B-roll / title-card frames don't
+    # influence slot discovery. The full ``dense_faces`` list still
+    # flows downstream — only registry-input is filtered.
     if dense_faces:
+        from backend.services.face_registry import (
+            apply_face_registry_burn_in,
+        )
+        registry_input = apply_face_registry_burn_in(dense_faces)
         face_registry = build_face_registry_with_embeddings(
-            dense_faces, min_appearances=3, cosine_threshold=0.25,
+            registry_input, min_appearances=3, cosine_threshold=0.25,
         )
     else:
         face_registry = FaceRegistry()
@@ -1305,6 +1491,28 @@ def _extract_and_cache(
             ], indent=2),
         )
 
+    # ── Layer 1: per-second saliency peaks (TASED-Net) ──
+    # Runs AFTER Whisper / Light-ASD have unloaded so the 4 GB
+    # GTX 1650 isn't holding three models at once. Always-write
+    # behavior — failure paths produce an empty list rather than
+    # crashing the cache. ``CLIPAI_SALIENCY_LAYER=0`` skips the run
+    # entirely and writes ``[]`` (also the v6-required schema).
+    saliency_peaks: list = []
+    if _saliency_layer_enabled():
+        try:
+            saliency_peaks = _compute_saliency_peaks_per_second(
+                video_path, audio_path, duration, slug=slug,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] saliency layer raised unexpectedly (%s) — empty peaks",
+                slug, exc,
+            )
+            saliency_peaks = []
+    (clip_cache / "saliency_peaks_per_second.json").write_text(
+        json.dumps(saliency_peaks),
+    )
+
     # ── Content profile ──
     classifier_meta = _classifier_metadata_from_clip(clip)
     content_profile = None
@@ -1386,6 +1594,7 @@ def _extract_and_cache(
     return {
         "metadata": metadata,
         "segments": segments_serialized,
+        "saliency_peaks_per_second": saliency_peaks,
     }
 
 
@@ -1885,6 +2094,29 @@ def main(argv: Optional[list[str]] = None) -> int:
                 result.notes.append("clipai_skipped")
         else:
             result.clipai = score_timeline(ca_events, **ca_extras)
+            # Layer 1: surface saliency-in-crop into the critic block
+            # so the UI / JSON consumer can render the Critic Engine
+            # rows even when other layers haven't been wired yet.
+            sal_peaks = ca_extras.get("saliency_peaks_per_second")
+            sal_in_crop = (
+                result.clipai.get("saliency_in_crop_fraction")
+                if isinstance(result.clipai, dict) else None
+            )
+            if sal_peaks is not None or sal_in_crop is not None:
+                result.critic = {
+                    "saliency": {
+                        "in_crop_fraction": sal_in_crop,
+                        "n_seconds_with_peaks": (
+                            sum(1 for s in (sal_peaks or []) if s)
+                        ),
+                        # Populated when the segmenter / bridge runs
+                        # ``auto_repair_plan`` with saliency awareness.
+                        # The bench currently doesn't drive that path,
+                        # so we expose the slot with a stable schema and
+                        # let downstream PRs fill in the counter.
+                        "windows_fixed": None,
+                    },
+                }
 
         # Optional human ground truth
         gt_events = load_ground_truth_timeline(clip, gt_dir)
@@ -1935,6 +2167,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "ground_truth": r.ground_truth,
                 "verdicts": r.verdicts,
                 "notes": r.notes,
+                "critic": r.critic,
             }
             for r in results
         ],
