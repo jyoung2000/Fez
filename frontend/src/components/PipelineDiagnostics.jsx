@@ -1090,6 +1090,75 @@ export default function PipelineDiagnostics() {
           </div>
         )}
 
+        {/* Layer 1+ critic engine summary. Renders when the bench
+            populated ``result.critic`` for at least one clip. The
+            backend SSE stream attaches the per-run aggregate to
+            sotaResult.critic so this row lights up without a JSON
+            re-fetch. */}
+        {sotaResult?.critic?.saliency && (() => {
+          const sal = sotaResult.critic.saliency;
+          const inCrop = (
+            sal.in_crop_mean ?? sal.in_crop_fraction
+          );
+          const salColor = (v) => {
+            if (v == null) return 'var(--text-muted)';
+            if (v >= 0.75) return '#22c55e';
+            if (v >= 0.50) return '#ff9f0a';
+            return '#ef4444';
+          };
+          return (
+            <div style={{
+              marginTop: 8,
+              padding: '8px 12px',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-sm)',
+              background: 'var(--bg-base)',
+            }}>
+              <div style={{
+                fontSize: 11, fontWeight: 600,
+                color: 'var(--text-secondary)', marginBottom: 6,
+              }}>
+                Critic engine
+              </div>
+              <div style={{
+                display: 'flex', gap: 12, flexWrap: 'wrap',
+                fontSize: 12, alignItems: 'center',
+              }}>
+                <span style={{ minWidth: 110, color: 'var(--text-muted)' }}>
+                  Saliency (L1):
+                </span>
+                <span style={{ color: salColor(inCrop), fontWeight: 600 }}>
+                  {inCrop != null
+                    ? `${Math.round(inCrop * 100)}% in-crop`
+                    : 'not measured'}
+                </span>
+                {sal.windows_flagged > 0 && (
+                  <span style={{ color: '#ff9f0a', fontSize: 11 }}>
+                    {sal.windows_flagged} window{sal.windows_flagged === 1 ? '' : 's'} flagged
+                  </span>
+                )}
+                {sal.windows_fixed > 0 && (
+                  <span style={{ color: '#3b82f6', fontSize: 11 }}>
+                    +{sal.windows_fixed} fixed
+                  </span>
+                )}
+                {sal.backend && sal.backend !== 'tased_net' && (
+                  <span style={{
+                    color: 'var(--text-muted)', fontSize: 10,
+                    padding: '1px 6px',
+                    border: '1px solid var(--border)',
+                    borderRadius: 4,
+                  }}>
+                    {sal.backend === 'spectral_residual'
+                      ? '(spectral fallback)'
+                      : `(${sal.backend})`}
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+
         {/* Task A: cache state row \u2014 surfaces stale-cache warning so
             the operator knows when their numbers came from a cache
             written before the running container's code landed. */}
