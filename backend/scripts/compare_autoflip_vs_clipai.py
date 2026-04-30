@@ -1133,8 +1133,10 @@ def _compute_saliency_peaks_per_second(
         # Determine device — fall back to CPU when GPU not visible.
         from backend.services.av_saliency import _is_gpu_visible
         device = "cuda" if _is_gpu_visible() else "cpu"
+        backend_name = "unknown"
         try:
             avs = AvSaliency(device=device)
+            backend_name = avs.backend_name
             result = avs.predict(frames, audio_energy_1hz)
         except Exception as exc:
             logger.warning(
@@ -1151,6 +1153,11 @@ def _compute_saliency_peaks_per_second(
                 torch.cuda.empty_cache()
         except Exception:
             pass
+
+        # Stash the chosen backend on the function so the caller can
+        # surface it in result.critic.saliency.backend without
+        # threading another return value through every call site.
+        _compute_saliency_peaks_per_second.last_backend = backend_name  # type: ignore[attr-defined]
 
         # Serialize peaks: each second is a list of [x_pct, y_pct, score].
         out: list = []
@@ -1498,19 +1505,27 @@ def _extract_and_cache(
     # crashing the cache. ``CLIPAI_SALIENCY_LAYER=0`` skips the run
     # entirely and writes ``[]`` (also the v6-required schema).
     saliency_peaks: list = []
+    saliency_backend: str = "disabled"
     if _saliency_layer_enabled():
         try:
             saliency_peaks = _compute_saliency_peaks_per_second(
                 video_path, audio_path, duration, slug=slug,
             )
+            saliency_backend = getattr(
+                _compute_saliency_peaks_per_second, "last_backend", "unknown",
+            ) if saliency_peaks else "failed"
         except Exception as exc:
             logger.warning(
                 "[%s] saliency layer raised unexpectedly (%s) — empty peaks",
                 slug, exc,
             )
             saliency_peaks = []
+            saliency_backend = "failed"
     (clip_cache / "saliency_peaks_per_second.json").write_text(
         json.dumps(saliency_peaks),
+    )
+    (clip_cache / "saliency_meta.json").write_text(
+        json.dumps({"backend": saliency_backend}),
     )
 
     # ── Content profile ──
@@ -1595,6 +1610,7 @@ def _extract_and_cache(
         "metadata": metadata,
         "segments": segments_serialized,
         "saliency_peaks_per_second": saliency_peaks,
+        "saliency_backend": saliency_backend,
     }
 
 
@@ -1620,7 +1636,64 @@ def _load_cached_extraction(clip_cache: Path) -> dict:
                 logger.warning(
                     "extraction cache: failed to load %s: %s", fname, exc,
                 )
+    # Layer 1 backend metadata (which adapter actually ran). Optional —
+    # caches written before saliency_meta.json existed return None.
+    meta_path = clip_cache / "saliency_meta.json"
+    if meta_path.is_file():
+        try:
+            payload["saliency_backend"] = json.loads(
+                meta_path.read_text()
+            ).get("backend")
+        except (OSError, json.JSONDecodeError):
+            pass
     return payload
+
+
+def _count_saliency_flagged_windows(
+    events: list, saliency_peaks_per_second: Optional[list],
+    *, crop_width_pct: float = 56.25,
+) -> int:
+    """Count seconds where every top-K saliency peak lies outside the
+    crop, mirroring the ``saliency_excluded`` flag in
+    ``reframe_critic._saliency_in_crop_at`` (Layer 1).
+
+    Returns 0 when no peaks data is available — "not measured" rather
+    than "everything is fine."
+    """
+    if not events or not saliency_peaks_per_second:
+        return 0
+    half = crop_width_pct / 2.0
+    # Bucket events by integer second; use the median crop center
+    # within each second to avoid sub-second jitter.
+    seconds: dict[int, list[float]] = {}
+    for e in events:
+        try:
+            t = float(e.get("t", 0.0))
+            cx = float(e.get("crop_cx", 0.5)) * 100.0
+        except (TypeError, ValueError):
+            continue
+        seconds.setdefault(int(t), []).append(cx)
+    flagged = 0
+    for sec_idx, peaks in enumerate(saliency_peaks_per_second):
+        if not peaks:
+            continue
+        cxs = seconds.get(sec_idx)
+        if not cxs:
+            continue
+        cxs_sorted = sorted(cxs)
+        cx = cxs_sorted[len(cxs_sorted) // 2]  # median
+        any_in = False
+        for peak in peaks:
+            try:
+                px = float(peak[0])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if cx - half <= px <= cx + half:
+                any_in = True
+                break
+        if not any_in:
+            flagged += 1
+    return flagged
 
 
 def extract_per_frame_data_from_payload(payload: dict) -> dict[str, Optional[list]]:
@@ -1741,6 +1814,13 @@ def run_clipai_on_clip(
     )
     if extras_out is not None:
         extras_out.update(extract_per_frame_data_from_payload(payload))
+        # ``saliency_backend`` is consumed by the result.critic block
+        # in main(), not by ``score_timeline`` (which would reject the
+        # unknown kwarg). Stash it under a leading-underscore key the
+        # caller pops before splatting extras into score_timeline.
+        backend = payload.get("saliency_backend")
+        if backend is not None:
+            extras_out["_saliency_backend"] = backend
     return events
 
 
@@ -2093,28 +2173,48 @@ def main(argv: Optional[list[str]] = None) -> int:
             else:
                 result.notes.append("clipai_skipped")
         else:
+            # Layer 1: pop the out-of-band saliency backend before
+            # splatting extras into score_timeline (which only accepts
+            # the documented per-frame kwargs).
+            sal_backend = ca_extras.pop("_saliency_backend", None)
             result.clipai = score_timeline(ca_events, **ca_extras)
             # Layer 1: surface saliency-in-crop into the critic block
             # so the UI / JSON consumer can render the Critic Engine
-            # rows even when other layers haven't been wired yet.
+            # rows. We compute ``windows_flagged`` here from the same
+            # peaks + crop centers the in-crop fraction uses, so the
+            # bench reports a real number even though it doesn't run
+            # ``auto_repair_plan`` directly. ``windows_fixed`` stays
+            # None until the bench drives the bridge end-to-end —
+            # production exports already get the fixes via
+            # ``human_reframe_bridge.maybe_override_render_plan``.
             sal_peaks = ca_extras.get("saliency_peaks_per_second")
             sal_in_crop = (
                 result.clipai.get("saliency_in_crop_fraction")
                 if isinstance(result.clipai, dict) else None
             )
-            if sal_peaks is not None or sal_in_crop is not None:
+            if (
+                sal_peaks is not None
+                or sal_in_crop is not None
+                or sal_backend
+            ):
+                # Count seconds where every top-K peak fell outside the
+                # crop window — these are the "flagged" windows the
+                # critic would auto-widen during the production export.
+                windows_flagged = _count_saliency_flagged_windows(
+                    ca_events, sal_peaks,
+                )
                 result.critic = {
                     "saliency": {
                         "in_crop_fraction": sal_in_crop,
+                        # Alias used by the UI's Critic engine row —
+                        # same value, more readable key.
+                        "in_crop_mean": sal_in_crop,
                         "n_seconds_with_peaks": (
                             sum(1 for s in (sal_peaks or []) if s)
                         ),
-                        # Populated when the segmenter / bridge runs
-                        # ``auto_repair_plan`` with saliency awareness.
-                        # The bench currently doesn't drive that path,
-                        # so we expose the slot with a stable schema and
-                        # let downstream PRs fill in the counter.
+                        "windows_flagged": windows_flagged,
                         "windows_fixed": None,
+                        "backend": sal_backend,
                     },
                 }
 

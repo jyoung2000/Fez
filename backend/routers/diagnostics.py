@@ -2638,6 +2638,41 @@ async def sota_clip_bench(request: Request):
             })
             return
 
+        # Layer 1: pull the critic block out of the bench's results.json
+        # so the SSE complete event can carry it. UI's Critic engine row
+        # consumes ``sotaResult.critic`` directly — no second fetch.
+        critic_summary: Optional[dict] = None
+        try:
+            bench_json_path = f"/tmp/sota_clip_{token}_results.json"
+            if os.path.isfile(bench_json_path):
+                with open(bench_json_path) as fh:
+                    bench_payload = json.load(fh)
+                results_list = bench_payload.get("results") or []
+                # Single-clip mode produces one entry; aggregate would
+                # average across clips but we're always single-clip here.
+                if results_list:
+                    first = results_list[0]
+                    if first.get("critic"):
+                        critic_summary = first["critic"]
+                        sal = critic_summary.get("saliency") or {}
+                        yield _sse_event("phase_result", {
+                            "phase": "saliency",
+                            "status": (
+                                "ok_fallback"
+                                if sal.get("backend") == "spectral_residual"
+                                else "ok"
+                            ),
+                            "in_crop_mean": sal.get("in_crop_mean"),
+                            "windows_flagged": sal.get("windows_flagged"),
+                            "windows_fixed": sal.get("windows_fixed"),
+                            "backend": sal.get("backend"),
+                        })
+        except Exception as _critic_exc:
+            logger.info(
+                "[sota-clip-bench] critic summary parse failed: %s",
+                _critic_exc,
+            )
+
         render_failed = False
         render_cmd = [
             _sys.executable, "-u", "-m", "backend.scripts.sota_render_preview",
@@ -2668,6 +2703,7 @@ async def sota_clip_bench(request: Request):
                 "ok": True, "stage": "sota_bench",
                 "results_md_url": results_md_url,
                 "results_json_url": results_json_url,
+                "critic": critic_summary,
                 "message": (
                     "Bench OK but preview render failed — see ffmpeg "
                     "output above. The bench metric results below "
@@ -2682,6 +2718,7 @@ async def sota_clip_bench(request: Request):
                 "preview_size_mb": round(preview_size_mb, 1),
                 "results_md_url": results_md_url,
                 "results_json_url": results_json_url,
+                "critic": critic_summary,
                 "message": (
                     f"SOTA pipeline rendered 9:16 preview "
                     f"({preview_size_mb:.1f} MB). Watch the video inline "
