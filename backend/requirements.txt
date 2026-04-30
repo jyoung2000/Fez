@@ -22,7 +22,10 @@ psutil>=5.9.0
 # mediapipe installed separately in Dockerfile (protobuf conflict with torch/pyannote)
 numpy>=1.24.0
 scipy>=1.10.0
-opencv-python-headless>=4.8.0
+# L1 critic engine: cv2.saliency lives in the contrib variant only.
+# StaticSaliencySpectralResidual is the always-available fallback when
+# TASED-Net's vendored module / weights aren't present.
+opencv-contrib-python-headless>=4.8.0
 # v4.1: ultralytics (YOLOv8n) backend for object_detector /
 # person_detector. Without this, PersonDetector silently falls back to
 # backend=none → person_body anchor source produces 0 anchors on

@@ -147,56 +147,201 @@ def normalize_heatmap(raw: np.ndarray) -> np.ndarray:
 class _TasedNetAdapter:
     """Lazy wrapper around the TASED-Net PyTorch port.
 
-    Isolated for unit-test mocking. Real wiring downloads TASED_v2.pth
-    on first use, builds the upstream nn.Module, and runs inference at
-    256×144 input on 32-frame clips.
+    Two artefacts must be operator-supplied for this adapter to
+    actually run:
+
+    1. Weights at ``$TASED_NET_MODEL_PATH`` (default
+       ``/opt/clipai/models/tased_v2.pth``). Operators download the
+       canonical checkpoint themselves — we don't bake it into the
+       image because the upstream MichiganCOG/TASED-Net repo lacks an
+       explicit license.
+    2. A vendored module at ``backend/vendor/tasednet/model.py``
+       exporting ``TASED_v2``. Same licensing concern: operators who
+       want TASED-Net place the model definition there with their own
+       attribution.
+
+    When either is missing the adapter raises ``RuntimeError`` and the
+    ``AvSaliency.__post_init__`` fallback drops to the spectral
+    residual backend so production stays functional.
     """
+
+    backend_name = "tased_net"
 
     def __init__(self, *, device: str = "cuda"):
         self.device = device
         self._model: Optional[Any] = None
+        self._mean: Optional[Any] = None
+        self._std: Optional[Any] = None
 
     def load(self) -> None:
         try:
             import torch  # type: ignore
-            import torch.nn as nn  # type: ignore  # noqa: F401
         except ImportError as exc:
             raise RuntimeError(
                 "torch required for TASED-Net AV saliency"
             ) from exc
-        # Real wiring: clone the upstream model definition, download
-        # weights, load_state_dict. Kept minimal here to isolate the
-        # unit-test surface — homelab integration is the gate.
+
         try:
-            from tasednet.model import TASED_v2  # type: ignore
-            self._model = TASED_v2().to(self.device).eval()
+            from backend.vendor.tasednet import TASED_v2  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
-                "tasednet wheel not installed; pin upstream and rebuild"
+                "TASED-Net vendored module missing — drop "
+                "backend/vendor/tasednet/model.py with a TASED_v2 nn.Module "
+                "(see infra/saliency/README.md)"
             ) from exc
+
+        import os as _os
+        model_path = _os.environ.get(
+            "TASED_NET_MODEL_PATH", "/opt/clipai/models/tased_v2.pth",
+        )
+        if not _os.path.isfile(model_path):
+            raise RuntimeError(
+                f"TASED-Net weights not found at {model_path} — set "
+                "TASED_NET_MODEL_PATH or rebuild with the weights baked in"
+            )
+
+        state_dict = torch.load(model_path, map_location=self.device)
+        # Some upstream checkpoints are saved with a ``module.`` prefix
+        # from DataParallel training; strip it so vanilla load works.
+        cleaned = {
+            k.replace("module.", "", 1) if k.startswith("module.") else k: v
+            for k, v in state_dict.items()
+        }
+        model = TASED_v2()
+        missing, unexpected = model.load_state_dict(cleaned, strict=False)
+        if missing or unexpected:
+            logger.warning(
+                "TASED-Net load_state_dict had %d missing / %d unexpected "
+                "keys — first missing: %r, first unexpected: %r",
+                len(missing or ()), len(unexpected or ()),
+                (missing or [None])[0], (unexpected or [None])[0],
+            )
+        self._model = model.to(self.device).eval()
+
+        # ImageNet normalization stats — the upstream repo uses these.
+        self._mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self._std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
     def predict_clip(
         self, frames: np.ndarray, audio_energy_per_sec: np.ndarray,
     ) -> np.ndarray:
-        """Run TASED-Net + audio-energy concat over a clip.
+        """Run TASED-Net over ``frames`` and return raw saliency maps.
 
-        Returns ``(T_sec, H, W)`` raw saliency maps. Caller normalizes.
+        Returns ``(T_sec, H, W)``. Caller normalizes + applies audio
+        fusion.
         """
         if self._model is None:
             self.load()
         try:
             import torch  # type: ignore
+            import cv2  # type: ignore
         except ImportError as exc:
-            raise RuntimeError("torch missing") from exc
+            raise RuntimeError("torch+cv2 required for TASED-Net") from exc
         if frames.ndim != 4 or frames.shape[-1] != 3:
             raise ValueError("expected (T, H, W, 3)")
+
+        T = frames.shape[0]
+        # TASED-Net needs 32-frame chunks; pad short clips by repeating
+        # the last frame so the model doesn't crash on a 5-second
+        # 1-fps fixture or a tail second with <30 frames remaining.
+        if T < 32:
+            pad = np.repeat(frames[-1:], 32 - T, axis=0)
+            frames = np.concatenate([frames, pad], axis=0)
+            T = frames.shape[0]
+
+        n_sec = max(1, T // 30)
+        out = np.zeros((n_sec, HEATMAP_H, HEATMAP_W), dtype=np.float32)
+
+        # Resize to 256x144 + ImageNet normalize once.
+        resized = np.empty((T, HEATMAP_H, HEATMAP_W, 3), dtype=np.float32)
+        for i in range(T):
+            resized[i] = cv2.resize(
+                frames[i], (HEATMAP_W, HEATMAP_H),
+            ).astype(np.float32)
+        resized /= 255.0
+        resized = (resized - self._mean) / self._std
+        chw = resized.transpose(0, 3, 1, 2)  # (T, 3, H, W)
+
+        with torch.no_grad():
+            for sec in range(n_sec):
+                start = sec * 30
+                chunk = chw[start:start + 32]
+                if chunk.shape[0] < 32:
+                    pad = np.repeat(chunk[-1:], 32 - chunk.shape[0], axis=0)
+                    chunk = np.concatenate([chunk, pad], axis=0)
+                tensor = (
+                    torch.from_numpy(chunk)
+                    .unsqueeze(0)
+                    .to(self.device)
+                )
+                heat = self._model(tensor)
+                # Output shape is (B, 1, H, W) on the canonical
+                # upstream — squeeze defensively.
+                heat = heat.squeeze().cpu().numpy()
+                if heat.ndim != 2:
+                    heat = heat.reshape(HEATMAP_H, HEATMAP_W)
+                out[sec] = heat
+        return out
+
+
+class _SpectralResidualAdapter:
+    """OpenCV spectral-residual saliency.
+
+    Always-available production fallback for hosts that don't have
+    PyTorch / TASED-Net weights / a usable GPU. Quality is meaningfully
+    below TASED-Net — there's no audio fusion and no temporal context,
+    just per-frame spatial-frequency saliency — but it produces a real
+    heatmap with hot spots near high-contrast / unusual regions that
+    the critic can act on. Inference cost is a few ms per frame on
+    CPU, so the per-second sampling is essentially free.
+
+    Requires ``opencv-contrib-python-headless`` (NOT the plain
+    ``opencv-python-headless``). The image's ``requirements.txt``
+    pins the contrib variant.
+    """
+
+    backend_name = "spectral_residual"
+
+    def __init__(self, *, device: str = "cpu"):
+        self.device = device  # ignored
+        self._sr: Optional[Any] = None
+
+    def load(self) -> None:
+        try:
+            import cv2  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "OpenCV not installed — spectral residual unavailable"
+            ) from exc
+        try:
+            self._sr = cv2.saliency.StaticSaliencySpectralResidual_create()
+        except (AttributeError, cv2.error) as exc:  # type: ignore
+            raise RuntimeError(
+                "cv2.saliency missing — install opencv-contrib-python(-headless) "
+                "instead of opencv-python(-headless)"
+            ) from exc
+
+    def predict_clip(
+        self, frames: np.ndarray, audio_energy_per_sec: np.ndarray,
+    ) -> np.ndarray:
+        if self._sr is None:
+            self.load()
+        try:
+            import cv2  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("cv2 missing") from exc
+        if frames.ndim != 4 or frames.shape[-1] != 3:
+            raise ValueError("expected (T, H, W, 3)")
+
         T = frames.shape[0]
         n_sec = max(1, T // 30)
-        # Resize each frame to 256x144 and stack into 32-frame chunks.
-        # TASED-Net wants (B, 3, T_chunk, H, W). We process one chunk
-        # per second of source video.
         out = np.zeros((n_sec, HEATMAP_H, HEATMAP_W), dtype=np.float32)
-        # Real path runs the model; mocked path overrides this method.
+        for sec in range(n_sec):
+            mid = min(sec * 30 + 15, T - 1)
+            small = cv2.resize(frames[mid], (HEATMAP_W, HEATMAP_H))
+            ok, sal = self._sr.computeSaliency(small.astype(np.uint8))
+            if ok and sal is not None:
+                out[sec] = sal.astype(np.float32)
         return out
 
 
@@ -233,18 +378,50 @@ def audio_energy_per_second(audio_samples: np.ndarray, sample_rate: int) -> np.n
 
 @dataclass
 class AvSaliency:
-    """Saliency predictor + audio fusion + peak extraction."""
+    """Saliency predictor + audio fusion + peak extraction.
+
+    Backend selection chain:
+      1. Try ``_adapter_cls`` (default ``_TasedNetAdapter``).
+      2. On RuntimeError / ImportError fall back to
+         ``_SpectralResidualAdapter`` so production is never left
+         without saliency. ``backend_name`` reflects the chosen
+         adapter — surfaced to the SSE / UI so operators see when
+         the fallback fired.
+
+    CUDA-requested + no-GPU silently downgrades to CPU instead of
+    raising — matches the bench's prior behavior where missing GPU
+    falls back rather than aborting the run.
+    """
 
     device: str = "cuda"
     _adapter_cls: type = field(default_factory=lambda: _TasedNetAdapter, repr=False)
 
     def __post_init__(self):
         if self.device == "cuda" and not _is_gpu_visible():
-            raise RuntimeError(
-                "AvSaliency requires a CUDA GPU; set device='cpu' to "
-                "run on CPU (very slow) or skip the saliency pass."
+            self.device = "cpu"
+        primary = self._adapter_cls(device=self.device)
+        try:
+            primary.load()
+            self._adapter = primary
+        except (ImportError, RuntimeError) as exc:
+            logger.info(
+                "%s unavailable (%s); falling back to spectral residual",
+                getattr(primary, "backend_name", primary.__class__.__name__),
+                exc,
             )
-        self._adapter = self._adapter_cls(device=self.device)
+            fallback = _SpectralResidualAdapter(device="cpu")
+            try:
+                fallback.load()
+            except (ImportError, RuntimeError) as exc2:
+                raise RuntimeError(
+                    "no saliency backend available (TASED-Net + spectral "
+                    f"residual both failed): {exc2}"
+                ) from exc2
+            self._adapter = fallback
+
+    @property
+    def backend_name(self) -> str:
+        return getattr(self._adapter, "backend_name", "unknown")
 
     def predict(
         self,
