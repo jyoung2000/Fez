@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import AsyncGenerator
 
 import httpx
@@ -2190,6 +2191,9 @@ async def sota_clip_bench(request: Request):
         body = {}
     token = (body.get("token") or "").strip()
     info = _SOTA_CLIP_UPLOADS.get(token)
+    # Task A: operator can request a forced re-extraction when the
+    # cache-state badge in the UI flagged a stale-cache warning.
+    force_reextract = bool(body.get("force") or body.get("force_reextract"))
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     repo_root = os.path.dirname(repo_root)
@@ -2419,6 +2423,111 @@ async def sota_clip_bench(request: Request):
             })
             return
 
+        # ── Phase 1.7: cache state check (Task A) ────────────────────
+        # Surface stale-cache warnings BEFORE the bench runs so the
+        # operator sees a "your cache predates this code" badge if
+        # they need to force-reextract. This is the operator-facing
+        # fix for the silent-stale-result regression.
+        import hashlib as _hashlib
+        try:
+            _sha = _hashlib.sha256()
+            with open(info["path"], "rb") as _f:
+                for _chunk in iter(lambda: _f.read(1 << 20), b""):
+                    _sha.update(_chunk)
+            _sha_hex_for_cache_check = _sha.hexdigest()
+        except Exception as _exc:
+            _sha_hex_for_cache_check = None
+            yield _sse_event("log", {
+                "line": f"!! cache_check: hash failed: {_exc}",
+            })
+
+        cache_state_payload = None
+        if _sha_hex_for_cache_check:
+            yield _sse_event("phase_start", {
+                "phase": "cache_check",
+                "label": "Checking extraction cache freshness...",
+            })
+            try:
+                from backend.scripts.compare_autoflip_vs_clipai import (
+                    describe_cache_state,
+                )
+                _clip_cache = Path(cache_dir) / "extractions" / _sha_hex_for_cache_check
+                cache_state_payload = describe_cache_state(_clip_cache)
+            except Exception as _exc:
+                cache_state_payload = {
+                    "phase": "cache_check",
+                    "status": "ok",
+                    "warning": None,
+                    "cache_path": None,
+                    "cache_age_seconds": None,
+                    "cache_version": None,
+                    "expected_version": None,
+                    "container_image_built_at": None,
+                    "exists": False,
+                }
+                yield _sse_event("log", {
+                    "line": f"!! cache_check: describe failed: {_exc}",
+                })
+            yield _sse_event("phase_result", cache_state_payload)
+            if cache_state_payload.get("warning"):
+                yield _sse_event("log", {
+                    "line": f"⚠ {cache_state_payload['warning']}",
+                })
+
+        # ── Phase 1.8: naive_baseline reference (Task B) ─────────────
+        # AutoFlip references must exist for the bench's autoflip
+        # column to populate. Real refs require the AutoFlip Docker
+        # image (~30-60 min build); the naive_baseline is generated
+        # inline by ``backend.scripts.run_naive_baseline --single-clip``
+        # so single-clip runs always have a comparator. This block
+        # is a no-op when a reference already exists for the slug.
+        ref_dir = os.path.join(repo_root, "tests", "autoflip_reference_outputs")
+        ref_path = os.path.join(ref_dir, f"{info['slug']}.json")
+        if os.path.isfile(ref_path):
+            yield _sse_event("phase_start", {
+                "phase": "naive_baseline_ref",
+                "label": (
+                    f"AutoFlip reference already exists for "
+                    f"{info['slug']} — skipping generation."
+                ),
+            })
+            yield _sse_event("phase_result", {
+                "phase": "naive_baseline_ref",
+                "status": "skip",
+                "reason": "reference already exists",
+                "ref_path": ref_path,
+            })
+        else:
+            yield _sse_event("phase_start", {
+                "phase": "naive_baseline_ref",
+                "label": "Generating naive_baseline AutoFlip reference (~5-30s)...",
+            })
+            try:
+                os.makedirs(ref_dir, exist_ok=True)
+            except OSError:
+                pass
+            naive_failed = False
+            naive_cmd = [
+                _sys.executable, "-u", "-m",
+                "backend.scripts.run_naive_baseline",
+                "--single-clip", info["path"],
+                "--slug", info["slug"],
+                "--output-dir", ref_dir,
+            ]
+            async for evt in _stream_subprocess(naive_cmd):
+                yield evt
+                try:
+                    parsed = json.loads(evt[6:])
+                    if parsed.get("type") == "exit_code":
+                        naive_failed = parsed["data"]["code"] != 0
+                except Exception:
+                    pass
+            yield _sse_event("phase_result", {
+                "phase": "naive_baseline_ref",
+                "status": "fail" if naive_failed else "ok",
+                "ref_path": ref_path if not naive_failed else None,
+            })
+
         yield _sse_event("phase_start", {
             "phase": "sota_bench",
             "label": (
@@ -2446,6 +2555,11 @@ async def sota_clip_bench(request: Request):
             "--output", f"/tmp/sota_clip_{token}_results.md",
             "--json-out", f"/tmp/sota_clip_{token}_results.json",
         ]
+        if force_reextract:
+            bench_cmd.append("--force-reextract")
+            yield _sse_event("log", {
+                "line": "[bench] --force-reextract: ignoring extraction cache",
+            })
         async for evt in _stream_subprocess(bench_cmd, env=bench_env):
             yield evt
             try:
@@ -2788,3 +2902,205 @@ async def auth_cache_stats(_admin: User = Depends(require_admin)):
     """
     from backend.app.auth import store as auth_store
     return auth_store.get_cache_stats()
+
+
+# ─────────────────── Task B — AutoFlip refs management ───────────────────
+
+
+def _refs_state_snapshot() -> dict:
+    """Count real / naive AutoFlip references on disk for the badge UI.
+
+    Reads the canonical bench manifest (``tests/real_content/manifest.json``)
+    so ``expected`` is the number of clips the bench expects refs for.
+    For each ``ref_dir/<slug>.json`` that exists, the file's ``tool``
+    field is consulted: ``"naive_baseline"`` → naive count;
+    everything else (typically ``"mediapipe_autoflip"``) → real count.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo_root = os.path.dirname(repo_root)
+    manifest_path = os.path.join(repo_root, "tests", "real_content", "manifest.json")
+    ref_dir = os.path.join(repo_root, "tests", "autoflip_reference_outputs")
+
+    expected = 0
+    real = 0
+    naive = 0
+
+    try:
+        with open(manifest_path) as fh:
+            manifest = json.load(fh)
+        clips = manifest.get("clips") or []
+        expected = len(clips)
+        for clip in clips:
+            slug = clip.get("slug") or ""
+            ref_path = os.path.join(ref_dir, f"{slug}.json")
+            if not os.path.isfile(ref_path):
+                continue
+            try:
+                with open(ref_path) as rf:
+                    payload = json.load(rf)
+                tool = str(payload.get("tool") or "").lower()
+            except (OSError, json.JSONDecodeError):
+                tool = ""
+            if tool == "naive_baseline":
+                naive += 1
+            else:
+                real += 1
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    return {
+        "expected": expected,
+        "real": real,
+        "naive": naive,
+        "ref_dir": ref_dir,
+    }
+
+
+@router.get("/refs-state")
+async def diagnostics_refs_state():
+    """Return AutoFlip-references badge state for the Settings UI.
+
+    Schema: ``{expected, real, naive, ref_dir}``. Public (matches the
+    rest of the SOTA diagnostics endpoints, which are unauthenticated
+    on this router).
+    """
+    return _refs_state_snapshot()
+
+
+@router.post("/build-autoflip-image")
+async def build_autoflip_image():
+    """SSE-stream a full AutoFlip reference rebuild.
+
+    Two phases:
+      1. ``docker compose --profile bench build autoflip`` — first run
+         takes 30-60 minutes (Bazel + MediaPipe). Subsequent rebuilds
+         hit the layer cache and complete in seconds.
+      2. ``python -m backend.scripts.run_autoflip_reference`` — emits
+         per-clip JSON references into ``tests/autoflip_reference_outputs/``.
+
+    The existing ``_stream_subprocess`` helper emits a 5 s heartbeat
+    while subprocess output is quiet (see :func:`sota_clip_bench`),
+    so the SSE connection stays open through long Bazel compiles.
+    """
+    import sys as _sys
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo_root = os.path.dirname(repo_root)
+    manifest_path = os.path.join(repo_root, "tests", "real_content", "manifest.json")
+    ref_dir = os.path.join(repo_root, "tests", "autoflip_reference_outputs")
+
+    async def _stream_subprocess(cmd: list, *, env: dict | None = None):
+        sub_env = {
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+            **(env or {}),
+        }
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=repo_root, env=sub_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            assert proc.stdout is not None
+            last_emit = time.monotonic()
+            while True:
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    yield _sse_event("heartbeat", {
+                        "elapsed_sec": round(time.monotonic() - last_emit, 1),
+                    })
+                    continue
+                if not line:
+                    break
+                last_emit = time.monotonic()
+                yield _sse_event("log", {
+                    "line": line.decode(errors="replace").rstrip(),
+                })
+            await proc.wait()
+            yield _sse_event("exit_code", {"code": proc.returncode})
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        # Phase 1: docker build
+        yield _sse_event("phase_start", {
+            "phase": "build_autoflip",
+            "label": "Building AutoFlip Docker image (~30-60 min on first run)...",
+        })
+        build_failed = False
+        async for evt in _stream_subprocess([
+            "docker", "compose", "--profile", "bench", "build", "autoflip",
+        ]):
+            yield evt
+            try:
+                parsed = json.loads(evt[6:])
+                if parsed.get("type") == "exit_code":
+                    build_failed = parsed["data"]["code"] != 0
+            except Exception:
+                pass
+        yield _sse_event("phase_result", {
+            "phase": "build_autoflip",
+            "status": "fail" if build_failed else "pass",
+        })
+        if build_failed:
+            yield _sse_event("complete", {
+                "ok": False, "stage": "build_autoflip",
+                "message": (
+                    "Docker build for the AutoFlip image failed. Inspect "
+                    "the streaming output above; if Docker isn't available "
+                    "in this environment, run the build out-of-band on a "
+                    "host with the daemon."
+                ),
+            })
+            return
+
+        # Phase 2: generate refs
+        try:
+            os.makedirs(ref_dir, exist_ok=True)
+        except OSError:
+            pass
+
+        yield _sse_event("phase_start", {
+            "phase": "generate_refs",
+            "label": "Generating real AutoFlip references for each manifest clip...",
+        })
+        gen_failed = False
+        async for evt in _stream_subprocess([
+            _sys.executable, "-u", "-m", "backend.scripts.run_autoflip_reference",
+            "--manifest", manifest_path,
+            "--output-dir", ref_dir,
+        ]):
+            yield evt
+            try:
+                parsed = json.loads(evt[6:])
+                if parsed.get("type") == "exit_code":
+                    gen_failed = parsed["data"]["code"] != 0
+            except Exception:
+                pass
+        yield _sse_event("phase_result", {
+            "phase": "generate_refs",
+            "status": "fail" if gen_failed else "pass",
+            "refs_state": _refs_state_snapshot(),
+        })
+
+        yield _sse_event("complete", {
+            "ok": not gen_failed,
+            "stage": "generate_refs",
+            "refs_state": _refs_state_snapshot(),
+            "message": (
+                "AutoFlip references rebuilt." if not gen_failed
+                else "Reference generation failed; see streaming output."
+            ),
+        })
+
+    return StreamingResponse(
+        event_stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

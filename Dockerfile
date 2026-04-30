@@ -173,6 +173,42 @@ RUN chmod +x ./scripts/*.sh 2>/dev/null || true
 # Copy built frontend from stage 1
 COPY --from=frontend-build /app/frontend/dist ./static
 
+# Build timestamp for cache-staleness detection. The /sota-clip-bench
+# SSE endpoint compares this against the per-clip extraction cache mtime
+# to flag "stale cache, fresh code" mismatches that the in-process
+# mtime watch list might miss (e.g. when a newly-added module's path
+# hasn't been added to _EXTRACTOR_MODULES_FOR_CACHE yet).
+RUN date -u +"%Y-%m-%dT%H:%M:%SZ" > /etc/build_info \
+    && cat /etc/build_info
+
+# Pre-download Light-ASD ONNX model so first-run inference doesn't
+# require network egress. The SHA256 pin protects against substitution
+# on GitHub Releases. To compute / refresh the pin locally:
+#     make download-light-asd-model
+# then paste the printed sha256 into LIGHT_ASD_SHA256 below. The
+# ``|| echo`` keeps the build green when the operator hasn't pinned
+# the hash yet — the lazy loader in ``backend/services/light_asd.py``
+# falls back to runtime download in that case (same behavior as
+# pre-Task-C builds), and the v3 path falls back to v2 if the model
+# is unavailable.
+ENV LIGHT_ASD_SHA256=""
+ENV LIGHT_ASD_MODEL_PATH=/app/backend/models/light_asd.onnx
+RUN mkdir -p /app/backend/models && \
+    if curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
+         -o "$LIGHT_ASD_MODEL_PATH" \
+         "https://github.com/Junhua-Liao/Light-ASD/releases/download/v1.0/light_asd.onnx"; then \
+       if [ -n "$LIGHT_ASD_SHA256" ]; then \
+         echo "$LIGHT_ASD_SHA256  $LIGHT_ASD_MODEL_PATH" | sha256sum -c \
+           || (echo "WARN: Light-ASD SHA256 mismatch — keeping file but flagging" \
+               && rm -f "$LIGHT_ASD_MODEL_PATH"); \
+       else \
+         echo "WARN: LIGHT_ASD_SHA256 not pinned; record sha256:" \
+           && sha256sum "$LIGHT_ASD_MODEL_PATH"; \
+       fi; \
+    else \
+       echo "WARN: Light-ASD pre-download failed — will retry at runtime"; \
+    fi
+
 EXPOSE 1353
 
 CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "1353", "--workers", "1"]

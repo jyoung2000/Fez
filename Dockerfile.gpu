@@ -208,6 +208,34 @@ RUN chmod +x ./scripts/*.sh 2>/dev/null || true
 # Copy pre-built frontend from stage 1
 COPY --from=frontend-build /app/frontend/dist ./static
 
+# Build timestamp for cache-staleness detection. The /sota-clip-bench
+# SSE endpoint compares this against the per-clip extraction cache mtime
+# to flag "stale cache, fresh code" mismatches.
+RUN date -u +"%Y-%m-%dT%H:%M:%SZ" > /etc/build_info \
+    && cat /etc/build_info
+
+# Pre-download Light-ASD ONNX model so first-run inference doesn't
+# require network egress. To pin the SHA256 locally, run:
+#     make download-light-asd-model
+# then paste the printed hash into LIGHT_ASD_SHA256.
+ENV LIGHT_ASD_SHA256=""
+ENV LIGHT_ASD_MODEL_PATH=/app/backend/models/light_asd.onnx
+RUN mkdir -p /app/backend/models && \
+    if curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
+         -o "$LIGHT_ASD_MODEL_PATH" \
+         "https://github.com/Junhua-Liao/Light-ASD/releases/download/v1.0/light_asd.onnx"; then \
+       if [ -n "$LIGHT_ASD_SHA256" ]; then \
+         echo "$LIGHT_ASD_SHA256  $LIGHT_ASD_MODEL_PATH" | sha256sum -c \
+           || (echo "WARN: Light-ASD SHA256 mismatch — keeping file but flagging" \
+               && rm -f "$LIGHT_ASD_MODEL_PATH"); \
+       else \
+         echo "WARN: LIGHT_ASD_SHA256 not pinned; record sha256:" \
+           && sha256sum "$LIGHT_ASD_MODEL_PATH"; \
+       fi; \
+    else \
+       echo "WARN: Light-ASD pre-download failed — will retry at runtime"; \
+    fi
+
 EXPOSE 1353
 
 CMD ["python3", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "1353", "--workers", "1"]

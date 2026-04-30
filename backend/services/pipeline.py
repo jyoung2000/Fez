@@ -4011,11 +4011,17 @@ async def _run_analysis_inner(job_id: str):
             # Use V2 (identity-based) with dense data when available
             _speaker_face_data = dense_face_results if dense_face_results else face_results
             _shot_cuts_for_speaker = scene_cut_timestamps if scene_cut_timestamps else []
-            # Phase C: optional Light-ASD audio-visual backend behind
-            # CLIPAI_ASD_BACKEND=light_asd. Falls back to v2 if the model
-            # produced no scores. Default OFF — v2 stays the production
-            # path until content-type validation confirms parity.
-            asd_backend = os.environ.get("CLIPAI_ASD_BACKEND", "heuristic").lower()
+            # Phase C: Light-ASD audio-visual backend (default ON as
+            # of Task C). v2's lip-aperture heuristic over-switched on
+            # any non-speech mouth motion (laughing, eating, hand
+            # gestures near the face) and couldn't represent
+            # overlapping speech or off-camera speakers. Light-ASD's
+            # audio-visual model handles all three; the v2 fallback
+            # below preserves the old behavior automatically when the
+            # model is unavailable or returns zero scores. Override
+            # with CLIPAI_ASD_BACKEND=heuristic to revert without a
+            # redeploy.
+            asd_backend = os.environ.get("CLIPAI_ASD_BACKEND", "light_asd").lower()
             if asd_backend == "light_asd" and dense_face_results:
                 try:
                     from backend.services.light_asd import score_faces_for_clip

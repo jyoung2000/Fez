@@ -392,6 +392,82 @@ export default function PipelineDiagnostics() {
   const [sotaClipUploadProgress, setSotaClipUploadProgress] = useState(null); // 0..100 or null
   const sotaClipFileInputRef = React.useRef(null);
 
+  // Task A — cache state surfaced in SSE phase_result for "cache_check"
+  // so the operator sees a stale-cache warning + a "Force re-extract"
+  // button when the deployed cache predates the running container.
+  const [cacheCheck, setCacheCheck] = useState(null);
+  const [forceReextract, setForceReextract] = useState(false);
+
+  // Task B — AutoFlip references badge state. Polled from
+  // /api/diagnostics/refs-state on mount + after a build.
+  const [refsState, setRefsState] = useState({ expected: 0, real: 0, naive: 0 });
+  const [refsBuilding, setRefsBuilding] = useState(false);
+
+  const fetchRefsState = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/diagnostics/refs-state');
+      if (resp.ok) {
+        const data = await resp.json();
+        setRefsState({
+          expected: data.expected || 0,
+          real: data.real || 0,
+          naive: data.naive || 0,
+        });
+      }
+    } catch { /* badge is best-effort */ }
+  }, []);
+
+  React.useEffect(() => { fetchRefsState(); }, [fetchRefsState]);
+
+  const handleBuildAutoflip = useCallback(async () => {
+    if (refsBuilding) return;
+    setRefsBuilding(true);
+    setSotaLogs((prev) => [...prev, {
+      kind: 'meta',
+      text: '[build-autoflip] starting Docker build (may take 30-60 min)...',
+    }]);
+    try {
+      const resp = await fetch('/api/diagnostics/build-autoflip-image', {
+        method: 'POST',
+      });
+      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const evt = JSON.parse(line.slice(6));
+            if (evt.type === 'log') {
+              setSotaLogs((prev) => [...prev, { kind: 'log', text: evt.data.line }]);
+            } else if (evt.type === 'phase_result' && evt.data.refs_state) {
+              setRefsState(evt.data.refs_state);
+            } else if (evt.type === 'complete') {
+              if (evt.data.refs_state) setRefsState(evt.data.refs_state);
+              setSotaLogs((prev) => [...prev, {
+                kind: 'meta',
+                text: `[build-autoflip] ${evt.data.message || 'done'}`,
+              }]);
+            }
+          } catch { /* skip malformed */ }
+        }
+      }
+    } catch (e) {
+      setSotaLogs((prev) => [...prev, {
+        kind: 'meta', text: `[build-autoflip] failed: ${e.message}`,
+      }]);
+    } finally {
+      setRefsBuilding(false);
+      fetchRefsState();
+    }
+  }, [refsBuilding, fetchRefsState]);
+
   const SOTA_CONTENT_TYPES = [
     { value: 'default', label: 'Auto / default' },
     { value: 'multi_speaker_panel', label: 'Multi-speaker panel' },
@@ -573,6 +649,7 @@ export default function PipelineDiagnostics() {
     setSotaPhases([]);
     setSotaLogs([]);
     setSotaResult(null);
+    setCacheCheck(null);
     setSotaClipUploadProgress(0);
 
     try {
@@ -619,11 +696,18 @@ export default function PipelineDiagnostics() {
       }]);
 
       // Step 2: SSE-stream the bench against the uploaded clip.
+      // ``force`` triggers --force-reextract on the bench script
+      // when the cache-state badge from a prior run was stale.
       const benchResp = await fetch('/api/diagnostics/sota-clip-bench', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: uploadJson.token }),
+        body: JSON.stringify({
+          token: uploadJson.token,
+          force: forceReextract,
+        }),
       });
+      // Reset the toggle so the next run defaults back to cache-fresh.
+      setForceReextract(false);
       if (!benchResp.ok || !benchResp.body) {
         throw new Error(`bench HTTP ${benchResp.status}`);
       }
@@ -649,6 +733,11 @@ export default function PipelineDiagnostics() {
               setSotaPhases((prev) =>
                 prev.map((p) => p.phase === evt.data.phase ? { ...p, status: evt.data.status } : p),
               );
+              // Task A: capture the full cache_check payload so the
+              // sticky badge below can render age / version / warning.
+              if (evt.data.phase === 'cache_check') {
+                setCacheCheck(evt.data);
+              }
             } else if (evt.type === 'log') {
               setSotaLogs((prev) => [...prev, { kind: 'log', text: evt.data.line }]);
             } else if (evt.type === 'exit_code') {
@@ -834,6 +923,47 @@ export default function PipelineDiagnostics() {
             fixture cache entirely. Auth required (you are logged in).
           </div>
 
+          {/* Task B: AutoFlip references status + on-demand rebuild */}
+          {refsState.expected > 0 && (
+            <div style={{
+              display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8,
+              fontSize: 11, fontFamily: 'var(--font-mono)',
+              color: 'var(--text-secondary)', marginBottom: 10,
+            }}>
+              <span>AutoFlip references:</span>
+              <span style={{
+                padding: '1px 6px',
+                background: refsState.real > 0 ? 'rgba(34,197,94,0.12)' : 'var(--bg-base)',
+                color: refsState.real > 0 ? '#22c55e' : 'var(--text-muted)',
+                border: '1px solid var(--border)', borderRadius: 4,
+              }}>
+                {refsState.real}/{refsState.expected} real
+              </span>
+              <span style={{
+                padding: '1px 6px',
+                background: refsState.naive > 0 ? 'rgba(59,130,246,0.12)' : 'var(--bg-base)',
+                color: refsState.naive > 0 ? '#3b82f6' : 'var(--text-muted)',
+                border: '1px solid var(--border)', borderRadius: 4,
+              }}>
+                {refsState.naive}/{refsState.expected} naive
+              </span>
+              {refsState.real === 0 && (
+                <button
+                  onClick={handleBuildAutoflip}
+                  disabled={refsBuilding}
+                  style={{
+                    ...smallBtnStyle,
+                    padding: '2px 10px', fontSize: 10,
+                    cursor: refsBuilding ? 'default' : 'pointer',
+                  }}
+                  title="Build the AutoFlip Docker image and generate real references for the manifest. Takes 30-60 minutes on first build."
+                >
+                  {refsBuilding ? 'Building (30-60 min)...' : 'Build AutoFlip image'}
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Hidden native file input + visible "Choose..." trigger */}
           <input
             ref={sotaClipFileInputRef}
@@ -1010,6 +1140,70 @@ export default function PipelineDiagnostics() {
             borderRadius: 'var(--radius-sm)',
           }}>
             {sotaResult.ok ? '\u2705 ' : '\u274c '}{sotaResult.message}
+          </div>
+        )}
+
+        {/* Task A: cache state row \u2014 surfaces stale-cache warning so
+            the operator knows when their numbers came from a cache
+            written before the running container's code landed. */}
+        {cacheCheck && cacheCheck.exists !== false && (
+          <div style={{
+            marginTop: 6,
+            padding: '6px 10px', fontSize: 11,
+            fontFamily: 'var(--font-mono)',
+            color: cacheCheck.status === 'stale_warning' ? '#ff9f0a' : 'var(--text-muted)',
+            background: cacheCheck.status === 'stale_warning'
+              ? 'rgba(255, 159, 10, 0.06)' : 'transparent',
+            border: cacheCheck.status === 'stale_warning'
+              ? '1px solid rgba(255, 159, 10, 0.4)' : '1px solid transparent',
+            borderRadius: 'var(--radius-sm)',
+            display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8,
+          }}>
+            <span>
+              {cacheCheck.status === 'stale_warning' ? '\u26a0 ' : '\u2705 '}
+              Cache: {cacheCheck.status === 'stale_warning' ? 'STALE' : 'fresh'}
+            </span>
+            {cacheCheck.cache_age_seconds !== null && (
+              <span>
+                {' \u2022 '}
+                {cacheCheck.cache_age_seconds < 60
+                  ? `${cacheCheck.cache_age_seconds}s old`
+                  : `${Math.round(cacheCheck.cache_age_seconds / 60)} min old`}
+              </span>
+            )}
+            <span>
+              {' \u2022 v'}{cacheCheck.cache_version ?? '?'}
+              {cacheCheck.expected_version != null
+                && cacheCheck.cache_version != null
+                && cacheCheck.cache_version !== cacheCheck.expected_version
+                && ` (code expects v${cacheCheck.expected_version})`}
+            </span>
+            {cacheCheck.status === 'stale_warning' && (
+              <button
+                onClick={() => {
+                  setForceReextract(true);
+                  runSotaClipTest();
+                }}
+                disabled={sotaRunning}
+                style={{
+                  ...smallBtnStyle,
+                  padding: '2px 10px', fontSize: 10,
+                  marginLeft: 'auto',
+                  cursor: sotaRunning ? 'default' : 'pointer',
+                  background: 'rgba(255, 159, 10, 0.16)',
+                  color: '#ff9f0a',
+                  borderColor: 'rgba(255, 159, 10, 0.6)',
+                }}
+                title="Re-run with --force-reextract to rebuild the cache from current code"
+              >
+                Force re-extract
+              </button>
+            )}
+            {cacheCheck.warning && (
+              <div style={{ width: '100%', fontStyle: 'italic', marginTop: 2 }}>
+                {cacheCheck.warning}
+              </div>
+            )}
           </div>
         )}
 

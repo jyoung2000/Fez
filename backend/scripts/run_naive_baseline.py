@@ -246,14 +246,68 @@ def run_for_manifest(
     return {"generated": generated, "skipped": skipped}
 
 
+def generate_single_clip_reference(
+    video_path: str | Path,
+    output_dir: str | Path,
+    *,
+    slug: Optional[str] = None,
+) -> Optional[Path]:
+    """Generate a naive_baseline reference JSON for one clip on disk.
+
+    Used by both the ``--single-clip`` CLI mode and the
+    ``/sota-clip-bench`` SSE pre-phase so single-clip runs always have
+    a comparator without requiring the operator to run
+    ``make naive-references`` out-of-band.
+
+    Returns the output path on success or ``None`` on failure.
+    """
+    video_path = Path(video_path)
+    if not video_path.is_file():
+        logger.error("naive_baseline: source not found: %s", video_path)
+        return None
+    out_slug = slug or video_path.stem
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        ref = naive_baseline_events(str(video_path))
+    except Exception as exc:
+        logger.error("naive_baseline: failed for %s: %s", video_path, exc)
+        return None
+    out_path = out_dir / f"{out_slug}.json"
+    out_path.write_text(json.dumps(ref))
+    logger.info(
+        "[naive_baseline] wrote %s (%d events)",
+        out_path, len(ref["events"]),
+    )
+    return out_path
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.add_argument("--manifest", required=True)
+    # ``--manifest`` is required for the manifest-iteration path but
+    # not for ``--single-clip``; we enforce mutual-exclusivity manually
+    # below so the help text stays simple.
+    parser.add_argument("--manifest", default=None)
     parser.add_argument(
         "--output-dir", default="tests/autoflip_reference_outputs/",
     )
     parser.add_argument("--real-content-dir", default=None)
     parser.add_argument("--filter-slugs", default=None)
+    parser.add_argument(
+        "--single-clip", default=None,
+        help=(
+            "Generate a reference for one clip at this path "
+            "(skips manifest iteration). Pair with --slug to override "
+            "the output filename stem."
+        ),
+    )
+    parser.add_argument(
+        "--slug", default=None,
+        help=(
+            "Slug to use when --single-clip is set. Defaults to the "
+            "source filename stem."
+        ),
+    )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -261,6 +315,28 @@ def main(argv: Optional[list[str]] = None) -> int:
         level=logging.WARNING if args.quiet else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
+
+    if args.single_clip:
+        if args.manifest:
+            print(
+                "!! --single-clip and --manifest are mutually exclusive",
+                file=sys.stderr,
+            )
+            return 2
+        out_path = generate_single_clip_reference(
+            args.single_clip, args.output_dir, slug=args.slug,
+        )
+        if out_path is None:
+            return 1
+        print(json.dumps({"single_clip": str(out_path)}, indent=2))
+        return 0
+
+    if not args.manifest:
+        print(
+            "!! one of --manifest or --single-clip is required",
+            file=sys.stderr,
+        )
+        return 2
 
     only = None
     if args.filter_slugs:

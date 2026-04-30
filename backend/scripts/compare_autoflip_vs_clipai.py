@@ -65,6 +65,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -77,12 +78,34 @@ logger = logging.getLogger("compare_autoflip_vs_clipai")
 # Bump this when the extraction contract changes so stale caches
 # get invalidated automatically. See ``run_clipai_on_clip`` for the
 # cache layout and file list.
-EXTRACTION_CACHE_VERSION = 1
+#
+# Version history:
+#   v1 — initial schema (shots, faces, registry, transcript, speaker
+#        events, content_profile, anime_anchors, segments)
+#   v2 — Task 0: motion_path persisted inside segments.json so the
+#        diagnostic preview renderer reads the same per-frame camera
+#        path the production export pipeline uses.
+#   v3 — Task 2: per-frame data files added (face_bboxes_per_frame,
+#        saliency_peaks_per_second, text_regions_per_frame,
+#        identity_timeline) so real-content metrics can be measured.
+#   v4 — Task 1: editorial discontinuity_marks recorded so the L1
+#        solver and the renderer apply consistent cuts.
+#   v5 — Task C: asd_scores.json persisted when the Light-ASD backend
+#        is active so re-runs can reuse cached per-frame speaking
+#        probabilities instead of paying the inference cost twice.
+EXTRACTION_CACHE_VERSION = 5
 
 # Modules whose mtime participates in cache invalidation. If any of
 # these files is newer than the cache's ``cache_version.txt`` then
 # the cache is considered stale and gets rebuilt from scratch.
+#
+# Task A expanded this list to include every module whose output gets
+# persisted into the cache. The previous list missed Tasks 0/1/2/C
+# plumbing — every patch on those tasks shipped behind a cache that
+# didn't notice. If you add a module that touches cached state, add
+# its path here.
 _EXTRACTOR_MODULES_FOR_CACHE = (
+    # Original watch list — extractor primitives.
     "backend/services/face_detector.py",
     "backend/services/shot_detector.py",
     "backend/services/transcription.py",
@@ -91,11 +114,35 @@ _EXTRACTOR_MODULES_FOR_CACHE = (
     "backend/services/content_classifier.py",
     "backend/services/anime_anchor.py",
     "backend/services/reframe_segmenter.py",
+    # ── Added Task A ─────────────────────────────────────────────
+    "backend/services/l1_camera_path.py",          # writes motion_path
+    "backend/services/_autoflip_lp.py",            # LP solver schema
+    "backend/services/editorial_planner.py",       # discontinuity_marks
+    "backend/services/editorial_subject_lookup.py",
+    "backend/services/light_asd.py",               # v3 ASD output shape
+    "backend/services/clip_scoring.py",            # finalize/composite
+    "backend/services/clip_verifier.py",           # score_diagnostics
+    "backend/services/saliency_tracker.py",        # per-second peaks
+    "backend/services/av_saliency.py",             # AV saliency mass
+    "backend/services/ocr_regions.py",             # text regions
+    "backend/scripts/compare_autoflip_vs_clipai.py",   # serialization itself
+    "backend/scripts/export_autoflip_compatible.py",   # event translation
+    "backend/scripts/sota_render_preview.py",          # diagnostic renderer
 )
+
+# Tracks watch-list paths that have already produced a "missing
+# module" warning so the log doesn't spam once per cache check.
+_WARNED_MISSING_MODULES: set = set()
 
 # Required files inside ``$CACHE/<sha>/`` for a cache hit. The
 # presence of every one of these (plus ``cache_version.txt``) is a
 # necessary — but not sufficient — condition for cache validity.
+#
+# ``asd_scores.json`` is conditionally required (Task C): it is only
+# expected when ``CLIPAI_ASD_BACKEND=light_asd`` is the active
+# backend. ``_required_cache_files()`` resolves the conditional set
+# at validity-check time; switching backends invalidates affected
+# clips because the cache lacks the required file.
 _REQUIRED_CACHE_FILES = (
     "metadata.json",
     "shots.json",
@@ -108,6 +155,19 @@ _REQUIRED_CACHE_FILES = (
     "segments.json",
     "cache_version.txt",
 )
+
+
+def _active_asd_backend() -> str:
+    """Resolve the current ASD backend (defaults to ``light_asd``)."""
+    return os.environ.get("CLIPAI_ASD_BACKEND", "light_asd").lower()
+
+
+def _required_cache_files() -> tuple:
+    """Required-file list, with the conditional Task C entry applied."""
+    base = list(_REQUIRED_CACHE_FILES)
+    if _active_asd_backend() == "light_asd":
+        base.append("asd_scores.json")
+    return tuple(base)
 
 
 # ─────────────────── Target zones (Part D6) ───────────────────
@@ -504,30 +564,57 @@ def _repo_root_for_cache() -> Path:
 
 def _extractor_module_mtime() -> float:
     """Max mtime across the extractor modules that participate in
-    cache invalidation. Missing modules are ignored (0.0 fallback)."""
+    cache invalidation.
+
+    A missing module logs a single WARNING (deduped by path so the
+    log doesn't spam) and is skipped from the mtime computation.
+    When every module is missing the function returns 0.0 and logs
+    ERROR — that situation means the watch list has rotted and the
+    operator should investigate, NOT that every cache is forever
+    invalid.
+    """
     root = _repo_root_for_cache()
     latest = 0.0
+    seen_any = False
     for rel in _EXTRACTOR_MODULES_FOR_CACHE:
         p = root / rel
         try:
             mt = p.stat().st_mtime
+            seen_any = True
             if mt > latest:
                 latest = mt
-        except OSError:
+        except (OSError, FileNotFoundError):
+            if rel not in _WARNED_MISSING_MODULES:
+                _WARNED_MISSING_MODULES.add(rel)
+                logger.warning(
+                    "extractor watch list: %s is missing — skipping "
+                    "from cache invalidation mtime check. If this "
+                    "module was renamed, update _EXTRACTOR_MODULES_FOR_CACHE.",
+                    rel,
+                )
             continue
+    if not seen_any:
+        logger.error(
+            "extractor watch list: NO modules in _EXTRACTOR_MODULES_FOR_CACHE "
+            "were found under %s — cache invalidation is effectively "
+            "disabled. The watch list has rotted; investigate before "
+            "trusting cached results.",
+            root,
+        )
+        return 0.0
     return latest
 
 
 def _cache_is_valid(clip_cache: Path) -> bool:
     """Cache is valid iff:
       * the directory exists
-      * every required file is present
+      * every required file is present (see _required_cache_files)
       * ``cache_version.txt`` matches the current contract version
       * the cache is at least as new as the extractor modules
     """
     if not clip_cache.is_dir():
         return False
-    for name in _REQUIRED_CACHE_FILES:
+    for name in _required_cache_files():
         if not (clip_cache / name).is_file():
             return False
     try:
@@ -543,6 +630,132 @@ def _cache_is_valid(clip_cache: Path) -> bool:
     if cache_mtime < _extractor_module_mtime():
         return False
     return True
+
+
+def _read_build_info() -> Optional[str]:
+    """Return the container's build timestamp from ``/etc/build_info``.
+
+    The file is written by the final RUN layer in the Dockerfile so
+    the diagnostics endpoint can compare cache mtimes against the
+    image's age and flag "stale cache, fresh code" mismatches that
+    the in-process mtime check might miss (e.g. when a new module
+    is added but its path hasn't yet been added to the watch list).
+
+    Returns ``None`` outside of a built container or when the file is
+    missing / unreadable.
+    """
+    try:
+        return Path("/etc/build_info").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def describe_cache_state(clip_cache: Path) -> dict:
+    """Return a JSON-friendly dict describing this clip's cache state.
+
+    Used by ``backend.routers.diagnostics`` to surface a stale-cache
+    warning in the SOTA-bench SSE stream and the Settings UI.
+
+    Schema::
+
+        {
+          "phase": "cache_check",
+          "status": "ok" | "stale_warning" | "miss",
+          "cache_path": str,
+          "exists": bool,
+          "cache_age_seconds": int | None,
+          "cache_version": int | None,
+          "expected_version": int,
+          "container_image_built_at": str | None,
+          "warning": str | None,
+        }
+
+    ``status`` is:
+      - ``"miss"``   when the cache directory does not exist yet.
+      - ``"stale_warning"`` when the cache is older than the running
+        container image AND older than 24h (operator probably has a
+        stale cache from a previous deploy).
+      - ``"ok"``     otherwise.
+    """
+    expected_version = EXTRACTION_CACHE_VERSION
+    build_info = _read_build_info()
+
+    if not clip_cache.is_dir():
+        return {
+            "phase": "cache_check",
+            "status": "miss",
+            "cache_path": str(clip_cache),
+            "exists": False,
+            "cache_age_seconds": None,
+            "cache_version": None,
+            "expected_version": expected_version,
+            "container_image_built_at": build_info,
+            "warning": None,
+        }
+
+    cache_age_seconds: Optional[int] = None
+    cache_version: Optional[int] = None
+    version_path = clip_cache / "cache_version.txt"
+    try:
+        if version_path.is_file():
+            cache_age_seconds = int(
+                max(0.0, time.time() - version_path.stat().st_mtime),
+            )
+            try:
+                cache_version = int(version_path.read_text().strip())
+            except (OSError, ValueError):
+                cache_version = None
+    except OSError:
+        pass
+
+    # Compare cache mtime to container build_info. ``build_info`` is
+    # an RFC3339 string; we parse it leniently — if it doesn't parse,
+    # we fall back to age-only heuristics.
+    image_built_epoch: Optional[float] = None
+    if build_info:
+        try:
+            from datetime import datetime, timezone
+            image_built_epoch = datetime.fromisoformat(
+                build_info.replace("Z", "+00:00"),
+            ).replace(tzinfo=timezone.utc).timestamp()
+        except (ValueError, TypeError):
+            image_built_epoch = None
+
+    is_stale = False
+    if cache_age_seconds is not None:
+        cache_mtime_epoch = time.time() - cache_age_seconds
+        if cache_age_seconds > 86400:
+            if image_built_epoch is None:
+                # No build_info to compare to: fall back to an age-only
+                # heuristic (>24h is suspicious but not necessarily
+                # stale; we only warn if version mismatch too).
+                if cache_version is not None and cache_version != expected_version:
+                    is_stale = True
+            elif image_built_epoch > cache_mtime_epoch:
+                is_stale = True
+
+    # A version mismatch is unambiguously stale regardless of age.
+    if cache_version is not None and cache_version != expected_version:
+        is_stale = True
+
+    warning: Optional[str] = None
+    if is_stale:
+        warning = (
+            "Cache predates the running code — re-run with "
+            "force-reextract to get fresh numbers."
+        )
+
+    return {
+        "phase": "cache_check",
+        "status": "stale_warning" if is_stale else "ok",
+        "cache_path": str(clip_cache),
+        "exists": True,
+        "cache_age_seconds": cache_age_seconds,
+        "cache_version": cache_version,
+        "expected_version": expected_version,
+        "container_image_built_at": build_info,
+        "warning": warning,
+    }
 
 
 def _serialize_shots(shots: list) -> list[dict]:
@@ -1001,24 +1214,61 @@ def _extract_and_cache(
     )
 
     # ── Active speaker events ──
-    # Mirrors the pipeline gate (pipeline.py:2672-2695): use v2 when
-    # dense face data is available, fall back to v1 otherwise.
+    # Task C: mirror the production pipeline's v3 → v2 → v1 fallback
+    # chain (pipeline.py around line 4015) so the bench's extracted
+    # cache holds the same timeline shape production produces. Without
+    # this, the Settings → Validate Test panel showed v2 numbers while
+    # production was running v3, and the operator couldn't reason
+    # about regressions in either direction.
     speaker_events: list = []
+    asd_scores_for_cache: list = []
+    asd_backend = _active_asd_backend()
+    has_face_data = bool(
+        face_registry
+        and getattr(face_registry, "multi_speaker", False)
+        and transcript
+        and dense_faces
+    )
     try:
-        if (
-            face_registry
-            and getattr(face_registry, "multi_speaker", False)
-            and transcript
-            and dense_faces
-        ):
+        if asd_backend == "light_asd" and has_face_data:
+            try:
+                from backend.services.light_asd import score_faces_for_clip
+                from backend.services.active_speaker import (
+                    build_active_speaker_timeline_v3,
+                )
+                asd_scores_for_cache = score_faces_for_clip(
+                    video_path=str(video_path),
+                    face_results=dense_faces,
+                    audio_wav_path=str(audio_path) if audio_path else None,
+                ) or []
+                if asd_scores_for_cache:
+                    speaker_events = build_active_speaker_timeline_v3(
+                        dense_faces, transcript,
+                        asd_scores=asd_scores_for_cache,
+                        face_registry=face_registry,
+                        window_seconds=0.5,
+                        shot_cuts=shot_cuts,
+                        audio_path=str(audio_path) if audio_path else None,
+                    ) or []
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Light-ASD path failed in bench (non-fatal): %s; "
+                    "falling back to v2 heuristic", slug, exc,
+                )
+
+        # v2 fallback when v3 is off, the model failed, or scores
+        # were empty.
+        if not speaker_events and has_face_data:
             speaker_events = build_active_speaker_timeline_v2(
                 dense_faces, transcript, face_registry,
                 window_seconds=0.5,
                 shot_cuts=shot_cuts,
                 audio_path=str(audio_path) if audio_path else None,
             ) or []
+        # v1 fallback when dense face data isn't available.
         elif (
-            face_registry
+            not speaker_events
+            and face_registry
             and getattr(face_registry, "multi_speaker", False)
             and transcript
         ):
@@ -1037,6 +1287,23 @@ def _extract_and_cache(
     (clip_cache / "speaker_events.json").write_text(
         json.dumps(_serialize_speaker_events(speaker_events), indent=2),
     )
+
+    # Task C: persist the per-frame ASD scores so re-runs can reuse
+    # them without paying the inference cost twice. Only written when
+    # the Light-ASD backend produced scores; the cache validity check
+    # only requires this file when CLIPAI_ASD_BACKEND=light_asd, so
+    # heuristic-mode caches don't need the file at all.
+    if asd_backend == "light_asd":
+        (clip_cache / "asd_scores.json").write_text(
+            json.dumps([
+                {
+                    "timestamp": float(getattr(s, "timestamp", 0.0)),
+                    "face_idx": int(getattr(s, "face_idx", -1) or -1),
+                    "p_speaking": float(getattr(s, "p_speaking", 0.0)),
+                }
+                for s in asd_scores_for_cache
+            ], indent=2),
+        )
 
     # ── Content profile ──
     classifier_meta = _classifier_metadata_from_clip(clip)
