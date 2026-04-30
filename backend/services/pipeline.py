@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import json
 import os
 import shutil
 import time as _time
@@ -177,6 +178,178 @@ def release_torch_gpu_memory():
         pass
     except Exception as e:
         logger.debug("Torch GPU release error: %s", e)
+
+
+def _compute_l1_saliency_peaks(
+    *,
+    frames,
+    audio_path,
+    duration_sec: float,
+    job_id: str,
+    cache_dir,
+):
+    """Layer 1: per-second saliency peaks for the critic engine.
+
+    Samples 1 frame per second from ``frames`` (the master FrameMeta
+    list from ``extract_frames``), computes audio energy from the
+    same WAV the rest of the pipeline uses, and asks ``AvSaliency``
+    for top-K peaks. Backend selection is internal (TASED-Net first,
+    spectral residual fallback) — see ``infra/saliency/README.md``.
+
+    When ``cache_dir`` is provided, writes
+    ``saliency_peaks_per_second.json`` so the SOTA bench's
+    "extraction cache HIT" path on the same source reads the same
+    peaks the export job used.
+
+    Returns a list-of-lists: ``[[ [x_pct, y_pct, score], ... ]_for_sec_0,
+    ...]`` matching the schema ``human_reframe_bridge`` and
+    ``reframe_critic`` consume. ``None`` on failure.
+    """
+    try:
+        from backend.services.av_saliency import (
+            AvSaliency, audio_energy_per_second,
+        )
+    except Exception as exc:
+        logger.info(
+            "[%s] saliency import failed (%s); skipping L1", job_id, exc,
+        )
+        return None
+
+    n_seconds = max(1, int(round(duration_sec or 0.0)))
+    if n_seconds < 1:
+        return None
+
+    # ── Sample 1 frame per second from the existing FrameMeta list ──
+    try:
+        import numpy as _np
+        try:
+            import cv2  # type: ignore
+        except ImportError as exc:
+            logger.info(
+                "[%s] cv2 missing for saliency frame load: %s", job_id, exc,
+            )
+            return None
+        # Pick the first frame ≥ each integer second up to duration.
+        sampled_paths = []
+        next_t = 0.0
+        for f in frames:
+            if getattr(f, "timestamp", None) is None or not getattr(f, "path", None):
+                continue
+            if f.timestamp + 1e-3 >= next_t:
+                sampled_paths.append(f.path)
+                next_t = float(int(f.timestamp)) + 1.0
+                if len(sampled_paths) >= n_seconds:
+                    break
+        if not sampled_paths:
+            return None
+        from backend.services.av_saliency import HEATMAP_H, HEATMAP_W
+        loaded = []
+        for p in sampled_paths:
+            img = cv2.imread(str(p))
+            if img is None:
+                continue
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            loaded.append(img)
+        if not loaded:
+            return None
+        # Resize all frames to the same shape (256x144) BEFORE stacking
+        # — source frames may be 1920x1080 or 1280x720, np.stack can't
+        # handle mixed shapes.
+        normalized = _np.stack([
+            cv2.resize(img, (HEATMAP_W, HEATMAP_H))
+            for img in loaded
+        ]).astype(_np.uint8)
+    except Exception as exc:
+        logger.info(
+            "[%s] saliency frame sampling failed (%s); skipping L1",
+            job_id, exc,
+        )
+        return None
+
+    # ── Audio energy (1 Hz). Tolerates missing wav by passing zeros. ──
+    audio_energy_1hz = None
+    try:
+        import numpy as _np
+        if audio_path and os.path.isfile(audio_path):
+            try:
+                import wave
+                with wave.open(str(audio_path), "rb") as wf:
+                    sr = wf.getframerate()
+                    nchan = wf.getnchannels()
+                    raw = wf.readframes(wf.getnframes())
+                samples = _np.frombuffer(raw, dtype=_np.int16)
+                if nchan > 1:
+                    samples = samples.reshape(-1, nchan).mean(axis=1)
+                samples = samples.astype(_np.float32) / 32768.0
+                audio_energy_1hz = audio_energy_per_second(samples, sr)
+            except Exception as exc:
+                logger.info(
+                    "[%s] audio energy read failed (%s); using zeros",
+                    job_id, exc,
+                )
+        if audio_energy_1hz is None:
+            audio_energy_1hz = _np.zeros(n_seconds, dtype=_np.float32)
+    except Exception as exc:
+        logger.info(
+            "[%s] saliency audio prep failed (%s); skipping L1",
+            job_id, exc,
+        )
+        return None
+
+    # ── Predict ──
+    try:
+        device = "cuda" if release_torch_gpu_memory and _has_cuda() else "cpu"
+    except NameError:
+        device = "cpu"
+    try:
+        avs = AvSaliency(device=device)
+        result = avs.predict(normalized, audio_energy_1hz)
+    except Exception as exc:
+        logger.warning(
+            "[%s] AvSaliency.predict failed (%s); skipping L1",
+            job_id, exc,
+        )
+        return None
+    finally:
+        try:
+            del avs
+        except Exception:
+            pass
+        if device == "cuda":
+            try:
+                import torch  # type: ignore
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    peaks_per_second = [
+        [[float(x), float(y), float(s)] for (x, y, s) in sec_peaks]
+        for sec_peaks in result.peaks
+    ]
+
+    # ── Persist to extraction cache so the bench reads the same data ──
+    if cache_dir:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(
+                os.path.join(cache_dir, "saliency_peaks_per_second.json"),
+                "w",
+            ) as fh:
+                json.dump(peaks_per_second, fh)
+        except Exception as exc:
+            logger.info(
+                "[%s] saliency cache write failed (%s)", job_id, exc,
+            )
+
+    return peaks_per_second
+
+
+def _has_cuda() -> bool:
+    try:
+        import torch  # type: ignore
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 async def _trigger_ollama_gpu_rediscovery(job_id: str, provider):
@@ -4505,6 +4678,42 @@ async def _run_analysis_inner(job_id: str):
     source_width = int(metadata.get("width", 1920) or 1920)
     source_height = int(metadata.get("height", 1080) or 1080)
     _has_speaker_data = active_speaker_events or transcript_speaker_events
+
+    # ── Layer 1: per-second saliency peaks for the critic engine ──
+    # One-shot extraction shared by both reframer branches below
+    # (USE_AUTOFLIP_REFRAME and the regular REFRAME_SEGMENTER path).
+    # Output goes to ``human_reframe_bridge.maybe_override_render_plan``
+    # which threads it into ``reframe_critic.auto_repair_plan`` so
+    # windows that exclude the salient region get auto-widened.
+    #
+    # Backend selection chain (in av_saliency.AvSaliency.__post_init__):
+    #   1. TASED-Net (operator-supplied — see infra/saliency/README.md)
+    #   2. cv2.saliency.StaticSaliencySpectralResidual_create (always
+    #      available via opencv-contrib-python-headless)
+    #
+    # The block is wrapped in a single try/except so a saliency
+    # failure can't break the export. ``CLIPAI_SALIENCY_LAYER=0``
+    # disables the layer entirely.
+    _l1_saliency_peaks_per_second = None
+    if (
+        os.environ.get("CLIPAI_SALIENCY_LAYER", "1") == "1"
+        and frames
+    ):
+        try:
+            _l1_saliency_peaks_per_second = _compute_l1_saliency_peaks(
+                frames=frames,
+                audio_path=audio_path,
+                duration_sec=float(metadata.get("duration", 0) or 0.0),
+                job_id=job_id,
+                cache_dir=os.path.dirname(audio_path) if audio_path else None,
+            )
+        except Exception as _l1_exc:
+            logger.warning(
+                "[%s] Layer 1 saliency failed (%s) — proceeding without",
+                job_id, _l1_exc,
+            )
+            _l1_saliency_peaks_per_second = None
+
     USE_AUTOFLIP_REFRAME = os.environ.get("USE_AUTOFLIP_REFRAME", "false").lower() in ("true", "1", "yes")
     if dense_face_results and face_registry and scenes and _has_speaker_data:
         try:
@@ -4778,6 +4987,7 @@ async def _run_analysis_inner(job_id: str):
                                     source_height=int(metadata.get("height", 1080) or 1080),
                                     source_fps=float(metadata.get("fps", 30.0) or 30.0),
                                     job_id=job_id,
+                                    saliency_peaks_per_second=_l1_saliency_peaks_per_second,
                                 )
                             except Exception as _hr_e:
                                 logger.info("[%s] human-reframe hook skipped: %s", job_id, _hr_e)
@@ -5077,6 +5287,7 @@ async def _run_analysis_inner(job_id: str):
                                     source_height=int(metadata.get("height", 1080) or 1080),
                                     source_fps=float(metadata.get("fps", 30.0) or 30.0),
                                     job_id=job_id,
+                                    saliency_peaks_per_second=_l1_saliency_peaks_per_second,
                                 )
                             except Exception as _hr_e:
                                 logger.info("[%s] human-reframe hook skipped: %s", job_id, _hr_e)
