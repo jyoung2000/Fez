@@ -29,6 +29,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openjdk-11-jdk-headless \
     && rm -rf /var/lib/apt/lists/*
 
+# MediaPipe's Bazel WORKSPACE introspects the system Python's numpy
+# include path during analysis (org_tensorflow → python_configure.bzl
+# calls ``python -c "import numpy; print(numpy.get_include())"``). If
+# numpy isn't importable on system Python the build aborts during
+# repository fetch with "ModuleNotFoundError: No module named 'numpy'"
+# before any compile step runs. Pin to numpy<2 because MediaPipe v0.10.x
+# was developed against numpy 1.x and v2.0's API rename breaks header
+# layout for some of the first-party C extensions.
+RUN pip3 install --no-cache-dir "numpy<2"
+
 # Bazelisk picks up the .bazelversion the MediaPipe repo ships with.
 RUN curl -fsSL -o /usr/local/bin/bazelisk \
         https://github.com/bazelbuild/bazelisk/releases/download/v1.21.0/bazelisk-linux-amd64 \
