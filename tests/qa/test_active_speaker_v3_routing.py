@@ -201,6 +201,10 @@ def test_switching_to_light_asd_invalidates_heuristic_cache(tmp_path, monkeypatc
         bench, "_extractor_module_mtime",
         lambda: 0.0,
     )
+    # Keep this test focused on the ASD backend switch — the L1
+    # saliency layer adds its own required file and is exercised
+    # in test_critic_l1_saliency.py.
+    monkeypatch.setenv("CLIPAI_SALIENCY_LAYER", "0")
 
     monkeypatch.setenv("CLIPAI_ASD_BACKEND", "heuristic")
     assert bench._cache_is_valid(clip_cache) is True

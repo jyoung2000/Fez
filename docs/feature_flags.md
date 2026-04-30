@@ -108,3 +108,24 @@ workflows.
   `CLIPAI_EDITORIAL_PLANNER`, `CLIPAI_HUMAN_REFRAME_PIPELINE` — the
   Phase A-E feature flags that the SOTA test panel forces ON for
   every bench run.
+
+## Critic engine (Layer 1+)
+
+The 5-layer critic engine grades reframes the way a professional
+editor would, then re-solves windows that fail. Layer 1 ships with
+the saliency-in-crop check + auto-repair widening; Layers 2-5 land
+in subsequent PRs.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CLIPAI_SALIENCY_LAYER` | `1` | Layer 1 toggle. ON → `_extract_and_cache` writes `saliency_peaks_per_second.json` (TASED-Net top-K peaks per second) and `reframe_critic.score_plan` flags windows whose crop excludes the salient region. OFF → skip extraction; legacy behavior preserved. |
+| `CLIPAI_FACE_REGISTRY_BURN_IN_S` | `5.0` | XC.1 burn-in window. Detections in the first N seconds are dropped from face-registry slot discovery (so B-roll / title-card frames don't pin slots wrong). Falls back to unfiltered when the clip is shorter than the window or post-burn-in is too sparse. Set to `0` for legacy. |
+| `CLIPAI_ASD_CONFIDENCE_MARGIN` | `0.15` | XC.3 confidence floor for v3 active-speaker timeline. When exactly one identity crosses the speaking threshold but the runner-up is within the margin, v3 emits `slot_id=-1` (unsure). Multi-speaker overlap (≥2 above threshold) is unaffected. Set to `0` to disable. |
+
+**TASED-Net availability.** Layer 1's saliency extraction depends on
+the `tasednet` Python wheel + a CUDA GPU. When the wheel is missing or
+the GPU isn't visible, the helper degrades gracefully — logs a warning
+and writes an empty peaks file. The cache stays valid (the file just
+has no peaks); the critic treats no-data as "not measured" and skips
+the saliency check. A homelab that hasn't installed `tasednet` still
+produces a fully-valid v6 cache.
