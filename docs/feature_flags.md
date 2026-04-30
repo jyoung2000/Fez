@@ -122,10 +122,25 @@ in subsequent PRs.
 | `CLIPAI_FACE_REGISTRY_BURN_IN_S` | `5.0` | XC.1 burn-in window. Detections in the first N seconds are dropped from face-registry slot discovery (so B-roll / title-card frames don't pin slots wrong). Falls back to unfiltered when the clip is shorter than the window or post-burn-in is too sparse. Set to `0` for legacy. |
 | `CLIPAI_ASD_CONFIDENCE_MARGIN` | `0.15` | XC.3 confidence floor for v3 active-speaker timeline. When exactly one identity crosses the speaking threshold but the runner-up is within the margin, v3 emits `slot_id=-1` (unsure). Multi-speaker overlap (≥2 above threshold) is unaffected. Set to `0` to disable. |
 
-**TASED-Net availability.** Layer 1's saliency extraction depends on
-the `tasednet` Python wheel + a CUDA GPU. When the wheel is missing or
-the GPU isn't visible, the helper degrades gracefully — logs a warning
-and writes an empty peaks file. The cache stays valid (the file just
-has no peaks); the critic treats no-data as "not measured" and skips
-the saliency check. A homelab that hasn't installed `tasednet` still
-produces a fully-valid v6 cache.
+**Saliency backend selection (L1 completion PR).** AvSaliency now
+runs a real fallback chain instead of returning all-zero stubs:
+
+1. `_TasedNetAdapter` — used when (a) an operator has dropped a
+   `TASED_v2` PyTorch module at `backend/vendor/tasednet/model.py` AND
+   (b) weights exist at `$TASED_NET_MODEL_PATH` (default
+   `/opt/clipai/models/tased_v2.pth`). Both artefacts are operator-
+   supplied because the upstream MichiganCOG/TASED-Net repo ships
+   without an explicit license — see `infra/saliency/README.md`.
+2. `_SpectralResidualAdapter` — `cv2.saliency.StaticSaliencySpectral
+   Residual_create` from `opencv-contrib-python-headless`. Always
+   available, no GPU, ~few ms per frame on CPU. Real heatmap output;
+   quality is below TASED-Net but produces flag-able signal.
+
+The selection is reported as `AvSaliency.backend_name` and persisted
+to `saliency_meta.json` in the bench cache. The bench surfaces it
+as `result.critic.saliency.backend`; the UI's Critic engine row shows
+a `(spectral fallback)` badge when the spectral backend ran.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `TASED_NET_MODEL_PATH` | `/opt/clipai/models/tased_v2.pth` | Path to the operator-supplied TASED-Net checkpoint. Adapter raises (and AvSaliency falls back to spectral residual) when this points at a non-existent file. |
