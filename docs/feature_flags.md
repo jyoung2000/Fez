@@ -180,3 +180,42 @@ the SHA256 they computed, and the date the artifact was downloaded
 in `infra/dover_mobile/README.md` so anyone rebuilding from a
 different host can verify they got the same bytes. Replace the
 placeholder block on first build.
+
+## Layer 3 — VLM rubric critic
+
+Layer 3 grades each rendered preview frame against a 5-axis
+cinematographic rubric (composition / subject_visible / headroom /
+lead_room / framing_choice). Three backends are supported:
+
+  * `learned` — deterministic CPU heuristic via
+    `aesthetic_scorer.score_frame`. Always free, always works.
+  * `vlm` — local Ollama (preferred) or OpenRouter (paid fallback)
+    vision LLM scoring per the rubric prompt in
+    `backend/services/critic_loop.py`.
+  * `both` — average the VLM and learned scores per frame.
+
+Frames whose rubric score falls below `critic_threshold` (default
+6.0) are coalesced into `ReSolveRequest` objects surfaced in the
+SSE stream + UI. The bench's `verdict_for` downgrades a clip's
+verdict from PASS to MARGINAL when the **mean** rubric score falls
+below `L3_VLM_RUBRIC_MEAN_MIN` (default 5.5).
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CLIPAI_CRITIC_MODE` | `off` (in `/sota-clip-bench`); `learned` (in production exports via `reframe_config`) | Layer 3 backend selector. The bench gate is opt-in (`off` → skipped); production exports use the reframe_config default. Set to `learned` / `vlm` / `both` to enable in the bench. |
+| `CLIPAI_CRITIC_VLM_BACKEND` | `auto` | Vision-LLM backend selector when `mode=vlm`. `auto` prefers Ollama if reachable, else OpenRouter. `ollama` / `openrouter` force a single backend. |
+| `CLIPAI_CRITIC_DT` | `1.0` | Frame-sampling interval in seconds for `extract_frames_for_critic`. |
+| `CLIPAI_CRITIC_THRESHOLD` | `6.0` | Per-frame score threshold below which `ReSolveRequest`s are emitted. |
+| `CLIPAI_CRITIC_BUDGET` | `20` | Max VLM calls per clip. Cap is per-frame, not per-clip duration — a 60-second clip at 1 fps has 60 frames but only the first 20 are VLM-scored when budget is hit. |
+| `CLIPAI_CRITIC_CACHE` | `/tmp/clipai_critic_cache` | On-disk cache directory for `(source_sha, plan_hash, mode)` keys. Lives in tmpfs by default; set to a bind-mounted path for persistence across rebuilds. |
+| `CLIPAI_CRITIC_VERDICT_MIN` | `5.5` | Mean-score threshold for the bench's L3 verdict gate. Per-zone override via `vlm_rubric_mean_min` in `TARGET_ZONES`. |
+
+**Verdict gate.** `verdict_for` reads `vlm_rubric_mean_score` from
+the metrics dict. Below the per-zone threshold downgrades PASS to
+MARGINAL — never to MISS. Absent → no-op.
+
+**Out of scope (current PR).** The `ReSolveRequest` objects emitted
+by `score_plan` are surfaced in the SSE stream and UI but not yet
+fed back into the segmenter for an actual re-solve pass. Tracked as
+the "L3 resolve loop — feed `ReSolveRequest` into reframe_segmenter's
+iteration" follow-up.
