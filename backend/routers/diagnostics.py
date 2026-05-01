@@ -2693,6 +2693,88 @@ async def sota_clip_bench(request: Request):
             "status": "fail" if render_failed else "pass",
         })
 
+        # ── Layer 2: DOVER-Mobile quality delta vs source ──────
+        # Runs AFTER the render phase (so we have both the source
+        # and the rendered preview). Cached on (source SHA + plan
+        # hash) at DOVER_CACHE_DIR — second run on the same clip is
+        # free. CLIPAI_DOVER_LAYER=0 disables the layer entirely.
+        # Failure modes (model missing, onnxruntime missing,
+        # corrupt video) degrade silently — the existing critic
+        # row keeps rendering with quality_delta absent.
+        if (
+            not render_failed
+            and os.path.isfile(preview_path)
+            and os.environ.get("CLIPAI_DOVER_LAYER", "1") == "1"
+        ):
+            yield _sse_event("phase_start", {
+                "phase": "l2_quality_delta",
+                "label": "Running DOVER-Mobile quality delta (Layer 2)...",
+            })
+            try:
+                import hashlib as _hashlib
+                from backend.services.dover_quality import (
+                    score_delta as _dover_score_delta,
+                )
+                # Plan hash: derive from the segments JSON the renderer
+                # consumed so identical render plans hit the cache
+                # regardless of clip-token churn.
+                plan_hash = ""
+                try:
+                    with open(segments_path, "rb") as _seg_fh:
+                        plan_hash = _hashlib.sha256(
+                            _seg_fh.read()
+                        ).hexdigest()[:16]
+                except OSError:
+                    pass
+                # Source SHA: cheap to derive from the upload's path.
+                source_sha = ""
+                try:
+                    h = _hashlib.sha256()
+                    with open(info["path"], "rb") as _src_fh:
+                        for chunk in iter(lambda: _src_fh.read(65536), b""):
+                            h.update(chunk)
+                    source_sha = h.hexdigest()
+                except OSError:
+                    pass
+
+                delta = _dover_score_delta(
+                    info["path"], preview_path,
+                    source_sha256=source_sha,
+                    plan_hash=plan_hash,
+                )
+                if delta is None:
+                    yield _sse_event("phase_result", {
+                        "phase": "l2_quality_delta",
+                        "status": "skipped",
+                        "reason": "model_missing_or_runtime_error",
+                    })
+                else:
+                    if critic_summary is None:
+                        critic_summary = {}
+                    critic_summary["quality_delta"] = delta
+                    yield _sse_event("phase_result", {
+                        "phase": "l2_quality_delta",
+                        "status": "ok",
+                        "aesthetic_delta": delta["aesthetic_delta"],
+                        "technical_delta": delta["technical_delta"],
+                        "cache_hit": delta.get("cache_hit", False),
+                    })
+            except Exception as _l2_exc:
+                logger.info(
+                    "[sota-clip-bench] L2 DOVER failed: %s", _l2_exc,
+                )
+                yield _sse_event("phase_result", {
+                    "phase": "l2_quality_delta",
+                    "status": "skipped",
+                    "reason": "exception",
+                })
+        elif os.environ.get("CLIPAI_DOVER_LAYER", "1") != "1":
+            yield _sse_event("phase_result", {
+                "phase": "l2_quality_delta",
+                "status": "skipped",
+                "reason": "flag_disabled",
+            })
+
         # Both the bench results AND the preview are downloadable in
         # the GUI even when one of the two fails — the operator can
         # always grab whatever DID succeed.
