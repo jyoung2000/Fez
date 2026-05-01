@@ -312,13 +312,214 @@ def _rung_relaxed_whisper(
 # to the next rung. Real implementations land on the same Phase 2 PR
 # (Rungs 2, 4, 5) and Phase 4 (Rung 3 — Parakeet).
 
+# Module-level cache for the alt-checkpoint selection. Each entry
+# records when we last selected a particular alternate model so the
+# selection logic doesn't re-run nvidia-smi on every gap. The
+# transcribe_audio_slice_subprocess helper itself reloads weights on
+# every call; this cache is a TTL guard around the *decision*, not
+# the model object.
+_ALT_CHECKPOINT_TTL_SEC = 300.0
+_alt_checkpoint_cache: dict[str, dict] = {}
+_alt_checkpoint_lock_singleton: Optional[object] = None
+
+
+def _alt_checkpoint_lock():
+    """Lazy-init module-level Lock so importing the ladder is cheap."""
+    global _alt_checkpoint_lock_singleton
+    if _alt_checkpoint_lock_singleton is None:
+        import threading
+        _alt_checkpoint_lock_singleton = threading.Lock()
+    return _alt_checkpoint_lock_singleton
+
+
+def _select_alt_checkpoint(primary_model: str) -> Optional[str]:
+    """Pick the alternate Whisper checkpoint for Rung 2.
+
+    Returns ``None`` when no useful alternate exists for the primary
+    model — Rung 2 declines and the ladder moves on.
+    """
+    pm = (primary_model or "").lower()
+    if pm == "large-v3-turbo":
+        return "large-v3"
+    if pm == "medium":
+        # Prefer turbo when free VRAM allows; otherwise fall back to
+        # large-v3 (slower but still meaningful change in priors).
+        try:
+            from backend.services.transcription import _get_gpu_free_mb
+            free_mb = _get_gpu_free_mb() or 0
+        except Exception:
+            free_mb = 0
+        return "large-v3-turbo" if free_mb >= 3000 else "large-v3"
+    if pm == "small":
+        return "medium"
+    if pm.startswith("medium.en"):
+        return "large-v3-turbo"
+    return None
+
+
 def _rung_alt_whisper_checkpoint(
     audio_path: str, start_ms: int, end_ms: int, ctx: EscalationContext,
 ) -> RungResult:
-    return RungResult(
-        rung_name="rung_2_alt_whisper_checkpoint",
-        notes="not_yet_implemented",
+    """Re-run Whisper on the padded interval with a different checkpoint.
+
+    Uses ``transcribe_audio_slice_subprocess`` with ``model_name`` set
+    to the alternate checkpoint chosen by ``_select_alt_checkpoint``.
+    Recall-first knobs (vad_filter=False, no_speech_threshold=0.15,
+    temperature=0.0, condition_on_previous_text=False) are baked into
+    the slice helper. Pads the interval ±2 s for Whisper context;
+    drops words landing in the padding zone before claiming.
+    """
+    from backend.config import settings as _settings
+    started = time.monotonic()
+    if not getattr(_settings, "TACT_LADDER_RUNG_2_ENABLED", True):
+        return RungResult(
+            rung_name="rung_2_alt_whisper_checkpoint",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes="disabled",
+        )
+    if end_ms <= start_ms:
+        return RungResult(rung_name="rung_2_alt_whisper_checkpoint")
+
+    primary_model = str(getattr(_settings, "WHISPER_MODEL", "small") or "small")
+    alt_model = _select_alt_checkpoint(primary_model)
+    if not alt_model:
+        return RungResult(
+            rung_name="rung_2_alt_whisper_checkpoint",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes=f"no_alt_checkpoint_for_{primary_model}",
+        )
+
+    # TTL gate so we don't re-probe nvidia-smi on every gap.
+    with _alt_checkpoint_lock():
+        entry = _alt_checkpoint_cache.get(primary_model)
+        now = time.monotonic()
+        if entry is None or (now - entry.get("loaded_at", 0)) > _ALT_CHECKPOINT_TTL_SEC:
+            _alt_checkpoint_cache[primary_model] = {
+                "loaded_at": now, "alt": alt_model,
+            }
+        else:
+            alt_model = entry.get("alt", alt_model)
+
+    try:
+        import os
+        import tempfile
+        from backend.services.transcription import (
+            transcribe_audio_slice_subprocess,
+        )
+        from backend.services.transcription_gap_filler import (
+            _MIN_FILL_CONFIDENCE,
+            _extract_audio_slice,
+            _is_hallucinated_fill,
+        )
+    except Exception as e:
+        return RungResult(
+            rung_name="rung_2_alt_whisper_checkpoint",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes=f"deps_unavailable: {type(e).__name__}",
+        )
+
+    # Pad ±2 s for Whisper context; clamp to audio bounds.
+    pad_sec = 2.0
+    padded_start_sec = max(0.0, start_ms / 1000.0 - pad_sec)
+    padded_end_sec = min(
+        ctx.audio_duration_ms / 1000.0, end_ms / 1000.0 + pad_sec,
     )
+    if padded_end_sec <= padded_start_sec:
+        return RungResult(
+            rung_name="rung_2_alt_whisper_checkpoint",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes="empty_interval",
+        )
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".wav", delete=False, dir=tempfile.gettempdir(),
+    ) as tmp:
+        slice_path = tmp.name
+    try:
+        if not _extract_audio_slice(
+            audio_path, padded_start_sec, padded_end_sec, slice_path,
+        ):
+            return RungResult(
+                rung_name="rung_2_alt_whisper_checkpoint",
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                notes="slice_failed",
+            )
+        slice_dur = padded_end_sec - padded_start_sec
+        slice_timeout = min(
+            ctx.per_interval_timeout_sec,
+            max(30.0, slice_dur * 6.0 + 30.0),
+        )
+        try:
+            raw = transcribe_audio_slice_subprocess(
+                slice_path,
+                language=ctx.language,
+                task=ctx.task,
+                initial_prompt=ctx.initial_prompt,
+                model_name=alt_model,
+                timeout=slice_timeout,
+                is_animated=ctx.is_animated,
+            )
+        except Exception as e:
+            return RungResult(
+                rung_name="rung_2_alt_whisper_checkpoint",
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                notes=f"transcribe_failed:{type(e).__name__}:{alt_model}",
+            )
+
+        # Post-shift to original-audio time, drop words outside the
+        # original (un-padded) interval.
+        original_start_ms = start_ms
+        original_end_ms = end_ms
+        spans: list[LedgerSpan] = []
+        confidences: list[float] = []
+        for seg in raw or []:
+            text = (seg.get("text") or "").strip()
+            if _is_hallucinated_fill(text):
+                continue
+            avg_lp = float(seg.get("avg_logprob") or -1.0)
+            no_speech = float(seg.get("no_speech_prob") or 0.0)
+            confidence = max(0.0, min(1.0, 1.0 + avg_lp))
+            if no_speech > 0.85 or confidence < _MIN_FILL_CONFIDENCE:
+                continue
+            seg_start_ms = int(round(
+                (float(seg["start"]) + padded_start_sec) * 1000.0
+            ))
+            seg_end_ms = int(round(
+                (float(seg["end"]) + padded_start_sec) * 1000.0
+            ))
+            # Drop words whose midpoint falls in the padding zone.
+            mid = 0.5 * (seg_start_ms + seg_end_ms)
+            if mid < original_start_ms or mid > original_end_ms:
+                continue
+            # Clamp emitted span to the original interval bounds so
+            # we never overwrite neighboring covered_speech regions.
+            seg_start_ms = max(seg_start_ms, original_start_ms)
+            seg_end_ms = min(seg_end_ms, original_end_ms)
+            if seg_end_ms <= seg_start_ms:
+                continue
+            spans.append(LedgerSpan(
+                start_ms=seg_start_ms,
+                end_ms=seg_end_ms,
+                status="covered_speech",
+                content=text,
+                content_type="phrase",
+                source_pass=f"rung_2_alt_whisper_checkpoint:{alt_model}",
+                confidence=round(confidence, 4),
+            ))
+            confidences.append(confidence)
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+        return RungResult(
+            rung_name="rung_2_alt_whisper_checkpoint",
+            spans=spans,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            confidence=avg_conf,
+            notes=f"alt_model={alt_model};emitted={len(spans)}",
+        )
+    finally:
+        try:
+            os.unlink(slice_path)
+        except OSError:
+            pass
 
 
 def _rung_consensus_model(
