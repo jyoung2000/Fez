@@ -299,6 +299,20 @@ TARGET_ZONES: dict[str, dict[str, float]] = {
 }
 
 
+# Layer 2 (DOVER) verdict thresholds. Applied via ``verdict_for`` to
+# every zone — a reframe that drops aesthetic OR technical score by
+# more than the absolute threshold downgrades a PASS verdict to
+# MARGINAL. Zones can override by setting their own
+# ``quality_delta_aesthetic_min`` / ``quality_delta_technical_min``
+# keys (negative numbers; e.g. ``-0.10`` means "delta must be ≥ -0.10
+# to keep PASS"). The diagnostics router populates the metrics dict
+# with ``quality_delta_aesthetic`` / ``_technical`` after the DOVER
+# phase runs. When those keys are absent (bench-only run, layer
+# disabled, model missing) the L2 gate is a no-op.
+L2_QUALITY_DELTA_AESTHETIC_MIN = -0.10
+L2_QUALITY_DELTA_TECHNICAL_MIN = -0.10
+
+
 def target_zone_for(clip: dict) -> dict[str, float]:
     """Look up the target zone for a clip, falling back through
     (clipcontenttype + subtype) → clipcontenttype → "default" zone.
@@ -516,6 +530,23 @@ def verdict_for(metrics: dict[str, Any], zone: Optional[dict[str, float]]) -> st
         per_min = id_sw / approx_minutes
         if per_min > id_per_min_max:
             extra_failures.append("identity_switch_count")
+
+    # Layer 2 (DOVER) quality-delta gate. Fires only when the metrics
+    # dict carries the deltas — the bench itself doesn't populate
+    # them, but the diagnostics router amends results after the DOVER
+    # phase runs. Per-zone overrides win over the module-level default.
+    aest_min = zone.get(
+        "quality_delta_aesthetic_min", L2_QUALITY_DELTA_AESTHETIC_MIN,
+    )
+    tech_min = zone.get(
+        "quality_delta_technical_min", L2_QUALITY_DELTA_TECHNICAL_MIN,
+    )
+    aest_delta = metrics.get("quality_delta_aesthetic")
+    tech_delta = metrics.get("quality_delta_technical")
+    if aest_delta is not None and aest_delta < aest_min:
+        extra_failures.append("quality_delta_aesthetic")
+    if tech_delta is not None and tech_delta < tech_min:
+        extra_failures.append("quality_delta_technical")
 
     if hold_zone_pass and not extra_failures:
         return "PASS"
