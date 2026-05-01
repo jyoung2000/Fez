@@ -23,6 +23,19 @@ from typing import Iterable, Optional
 
 from backend.models import TranscriptSegment, WordTimestamp
 
+
+# Module-level handoff so the pipeline can persist reconciliation
+# stats into coverage_report after reconcile_passes / reconcile_n_passes
+# has already returned. Mirrors the _last_quarantined_segments pattern
+# in transcription.py. Single-job homelab use is the design center;
+# concurrent jobs would need a per-job dict (documented in notes).
+_last_reconciliation_stats: Optional["ReconciliationStats"] = None
+
+
+def get_last_reconciliation_stats() -> Optional["ReconciliationStats"]:
+    """Return (a snapshot of) the most recent reconciliation stats."""
+    return _last_reconciliation_stats
+
 logger = logging.getLogger(__name__)
 
 
@@ -456,6 +469,9 @@ def reconcile_n_passes(
         pass_names, stats.total_words, stats.agreed, stats.disagreed,
         stats.single_source, stats.contested, stats.elapsed_sec,
     )
+    # Stash for the pipeline to read (mirrors _last_quarantined_segments).
+    global _last_reconciliation_stats
+    _last_reconciliation_stats = stats
     return out_segments, stats
 
 

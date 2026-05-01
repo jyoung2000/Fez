@@ -899,15 +899,23 @@ def escalate_uncovered_intervals_sync(
     if ctx.budget_ms_remaining > 0:
         budget_ms = min(budget_ms, ctx.budget_ms_remaining)
 
+    from dataclasses import replace
+
     for start_ms, end_ms in intervals:
-        # Refresh per-interval neighbor context so Rung 4 has it.
-        ctx.neighbor_text_before = _neighbor_text(
-            ledger, around_ms=start_ms, direction="before",
+        # Build a fresh per-interval EscalationContext via
+        # dataclasses.replace so the caller's original ctx is not
+        # mutated. Rung 4 (forced alignment) reads neighbor text;
+        # other rungs ignore it.
+        interval_ctx = replace(
+            ctx,
+            neighbor_text_before=_neighbor_text(
+                ledger, around_ms=start_ms, n_words=5, direction="before",
+            ),
+            neighbor_text_after=_neighbor_text(
+                ledger, around_ms=end_ms, n_words=5, direction="after",
+            ),
+            budget_ms_remaining=max(0, budget_ms),
         )
-        ctx.neighbor_text_after = _neighbor_text(
-            ledger, around_ms=end_ms, direction="after",
-        )
-        ctx.budget_ms_remaining = max(0, budget_ms)
 
         if budget_ms <= 0 and not stats.budget_exhausted:
             stats.budget_exhausted = True
@@ -935,7 +943,9 @@ def escalate_uncovered_intervals_sync(
         interval_resolved = False
         for rung_name, rung_fn in effective_rungs:
             try:
-                result = rung_fn(ctx.audio_path, start_ms, end_ms, ctx)
+                result = rung_fn(
+                    interval_ctx.audio_path, start_ms, end_ms, interval_ctx,
+                )
             except Exception as e:
                 logger.warning(
                     "escalation_ladder: rung %s raised %s — passing",
