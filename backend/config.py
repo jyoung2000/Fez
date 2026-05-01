@@ -88,6 +88,19 @@ class Settings(BaseSettings):
     # on ≥6 GB cards; this flag extends the ladder so mid-tier GPUs
     # get ``small → medium`` on ≥2.5 GB as well.
     WHISPER_AUTO_UPGRADE: bool = True
+    # ── TACT Phase 1: Temporal Coverage Ledger ──
+    # First-class coverage record. Defaults ON because Phase 1 is pure
+    # observability — it bootstraps a CoverageLedger from the existing
+    # post-gap-fill segment list, persists a coverage_report dict on
+    # the job, and logs a one-line summary. No transcript text changes.
+    # Set to False to disable ledger emission (e.g. for byte-identical
+    # regression comparisons against pre-TACT runs).
+    TACT_LEDGER_ENABLED: bool = True
+    # Bin width used purely for reporting denominators (the stored
+    # spans are full-ms precision regardless). 20 ms matches the TACT
+    # design doc default; 10 ms is finer-grained for archival research,
+    # 40 ms is coarser for very long files.
+    TACT_LEDGER_BIN_MS: int = 20
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
     # Adaptive frame extraction

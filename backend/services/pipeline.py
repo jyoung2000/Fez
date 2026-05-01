@@ -2646,6 +2646,63 @@ async def _run_analysis_inner(job_id: str):
                     job_id, e,
                 )
 
+        # ── TACT Phase 1: Temporal Coverage Ledger ──
+        # Bootstrap a CoverageLedger from the post-gap-fill segment list
+        # and persist a coverage_report dict on the job. Pure
+        # observability — does not modify ``result``. Bounded by a
+        # try/except so any ledger failure logs and proceeds.
+        if (getattr(settings, "TACT_LEDGER_ENABLED", True)
+                and result and audio_duration > 0):
+            try:
+                from backend.services.transcription_ledger import (
+                    CoverageLedger,
+                )
+                ledger = CoverageLedger(
+                    int(audio_duration * 1000),
+                    bin_ms=int(getattr(settings, "TACT_LEDGER_BIN_MS", 20)),
+                )
+                ledger.from_segments(
+                    list(result),
+                    source_pass="whisper_main+gap_fill",
+                )
+                coverage_report = ledger.to_report_dict()
+                # Cross-check against the gap-filler's voiced-coverage
+                # number when VAD is available — same primitive that
+                # transcription_gap_filler uses, just routed through
+                # the ledger so the two numbers are guaranteed
+                # consistent in Phase 1.
+                try:
+                    from backend.services.active_speaker import (
+                        build_vad_presence,
+                    )
+                    vad_intervals = build_vad_presence(audio_path) or []
+                    coverage_report["voiced_coverage_ratio"] = round(
+                        ledger.voiced_coverage_ratio(vad_intervals), 4,
+                    )
+                except Exception as _vad_e:
+                    logger.debug(
+                        "[%s] ledger: voiced-coverage cross-check skipped "
+                        "(%s)", job_id, _vad_e,
+                    )
+                await database.update_job_status(
+                    job_id, coverage_report=coverage_report,
+                )
+                logger.info(
+                    "[%s] coverage_ledger: ratio=%.3f voiced=%s "
+                    "uncovered=%.3f spans=%d source=%s",
+                    job_id,
+                    coverage_report["coverage_ratio"],
+                    coverage_report.get("voiced_coverage_ratio"),
+                    coverage_report["uncovered_ratio"],
+                    coverage_report["span_count"],
+                    coverage_report["source_pass_ms"],
+                )
+            except Exception as e:
+                logger.warning(
+                    "[%s] coverage_ledger emission failed (%s) — "
+                    "continuing", job_id, e,
+                )
+
         await database.update_job_status(job_id, transcript=list(result))
 
         # ── Inline heuristic diarization ──
