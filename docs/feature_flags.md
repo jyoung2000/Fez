@@ -144,3 +144,39 @@ a `(spectral fallback)` badge when the spectral backend ran.
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `TASED_NET_MODEL_PATH` | `/opt/clipai/models/tased_v2.pth` | Path to the operator-supplied TASED-Net checkpoint. Adapter raises (and AvSaliency falls back to spectral residual) when this points at a non-existent file. |
+
+## Layer 2 — DOVER-Mobile (quality delta vs source)
+
+DOVER-Mobile is the no-reference VQA model that grades reframes
+along two axes: **aesthetic** (composition / framing / lighting /
+color) and **technical** (sharpness / blur / compression). The L2
+critic runs DOVER on both the source clip and the rendered preview,
+then surfaces the per-axis deltas so operators can tell when a
+reframe degraded quality even if the salient region stayed in-crop.
+
+The model is operator-vendored — see `infra/dover_mobile/README.md`
+for the build-stage Dockerfile that exports the upstream PyTorch
+checkpoint to ONNX.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CLIPAI_DOVER_LAYER` | `1` | Layer 2 toggle. ON → the diagnostics router runs DOVER on the source + rendered preview after the preview-render phase. OFF → the SSE stream emits `phase_result: l2_quality_delta status: skipped reason: flag_disabled` and the result panel's quality row is absent. |
+| `DOVER_MOBILE_MODEL_PATH` | `/opt/clipai/models/dover_mobile.onnx` | Path to the baked ONNX model. When the file is missing the wrapper logs "DOVER-Mobile model not at …" and returns None — the critic block stays empty. |
+| `DOVER_MOBILE_SHA256` | `""` | When set, the wrapper verifies the on-disk ONNX matches before loading. Mismatch → load fails (no inference). Empty string skips verification (operators who haven't pinned). |
+| `DOVER_CACHE_DIR` | `/var/cache/clipai/dover_cache` | Output directory for `(source_sha256[:16], plan_hash[:16]).json` cache files. Bind-mounted in `docker-compose.yml` so cache survives image rebuilds. |
+
+**Verdict gate.** `verdict_for` in
+`backend/scripts/compare_autoflip_vs_clipai.py` reads
+`quality_delta_aesthetic` / `quality_delta_technical` from the
+metrics dict. When either falls below the per-zone threshold
+(default `-0.10` absolute, override per-zone via
+`quality_delta_aesthetic_min` / `_technical_min`), a `PASS` verdict
+downgrades to `MARGINAL`. When the keys are absent the gate is a
+no-op — bench-only runs without the diagnostics-router DOVER phase
+behave exactly as before.
+
+**Vendoring URL + SHA256.** Operators record the upstream URL,
+the SHA256 they computed, and the date the artifact was downloaded
+in `infra/dover_mobile/README.md` so anyone rebuilding from a
+different host can verify they got the same bytes. Replace the
+placeholder block on first build.
