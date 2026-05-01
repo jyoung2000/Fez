@@ -289,6 +289,16 @@ async def _migrate_session_to_v2(token: str, new_fingerprint: str) -> None:
     invalidate_session_cache(token)
 
 
+# Minimum cookie lifetime after a successful sign-in. The cookie is
+# always written with at least this much ``Max-Age`` so a user who
+# signs in stays signed in for at least 25 hours regardless of the
+# ``remember`` choice. The middleware's rolling touch loop refreshes
+# the cookie on every API call (throttled to once per minute), so
+# active users effectively never have to sign in again — the floor
+# only kicks in for browsers that close mid-session and reopen later.
+_MIN_SESSION_LIFETIME_SEC = 25 * 3600
+
+
 def set_session_cookie(
     response: Response,
     token: str,
@@ -298,17 +308,32 @@ def set_session_cookie(
 ) -> None:
     """Attach the session cookie with safe defaults.
 
-    ``remember=True`` (default) writes a persistent cookie with
-    ``max_age``: the browser keeps it across restarts and the user
-    stays signed in for up to ``max_age_seconds``.
+    The cookie is ALWAYS written as persistent with a ``Max-Age``
+    floor of ``_MIN_SESSION_LIFETIME_SEC`` (25 h), regardless of the
+    ``remember`` flag. This guarantees that a user who successfully
+    signs in is not prompted to sign in again for at least 25 hours,
+    even if they close the browser between visits.
 
-    ``remember=False`` writes a SESSION cookie (no ``Max-Age`` /
-    ``Expires``): browsers drop it on quit, so the next time the
-    user opens ClipAI on that device they have to sign in again.
-    The server-side session record is unchanged either way; the
-    auto-extending touch loop on the middleware still rolls the
-    expiry forward, but no cookie persists past the browser tab.
+    ``remember=True`` (default): cookie persists for ``max_age_seconds``
+    (30 days by default). The middleware's rolling touch refreshes
+    this on every authenticated request, so an active user never
+    times out.
+
+    ``remember=False``: cookie persists for exactly 25 h. The user
+    has explicitly asked for a less-persistent session, but the
+    25 h floor is the minimum useful session length on this app —
+    we do not write session-scoped cookies that vanish on
+    browser quit, because those produced the most-reported "I just
+    signed in, why am I being asked to sign in again" bug.
+
+    The server-side session record itself lives 30 days regardless;
+    the cookie ``Max-Age`` and the server-side ``expires_at`` are
+    independent ceilings.
     """
+    if remember:
+        effective_max_age = max(int(max_age_seconds), _MIN_SESSION_LIFETIME_SEC)
+    else:
+        effective_max_age = _MIN_SESSION_LIFETIME_SEC
     cookie_kwargs = dict(
         key=SESSION_COOKIE,
         value=token,
@@ -316,9 +341,8 @@ def set_session_cookie(
         secure=False,  # localhost defaults; reverse proxy can override
         samesite="lax",
         path="/",
+        max_age=effective_max_age,
     )
-    if remember:
-        cookie_kwargs["max_age"] = max_age_seconds
     response.set_cookie(**cookie_kwargs)
 
 
