@@ -157,3 +157,78 @@ post-hoc.
   VRAM-management code in `transcription.py:510-665`. The
   `_get_gpu_free_mb()` machinery is already there to support the
   graceful-fallback contract.
+
+---
+
+## Phase 2 callers to update (`_filter_hallucinations`)
+
+Mandatory grep, run before changing the signature. From
+`grep -rn "_filter_hallucinations" backend/ --include='*.py'`:
+
+| File | Line | Kind | Action when signature changes |
+|------|------|------|-------------------------------|
+| `backend/services/transcription.py` | 917 | call (inside `transcribe_audio_subprocess`) | Consume `(kept, quarantined)` — bubble `quarantined` up so the pipeline can claim it into the ledger as `status="quarantined"`. |
+| `backend/services/transcription.py` | 1810 | call (partial-recovery path inside `transcribe_audio` exception handler) | `kept, _ = _filter_hallucinations(...)` — explicit discard. Partial recovery is already a degraded-output path; quarantine is not actionable here. |
+| `backend/services/transcription.py` | 2488 | call (inside `_transcribe_sync` final filter pass) | Bubble up — same pattern as line 917. |
+| `backend/services/transcription.py` | 3023 | the function definition itself | Change return type `list[dict] -> tuple[list[dict], list[dict]]`; preserve every existing `continue` site, but tag and append to `quarantined` instead of dropping. |
+| `backend/services/transcription.py` | 3227 | comment only | No code change. |
+| `backend/services/transcription.py` | 3377 | comment only | No code change. |
+| `backend/services/transcription_gap_filler.py` | 7 | docstring reference | No code change. |
+| `backend/tests/test_transcription.py` | 447 | comment only | No code change. |
+
+Both call-site updates at lines 917 and 2488 currently happen deep
+inside subprocess-result-handling code that returns `list[TranscriptSegment]`.
+The transport mechanism for the quarantined list back up to the
+pipeline integration site is the cleanest open question; two options:
+
+  (a) Stash quarantined dicts on a module-level `_last_quarantined`
+      dict keyed off the audio_path / job_id so the pipeline retrieves
+      it after `transcribe_audio_subprocess` returns. Mirrors the
+      `_last_detected_language` and `_last_diarization_method`
+      pattern already in this file.
+  (b) Change the subprocess-fronting helpers to return
+      `tuple[list[TranscriptSegment], list[dict]]`. Cleaner but
+      touches more callers.
+
+Going with (a) — module-level `_last_quarantined_segments`. Same
+pattern as `_last_detected_language` (line 20) and
+`_last_diarization_method` (line 23). Avoids changing the public
+shape of `transcribe_audio_subprocess` / `_transcribe_sync`. The
+pipeline reads it after transcription, claims the entries into the
+ledger with `status="quarantined"`, and the dict is reset on the
+next `transcribe_audio_*` call.
+
+When `TACT_QUARANTINE_HALLUCINATIONS=False`, every dropped segment
+still ends up dropped (compatible with pre-TACT behavior); the
+quarantined list is still populated for inspection but the pipeline
+ignores it. This means the function-level signature change is
+permanent (removing the `if flag` branch keeps the call sites
+uniform), and only the *consumption* of the quarantined list is
+flag-gated.
+
+## Phase 2 scope for this session
+
+This session's commit covers the foundation pieces of Phase 2 — the
+parts that other Rungs and the pipeline integration build on:
+
+1. `_filter_hallucinations` tuple-return signature change with all
+   three callers updated and a module-level `_last_quarantined_segments`
+   accessor.
+2. Ledger surface additions for Phase 2: `status` kwarg on
+   `from_segments`, `claim_word` for forthcoming Phase 3 word-level
+   claims (used in tests now to lock the API).
+3. `escalation_ladder.py` skeleton with `EscalationContext`,
+   `RungResult`, `EscalationStats`, and the Rung-1/Rung-6 rungs.
+   Rung 1 is the existing gap-filler logic, factored into a callable.
+   Rung 6 is the always-claims terminator that makes the coverage
+   invariant hold.
+4. `TACT_LADDER_*` and `TACT_QUARANTINE_HALLUCINATIONS` config keys.
+5. Unit tests for the quarantine path, ladder ordering, and the
+   coverage invariant after Rung 6.
+
+Rungs 2, 3, 4, 5, the PANNs/wav2vec2 integrations, the fixture pack,
+and the full pipeline.py rewire are deferred to follow-up commits on
+the same Phase 2 PR. The ledger's `from_segments` post-hoc emission
+block in pipeline.py stays in place this commit — replacing it with
+the ladder integration is a coordinated change that needs the rest
+of the rungs first.
