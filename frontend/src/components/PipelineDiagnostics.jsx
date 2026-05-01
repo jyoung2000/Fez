@@ -1095,9 +1095,14 @@ export default function PipelineDiagnostics() {
             backend SSE stream attaches the per-run aggregate to
             sotaResult.critic so this row lights up without a JSON
             re-fetch. */}
-        {(sotaResult?.critic?.saliency || sotaResult?.critic?.quality_delta) && (() => {
+        {(
+          sotaResult?.critic?.saliency
+          || sotaResult?.critic?.quality_delta
+          || sotaResult?.critic?.vlm_rubric
+        ) && (() => {
           const sal = sotaResult.critic.saliency;
           const qd = sotaResult.critic.quality_delta;
+          const vlm = sotaResult.critic.vlm_rubric;
           const inCrop = sal && (sal.in_crop_mean ?? sal.in_crop_fraction);
           const salColor = (v) => {
             if (v == null) return 'var(--text-muted)';
@@ -1219,6 +1224,81 @@ export default function PipelineDiagnostics() {
                   )}
                 </div>
               )}
+              {vlm && (() => {
+                // Layer 3 \u2014 VLM rubric critic row. Score is 0-10
+                // (min across 5 cinematographic axes). Color
+                // thresholds mirror the verdict gate's
+                // L3_VLM_RUBRIC_MEAN_MIN (default 5.5).
+                const score = vlm.mean_score;
+                const scoreColor = (s) => {
+                  if (s == null) return 'var(--text-muted)';
+                  if (s >= 7.0) return '#22c55e';
+                  if (s >= 5.5) return '#ff9f0a';
+                  return '#ef4444';
+                };
+                const modeLabel = (m) => {
+                  switch ((m || '').toLowerCase()) {
+                    case 'learned': return 'CPU heuristic';
+                    case 'vlm':     return 'VLM';
+                    case 'both':    return 'VLM + heuristic';
+                    case 'off':     return 'off';
+                    default:        return m || 'unknown';
+                  }
+                };
+                const lows = vlm.low_windows || [];
+                return (
+                  <>
+                    <div style={rowStyle}>
+                      <span style={{ minWidth: 130, color: 'var(--text-muted)' }}>
+                        VLM rubric (L3):
+                      </span>
+                      <span
+                        style={{ color: scoreColor(score), fontWeight: 600 }}
+                        title="Min across 5 axes: composition / subject_visible / headroom / lead_room / framing_choice"
+                      >
+                        \u2605 {score != null ? score.toFixed(1) : '\u2014'}/10
+                      </span>
+                      {vlm.low_window_count > 0 && (
+                        <span style={{ color: '#ff9f0a', fontSize: 11 }}>
+                          {vlm.low_window_count} window{vlm.low_window_count === 1 ? '' : 's'} flagged
+                        </span>
+                      )}
+                      <span style={{
+                        color: 'var(--text-muted)', fontSize: 10,
+                        padding: '1px 6px',
+                        border: '1px solid var(--border)',
+                        borderRadius: 4,
+                      }}>
+                        {modeLabel(vlm.mode)}
+                      </span>
+                      {vlm.budget_used > 0 && (
+                        <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>
+                          {vlm.budget_used} VLM call{vlm.budget_used === 1 ? '' : 's'}
+                        </span>
+                      )}
+                    </div>
+                    {lows.length > 0 && (
+                      <div style={{
+                        paddingLeft: 142,
+                        fontSize: 11,
+                        color: 'var(--text-muted)',
+                        marginBottom: 4,
+                      }}>
+                        {lows.slice(0, 3).map((w, i) => (
+                          <div key={i}>
+                            {Number(w.start).toFixed(1)}\u2013{Number(w.end).toFixed(1)}s
+                            {' \u2014 '}
+                            {w.suggested_action || 'review'}
+                          </div>
+                        ))}
+                        {lows.length > 3 && (
+                          <div>+{lows.length - 3} more</div>
+                        )}
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
             </div>
           );
         })()}
