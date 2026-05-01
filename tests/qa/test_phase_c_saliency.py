@@ -115,10 +115,22 @@ class _FakeTasedAdapter:
 
 class TestAvSaliencyOrchestration:
     @mock.patch("backend.services.av_saliency._is_gpu_visible", return_value=False)
-    def test_construction_raises_without_gpu(self, _gpu):
+    def test_construction_downgrades_to_cpu_without_gpu(self, _gpu):
+        """Documented contract (av_saliency.py:391-393): CUDA-requested
+        with no GPU visible silently downgrades to CPU rather than
+        raising. The fallback chain ensures a working adapter is loaded
+        on CPU. Production-critical: on a 4 GB GTX 1650 the GPU is
+        shared with Whisper / Ollama / Parakeet, and intermittent
+        unavailability must not abort the entire reframing pipeline.
+        """
         from backend.services.av_saliency import AvSaliency
-        with pytest.raises(RuntimeError, match="CUDA"):
-            AvSaliency()
+        sal = AvSaliency()
+        assert sal.device == "cpu"
+        # Fallback chain produced *some* adapter — TASED-Net (if its
+        # weights are present) or the always-available spectral
+        # residual.
+        assert sal._adapter is not None
+        assert getattr(sal._adapter, "backend_name", None) is not None
 
     @mock.patch("backend.services.av_saliency._is_gpu_visible", return_value=True)
     def test_predict_returns_normalized_heatmaps_and_peaks(self, _gpu):
