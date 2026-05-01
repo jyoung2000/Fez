@@ -22,6 +22,41 @@ _last_detected_language = {}
 # Stores which diarization method was used ("neural" or "heuristic")
 _last_diarization_method = {"method": "heuristic"}
 
+# TACT Phase 2: hallucination quarantine. Stores the most recent
+# _filter_hallucinations quarantined-segment list so the pipeline can
+# claim it into the CoverageLedger as ``status="quarantined"`` after
+# transcription returns. Mirrors the _last_detected_language /
+# _last_diarization_method accessor pattern. Reset at the start of
+# every transcribe_audio* entrypoint so a re-used worker doesn't
+# carry stale entries across jobs. Each entry is a dict with the
+# segment fields plus a ``quarantine_reason`` key.
+_last_quarantined_segments: list[dict] = []
+
+
+# TACT Phase 2: stable identifiers for quarantine reasons. The set
+# is closed — every drop in _filter_hallucinations gets exactly one
+# reason from this tuple.
+QUARANTINE_REASONS = (
+    "ghost_by_ratio",        # duration > N AND chars_per_sec < threshold
+    "near_duplicate",         # exact-text duplicate within sliding window
+    "fuzzy_duplicate",        # Jaccard / SequenceMatcher near-dup
+    "mega_ghost",             # very long duration, very short text
+    "boilerplate",            # matches _WHISPER_BOILERPLATE
+    "compression_anomaly",    # CJK looping / trigram looping
+    "logprob_floor",          # avg_logprob below threshold
+    "non_speech",             # high no_speech_prob + low confidence
+    "prompt_echo",            # initial_prompt echoed as transcription
+    "runaway",                # text > 1500 chars (single-segment runaway)
+    "backward_jump",          # temporal ordering violation
+)
+
+
+def get_last_quarantined_segments() -> list[dict]:
+    """Return (a copy of) the quarantined segments from the most recent
+    ``_filter_hallucinations`` call. Used by the pipeline to claim
+    quarantined regions into the CoverageLedger."""
+    return list(_last_quarantined_segments)
+
 # Exposed after model loads so the pipeline can report GPU info in status messages
 whisper_device_info = {"device": "cpu", "compute_type": "int8", "gpu_name": ""}
 
@@ -914,7 +949,13 @@ async def transcribe_audio_subprocess(
         # double-filtering that cumulatively removes ~19% of valid segments.
         raw_segments = raw.get("segments", [])
         if task != "translate":
-            raw_segments = _filter_hallucinations(raw_segments, task=task)
+            # _filter_hallucinations now returns (kept, quarantined). The
+            # quarantined list is parked on the module-level
+            # _last_quarantined_segments accessor for the pipeline to
+            # claim into the CoverageLedger as status="quarantined".
+            raw_segments, _q_segments = _filter_hallucinations(
+                raw_segments, task=task,
+            )
         raw_segments = _consolidate_segments(raw_segments, task=task, is_animated=is_animated)
         raw_segments = _split_segments_at_sentence_boundaries(raw_segments, task=task)
         raw_segments, _ = _dedupe_long_range(raw_segments)
@@ -1807,7 +1848,9 @@ async def transcribe_audio(
                     "Returning partial transcription.",
                     len(partial), str(e)[:200],
                 )
-                partial = _filter_hallucinations(partial, task=task)
+                # Partial-recovery path: discard quarantined explicitly
+                # — degraded output already, no pipeline path to re-feed.
+                partial, _ = _filter_hallucinations(partial, task=task)
                 partial = _consolidate_segments(partial, task=task)
                 partial = _split_segments_at_sentence_boundaries(partial, task=task)
                 partial, _ = _dedupe_long_range(partial)
@@ -2484,8 +2527,10 @@ def _transcribe_sync(
     if not raw_segments:
         return []
 
-    # Filter hallucinations and consolidate fragments before speaker assignment
-    raw_segments = _filter_hallucinations(raw_segments, task=task)
+    # Filter hallucinations and consolidate fragments before speaker assignment.
+    # Quarantined segments are parked on _last_quarantined_segments for the
+    # pipeline to claim into the CoverageLedger as status="quarantined".
+    raw_segments, _q_segments = _filter_hallucinations(raw_segments, task=task)
     raw_segments = _consolidate_segments(raw_segments, task=task, is_animated=is_animated)
     raw_segments = _split_segments_at_sentence_boundaries(raw_segments, task=task)
     raw_segments, _dedup_removed = _dedupe_long_range(raw_segments)
@@ -3020,8 +3065,22 @@ def _dedupe_long_range(
     return kept, removed_intervals
 
 
-def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -> list[dict]:
-    """Remove Whisper hallucination segments.
+def _filter_hallucinations(
+    raw_segments: list[dict], task: str = "transcribe",
+) -> tuple[list[dict], list[dict]]:
+    """Detect Whisper hallucination segments and split into kept + quarantined.
+
+    Returns ``(kept, quarantined)``. Each entry in ``quarantined`` is the
+    original segment dict with one extra key, ``quarantine_reason``,
+    drawn from ``QUARANTINE_REASONS``. Empty-text segments are silently
+    dropped (no recovery target for the escalation ladder).
+
+    The kept-list logic is byte-identical to the previous behavior; the
+    only change is that what was a ``continue`` (drop) now records a
+    quarantine_reason on the segment and appends it to ``quarantined``.
+    The module-level ``_last_quarantined_segments`` is also updated so
+    the pipeline can claim the quarantined regions into its
+    CoverageLedger as ``status="quarantined"``.
 
     Detects and filters:
     - Non-speech segments (high no_speech_prob + low confidence)
@@ -3029,17 +3088,36 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
     - Backward-jumping timestamps (temporal ordering violations)
     - Abnormally long single segments (>1500 chars = likely runaway)
     - Repeated n-grams (looping text like "Thank you. Thank you. Thank you.")
-    - Segments that are near-exact duplicates of the previous segment (sequence-based)
+    - Segments that are near-exact duplicates of the previous segment
 
-    When task='translate', applies looser thresholds because English translations
-    of non-English audio produce shorter text for the same audio duration.
+    When task='translate', applies looser thresholds because English
+    translations of non-English audio produce shorter text for the same
+    audio duration.
     """
+    global _last_quarantined_segments
+
     is_translate = (task == "translate")
     if not raw_segments:
-        return raw_segments
+        _last_quarantined_segments = []
+        return raw_segments, []
 
-    filtered = []
+    filtered: list[dict] = []
+    quarantined: list[dict] = []
     prev_text = ""
+
+    def _q(seg: dict, reason: str) -> None:
+        """Append ``seg`` to the quarantine list with a reason tag.
+
+        Uses a shallow copy so the caller's dict isn't mutated.
+        Validates the reason against ``QUARANTINE_REASONS`` so a typo
+        fails loud at test time rather than silently producing bad
+        ledger spans.
+        """
+        if reason not in QUARANTINE_REASONS:
+            raise ValueError(f"unknown quarantine reason: {reason!r}")
+        entry = dict(seg)
+        entry["quarantine_reason"] = reason
+        quarantined.append(entry)
 
     for seg in raw_segments:
         text = seg["text"].strip()
@@ -3056,6 +3134,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                 "Hallucination filter: removed non-speech segment at %.1fs (no_speech=%.2f, conf=%.2f): %s...",
                 seg["start"], no_speech, confidence, text[:60],
             )
+            _q(seg, "non_speech")
             continue
 
         # Check 0b: Whisper boilerplate phrases — only at transcript edges with low confidence
@@ -3069,6 +3148,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                     "Hallucination filter: removed boilerplate at %.1fs: %s",
                     seg["start"], text[:60],
                 )
+                _q(seg, "boilerplate")
                 continue
 
         # Check 0e: Prompt echo detection — catches initial_prompt being
@@ -3086,6 +3166,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                 "Hallucination filter: prompt echo at %.1fs: %s...",
                 seg["start"], text[:80],
             )
+            _q(seg, "prompt_echo")
             continue
 
         # Check 0d: Text-to-duration ratio — catches ghosts that have low no_speech_prob
@@ -3100,6 +3181,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                     "Hallucination filter: ghost (ratio) at %.1fs (%.0fs, %.2f c/s): %s...",
                     seg["start"], seg_duration, chars_per_sec, text[:60],
                 )
+                _q(seg, "ghost_by_ratio")
                 continue
             mega_threshold = 300 if is_translate else 120
             mega_min_chars = 10 if is_translate else 200
@@ -3108,6 +3190,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                     "Hallucination filter: mega-ghost at %.1fs (%.0fs, %d chars): %s...",
                     seg["start"], seg_duration, len(text), text[:60],
                 )
+                _q(seg, "mega_ghost")
                 continue
 
         # Check 0c: Temporal ordering — segment start must not jump backward
@@ -3116,6 +3199,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                 "Hallucination filter: removed backward-jumping segment at %.1fs (prev started %.1fs): %s...",
                 seg["start"], filtered[-1]["start"], text[:60],
             )
+            _q(seg, "backward_jump")
             continue
 
         # Check 1: Abnormally long segment (Whisper runaway)
@@ -3124,6 +3208,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                 "Hallucination filter: removed runaway segment at %.1fs (%d chars): %s...",
                 seg["start"], len(text), text[:80],
             )
+            _q(seg, "runaway")
             continue
 
         # Check 2: Repeated n-grams
@@ -3155,6 +3240,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                         "Hallucination filter: removed CJK looping segment at %.1fs: %s...",
                         seg["start"], text[:80],
                     )
+                    _q(seg, "compression_anomaly")
                     continue
         else:
             # Word-level trigram detection for space-delimited languages
@@ -3170,6 +3256,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                         "Hallucination filter: removed looping segment at %.1fs: %s...",
                         seg["start"], text[:80],
                     )
+                    _q(seg, "compression_anomaly")
                     continue
 
         # Check 3: Near-duplicate of previous segment (sequence-based)
@@ -3184,6 +3271,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                     "Hallucination filter: removed duplicate segment at %.1fs (%.0f%% similar): %s...",
                     seg["start"], ratio * 100, text[:60],
                 )
+                _q(seg, "near_duplicate")
                 continue
 
         # Check 3b: Exact duplicate of any segment in the last 10
@@ -3207,6 +3295,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                     "Hallucination filter: near-dup (window) at %.1fs: %s...",
                     seg["start"], text[:60],
                 )
+                _q(seg, "near_duplicate")
                 continue
 
         # Check 3c: Fuzzy near-duplicate within 30s (Jaccard word overlap)
@@ -3238,6 +3327,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                         _is_fuzzy_dup = True
                         break
         if _is_fuzzy_dup:
+            _q(seg, "fuzzy_duplicate")
             continue
 
         filtered.append(seg)
@@ -3245,8 +3335,14 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
 
     removed = len(raw_segments) - len(filtered)
     if removed > 0:
-        logger.info("Hallucination filter: removed %d/%d segments", removed, len(raw_segments))
-    return filtered
+        logger.info(
+            "Hallucination filter: removed %d/%d segments (quarantined %d)",
+            removed, len(raw_segments), len(quarantined),
+        )
+
+    # Stash for the pipeline to consume after we return.
+    _last_quarantined_segments = list(quarantined)
+    return filtered, quarantined
 
 
 def _consolidate_segments(

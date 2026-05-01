@@ -101,6 +101,40 @@ class Settings(BaseSettings):
     # design doc default; 10 ms is finer-grained for archival research,
     # 40 ms is coarser for very long files.
     TACT_LEDGER_BIN_MS: int = 20
+    # ── TACT Phase 2: Escalation ladder + hallucination quarantine ──
+    # Master switch for the ladder. When False, the legacy gap-filler
+    # remains in place and behavior is unchanged.
+    TACT_LADDER_ENABLED: bool = True
+    # Total audio (in seconds) the ladder may re-transcribe across all
+    # gap intervals in a single job. Once exceeded, remaining intervals
+    # are routed straight to the cheap Rungs 5 and 6.
+    TACT_LADDER_MAX_AUDIO_SEC: float = 600.0
+    # Hard ceiling (in seconds) that any single Rung 1-4 invocation may
+    # spend on one interval. Prevents a 300-s gap from starving the
+    # rest of the ladder.
+    TACT_LADDER_PER_INTERVAL_TIMEOUT_SEC: float = 30.0
+    # Per-rung kill switches. Useful for A/B comparison and as
+    # emergency rollback if a rung is producing bad output. Rung 1 and
+    # Rung 6 cannot be disabled (Rung 6 is the coverage-invariant
+    # terminator).
+    TACT_LADDER_RUNG_2_ENABLED: bool = True   # alt Whisper checkpoint
+    TACT_LADDER_RUNG_3_ENABLED: bool = False  # consensus — Phase 4
+    TACT_LADDER_RUNG_4_ENABLED: bool = True   # forced alignment
+    TACT_LADDER_RUNG_5_ENABLED: bool = True   # event classifier
+    # Quarantine vs drop. When False, _filter_hallucinations still
+    # returns the tuple (signature change is permanent), but the
+    # pipeline ignores the quarantined list — equivalent to legacy
+    # silent-drop behavior.
+    TACT_QUARANTINE_HALLUCINATIONS: bool = True
+    # Non-speech event classifier. Only "panns" is supported in
+    # Phase 2; "yamnet" reserved for future use.
+    TACT_EVENT_BACKEND: str = "panns"
+    TACT_EVENT_MIN_CONFIDENCE: float = 0.6
+    # Forced alignment device. "auto" uses CUDA when available, CPU
+    # otherwise. The aligner is small (~360 MB) so CPU is acceptable
+    # and avoids contending with the Whisper model for VRAM.
+    TACT_FORCED_ALIGN_DEVICE: str = "auto"
+    TACT_FORCED_ALIGN_MIN_WORD_CONFIDENCE: float = 0.6
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
     # Adaptive frame extraction

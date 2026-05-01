@@ -345,15 +345,30 @@ class CoverageLedger:
         self,
         segments: Iterable,
         source_pass: str = "whisper_main",
+        *,
+        status: str = "covered_speech",
+        flag_key: Optional[str] = None,
     ) -> None:
-        """Bulk-claim from an existing TranscriptSegment list.
+        """Bulk-claim from a segment-shaped list (dict or TranscriptSegment).
 
-        Phase 1 entrypoint: this is what bootstraps the ledger from
-        the post-gap-fill segment list emitted by the existing pipeline.
-        Each segment becomes one ``covered_speech`` span; the segment's
-        text is stored as ``content`` with ``content_type="phrase"``
-        (multi-word). Word-level claims are deferred to Phase 3 when
-        the disjoint-offset reconciler needs them.
+        Phase 1 entrypoint: bootstraps the ledger from the post-Whisper
+        segment list. Each segment becomes one span at
+        ``content_type="phrase"`` (multi-word).
+
+        Phase 2 additions:
+
+        ``status`` is configurable so the same primitive can be used to
+        claim quarantined segments with ``status="quarantined"``. The
+        ledger doesn't dedupe across different statuses, so quarantined
+        spans coexist with covered_speech spans even at the same
+        timestamp.
+
+        ``flag_key`` names a key on each segment dict whose value is
+        appended to ``LedgerSpan.flags``. Used by the pipeline to
+        forward ``quarantine_reason`` from the hallucination filter
+        into the ledger so it survives into ``to_report_dict``. When
+        ``None`` (default), no flag is added — preserves Phase 1
+        behavior on existing callers.
         """
         for seg in segments or []:
             if seg is None:
@@ -363,11 +378,13 @@ class CoverageLedger:
                 end = seg.get("end")
                 text = (seg.get("text") or "").strip()
                 speaker = seg.get("speaker")
+                flag_value = seg.get(flag_key) if flag_key else None
             else:
                 start = getattr(seg, "start", None)
                 end = getattr(seg, "end", None)
                 text = (getattr(seg, "text", "") or "").strip()
                 speaker = getattr(seg, "speaker", None)
+                flag_value = getattr(seg, flag_key, None) if flag_key else None
             if start is None or end is None:
                 continue
             try:
@@ -380,13 +397,45 @@ class CoverageLedger:
             self.claim(LedgerSpan(
                 start_ms=start_ms,
                 end_ms=end_ms,
-                status="covered_speech",
+                status=status,
                 content=text or None,
                 content_type="phrase",
                 source_pass=source_pass,
                 confidence=_seg_confidence(seg),
                 speaker=speaker,
+                flags=[str(flag_value)] if flag_value else [],
             ))
+
+    def claim_word(
+        self,
+        start_ms: int,
+        end_ms: int,
+        word: str,
+        confidence: float,
+        *,
+        source_pass: str,
+        speaker: Optional[str] = None,
+        flags: Optional[list[str]] = None,
+        status: str = "covered_speech",
+    ) -> bool:
+        """Word-level claim helper. Used by the Phase 3 word-level
+        reconciler and by Rung 4 forced alignment when emitting
+        recovered words from a forced-alignment pass.
+
+        Wraps ``claim`` with ``content_type="word"`` so the ledger's
+        ``to_report_dict`` source-pass distribution counts word-level
+        coverage separately from phrase-level coverage."""
+        return self.claim(LedgerSpan(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            status=status,
+            content=word,
+            content_type="word",
+            source_pass=source_pass,
+            confidence=float(confidence),
+            speaker=speaker,
+            flags=list(flags or []),
+        ))
 
     # ── Queries / audit ──────────────────────────────────────────
 
