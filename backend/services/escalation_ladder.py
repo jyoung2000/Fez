@@ -721,9 +721,79 @@ def _rung_forced_alignment(
 def _rung_event_classifier(
     audio_path: str, start_ms: int, end_ms: int, ctx: EscalationContext,
 ) -> RungResult:
+    """PANNs-based non-speech event tag rung.
+
+    When Rungs 1-4 fail to produce transcribed words for an interval,
+    this rung asks PANNs CNN14 "what is this audio?". If the answer
+    is music / laughter / applause / silence with high enough
+    confidence, claim a covered_event span carrying the simplified
+    tag. Speech-detected-but-untranscribed and below-threshold
+    cases fall through to Rung 6.
+    """
+    from backend.config import settings as _settings
+    started = time.monotonic()
+    if not getattr(_settings, "TACT_LADDER_RUNG_5_ENABLED", True):
+        return RungResult(
+            rung_name="rung_5_event_classifier",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes="disabled",
+        )
+    if end_ms <= start_ms:
+        return RungResult(rung_name="rung_5_event_classifier")
+
+    try:
+        from backend.services.non_speech_events import classify_interval
+    except Exception as e:
+        return RungResult(
+            rung_name="rung_5_event_classifier",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes=f"deps_unavailable:{type(e).__name__}",
+        )
+
+    try:
+        cls = classify_interval(audio_path, start_ms / 1000.0, end_ms / 1000.0)
+    except Exception as e:
+        return RungResult(
+            rung_name="rung_5_event_classifier",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes=f"classify_failed:{type(e).__name__}",
+        )
+
+    threshold = float(getattr(_settings, "TACT_EVENT_MIN_CONFIDENCE", 0.6))
+    if cls.label == "other" or cls.confidence < threshold:
+        return RungResult(
+            rung_name="rung_5_event_classifier",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes=f"low_conf:{cls.label}={cls.confidence:.2f}",
+        )
+    if cls.label == "speech":
+        # Speech detected but Rungs 1-4 already failed to transcribe
+        # it. Falling through to Rung 6 is more informative for the
+        # user than tagging "[speech]" — Rung 6's [unintelligible]
+        # tells them why a region had audio but no words.
+        return RungResult(
+            rung_name="rung_5_event_classifier",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes="speech_detected_but_untranscribed",
+        )
+
+    is_silence = cls.label == "silence"
+    span = LedgerSpan(
+        start_ms=start_ms,
+        end_ms=end_ms,
+        status="covered_silence" if is_silence else "covered_event",
+        content=f"[{cls.label}]",
+        content_type="silence" if is_silence else "event",
+        source_pass="rung_5_event_classifier",
+        confidence=float(cls.confidence),
+        flags=[f"raw:{cls.raw_class}"] if cls.raw_class else [],
+    )
     return RungResult(
         rung_name="rung_5_event_classifier",
-        notes="not_yet_implemented",
+        spans=[span],
+        elapsed_ms=int((time.monotonic() - started) * 1000),
+        confidence=float(cls.confidence),
+        notes=f"{cls.label}={cls.confidence:.2f}",
     )
 
 
