@@ -313,6 +313,19 @@ L2_QUALITY_DELTA_AESTHETIC_MIN = -0.10
 L2_QUALITY_DELTA_TECHNICAL_MIN = -0.10
 
 
+# Layer 3 (VLM rubric) verdict threshold. A clip whose rubric mean
+# score falls below this gets PASS → MARGINAL (never PASS → MISS;
+# the rubric is one signal among many, not a hard fail). The 5.5/10
+# default is conservative — well-framed reframes typically score
+# 7+. Tune via env var or per-zone override
+# (``vlm_rubric_mean_min`` key in TARGET_ZONES). When the metrics
+# dict doesn't carry ``vlm_rubric_mean_score`` (L3 was off /
+# skipped), the gate is a no-op.
+L3_VLM_RUBRIC_MEAN_MIN = float(
+    os.environ.get("CLIPAI_CRITIC_VERDICT_MIN", "5.5")
+)
+
+
 def target_zone_for(clip: dict) -> dict[str, float]:
     """Look up the target zone for a clip, falling back through
     (clipcontenttype + subtype) → clipcontenttype → "default" zone.
@@ -547,6 +560,16 @@ def verdict_for(metrics: dict[str, Any], zone: Optional[dict[str, float]]) -> st
         extra_failures.append("quality_delta_aesthetic")
     if tech_delta is not None and tech_delta < tech_min:
         extra_failures.append("quality_delta_technical")
+
+    # Layer 3 (VLM rubric) gate. Same downgrade-only semantics as L2:
+    # below threshold → PASS becomes MARGINAL. Per-zone override via
+    # ``vlm_rubric_mean_min`` key wins over the module-level default.
+    rubric_min = zone.get(
+        "vlm_rubric_mean_min", L3_VLM_RUBRIC_MEAN_MIN,
+    )
+    rubric_score = metrics.get("vlm_rubric_mean_score")
+    if rubric_score is not None and rubric_score < rubric_min:
+        extra_failures.append("vlm_rubric_mean_score")
 
     if hold_zone_pass and not extra_failures:
         return "PASS"
