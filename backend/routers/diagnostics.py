@@ -269,6 +269,37 @@ def _sse_event(event_type: str, data: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _probe_preview_duration(video_path: str, *, fallback: float = 600.0) -> float:
+    """Probe ``video_path``'s duration via ffprobe. Returns the
+    duration in seconds when ffprobe succeeds; otherwise ``fallback``.
+
+    L3 uses this to cap ``extract_frames_for_critic``'s sampling
+    loop. The helper terminates past EOF silently, so an over-
+    estimate (the 600s default) is safe — at worst we waste a few
+    ffmpeg invocations per long clip. Real failures (missing
+    ffprobe, malformed media) just fall back to the default and
+    let the inner loop sort itself out."""
+    import shutil
+    import subprocess
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return fallback
+    try:
+        out = subprocess.run(
+            [
+                ffprobe, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=nw=1:nk=1",
+                video_path,
+            ],
+            check=True, capture_output=True, timeout=10.0,
+        )
+        return float(out.stdout.decode().strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            ValueError, OSError):
+        return fallback
+
+
 async def _test_vision_model(model: str) -> dict:
     """Test vision model: load, analyze a tiny test image, check GPU status."""
     start = time.time()
@@ -2701,6 +2732,12 @@ async def sota_clip_bench(request: Request):
         # Failure modes (model missing, onnxruntime missing,
         # corrupt video) degrade silently — the existing critic
         # row keeps rendering with quality_delta absent.
+        #
+        # ``source_sha`` and ``plan_hash`` are hoisted out of the L2
+        # try-block so L3 (below) can reuse them — same plan + same
+        # source = same cache keys for both layers.
+        source_sha: str = ""
+        plan_hash: str = ""
         if (
             not render_failed
             and os.path.isfile(preview_path)
@@ -2718,7 +2755,6 @@ async def sota_clip_bench(request: Request):
                 # Plan hash: derive from the segments JSON the renderer
                 # consumed so identical render plans hit the cache
                 # regardless of clip-token churn.
-                plan_hash = ""
                 try:
                     with open(segments_path, "rb") as _seg_fh:
                         plan_hash = _hashlib.sha256(
@@ -2727,7 +2763,6 @@ async def sota_clip_bench(request: Request):
                 except OSError:
                     pass
                 # Source SHA: cheap to derive from the upload's path.
-                source_sha = ""
                 try:
                     h = _hashlib.sha256()
                     with open(info["path"], "rb") as _src_fh:
@@ -2771,6 +2806,138 @@ async def sota_clip_bench(request: Request):
         elif os.environ.get("CLIPAI_DOVER_LAYER", "1") != "1":
             yield _sse_event("phase_result", {
                 "phase": "l2_quality_delta",
+                "status": "skipped",
+                "reason": "flag_disabled",
+            })
+
+        # ── Layer 3: VLM rubric critic ─────────────────────────
+        # Same gating pattern as L2: only fires when the render
+        # produced a real output AND the operator has explicitly
+        # opted in via CLIPAI_CRITIC_MODE.
+        #
+        # Default-off here (the bench gate) even though the
+        # production reframe_config default is ``learned``. The
+        # bench's role is opt-in evaluation — operators flip to
+        # ``learned`` for free CPU scoring, ``vlm`` / ``both`` once
+        # they've configured Ollama or OpenRouter.
+        #
+        # Reuses ``source_sha`` / ``plan_hash`` from the L2 block
+        # above so the two layers share consistent cache keys. When
+        # L2 was skipped those vars are empty strings and L3
+        # computes them itself.
+        critic_mode_env = os.environ.get(
+            "CLIPAI_CRITIC_MODE", "off",
+        ).lower()
+        if (
+            not render_failed
+            and os.path.isfile(preview_path)
+            and critic_mode_env != "off"
+        ):
+            yield _sse_event("phase_start", {
+                "phase": "l3_vlm_rubric",
+                "label": (
+                    f"Running VLM rubric critic (Layer 3, "
+                    f"mode={critic_mode_env})..."
+                ),
+            })
+            try:
+                from backend.services.critic_loop import (
+                    extract_frames_for_critic,
+                    score_plan as _critic_score_plan,
+                )
+                from backend.services.reframe_config import (
+                    get_default_config,
+                )
+                cfg = get_default_config()
+
+                # If L2 was skipped, source_sha / plan_hash are still
+                # empty — populate now so L3's cache keys are stable.
+                if not source_sha or not plan_hash:
+                    import hashlib as _hashlib
+                    if not plan_hash:
+                        try:
+                            with open(segments_path, "rb") as _seg_fh:
+                                plan_hash = _hashlib.sha256(
+                                    _seg_fh.read()
+                                ).hexdigest()[:16]
+                        except OSError:
+                            plan_hash = ""
+                    if not source_sha:
+                        try:
+                            h = _hashlib.sha256()
+                            with open(info["path"], "rb") as _src_fh:
+                                for chunk in iter(
+                                    lambda: _src_fh.read(65536), b"",
+                                ):
+                                    h.update(chunk)
+                            source_sha = h.hexdigest()
+                        except OSError:
+                            source_sha = ""
+
+                # Probe the rendered preview's duration so the
+                # frame-extraction loop has a real upper bound. The
+                # ``extract_frames_for_critic`` helper terminates
+                # silently past EOF, so an over-estimate is safe.
+                duration_sec = _probe_preview_duration(preview_path)
+                samples = extract_frames_for_critic(
+                    preview_path,
+                    duration_sec=duration_sec,
+                    interval_sec=float(
+                        getattr(cfg, "critic_sample_interval_sec", 1.0)
+                    ),
+                )
+                if not samples:
+                    yield _sse_event("phase_result", {
+                        "phase": "l3_vlm_rubric",
+                        "status": "skipped",
+                        "reason": "no_frames_extracted",
+                    })
+                else:
+                    report = _critic_score_plan(
+                        samples=samples,
+                        source_sha256=source_sha,
+                        plan_hash=plan_hash,
+                        config=cfg,
+                    )
+                    if critic_summary is None:
+                        critic_summary = {}
+                    critic_summary["vlm_rubric"] = {
+                        "mode": report.mode,
+                        "mean_score": float(report.mean_score),
+                        "low_window_count": len(report.resolve_requests),
+                        "low_windows": [
+                            {
+                                "start": float(rr.start),
+                                "end": float(rr.end),
+                                "reason": rr.reason,
+                                "suggested_action": rr.suggested_action,
+                            }
+                            for rr in report.resolve_requests
+                        ],
+                        "budget_used": int(report.budget_used),
+                        "samples_scored": len(report.per_frame),
+                    }
+                    yield _sse_event("phase_result", {
+                        "phase": "l3_vlm_rubric",
+                        "status": "ok",
+                        "mode": report.mode,
+                        "mean_score": float(report.mean_score),
+                        "low_window_count": len(report.resolve_requests),
+                        "samples_scored": len(report.per_frame),
+                    })
+            except Exception as _l3_exc:
+                logger.info(
+                    "[sota-clip-bench] L3 VLM rubric failed: %s",
+                    _l3_exc,
+                )
+                yield _sse_event("phase_result", {
+                    "phase": "l3_vlm_rubric",
+                    "status": "skipped",
+                    "reason": "exception",
+                })
+        elif critic_mode_env == "off":
+            yield _sse_event("phase_result", {
+                "phase": "l3_vlm_rubric",
                 "status": "skipped",
                 "reason": "flag_disabled",
             })
