@@ -619,9 +619,102 @@ def _rung_consensus_model(
 def _rung_forced_alignment(
     audio_path: str, start_ms: int, end_ms: int, ctx: EscalationContext,
 ) -> RungResult:
+    """Wav2vec2 forced-alignment rung.
+
+    Recovers chunk-edge-truncated words by force-aligning the
+    concatenation of neighbor text (5 words before + 5 words after
+    the gap) against the gap audio. Words that align with high
+    confidence are emitted as covered_speech spans. Genuinely
+    non-lexical gaps (music, silence) align poorly and the rung
+    falls through to Rung 5.
+    """
+    from backend.config import settings as _settings
+    started = time.monotonic()
+    if not getattr(_settings, "TACT_LADDER_RUNG_4_ENABLED", True):
+        return RungResult(
+            rung_name="rung_4_forced_alignment",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes="disabled",
+        )
+    if end_ms <= start_ms:
+        return RungResult(rung_name="rung_4_forced_alignment")
+
+    # Neighbor text comes from the orchestrator (per-interval).
+    neighbor = (
+        (ctx.neighbor_text_before or "")
+        + " "
+        + (ctx.neighbor_text_after or "")
+    ).strip()
+    if not neighbor:
+        return RungResult(
+            rung_name="rung_4_forced_alignment",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes="no_neighbor_text",
+        )
+
+    try:
+        from backend.services.forced_alignment import align_text_to_audio
+    except Exception as e:
+        return RungResult(
+            rung_name="rung_4_forced_alignment",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes=f"deps_unavailable:{type(e).__name__}",
+        )
+
+    try:
+        aln = align_text_to_audio(
+            audio_path,
+            start_ms / 1000.0,
+            end_ms / 1000.0,
+            neighbor,
+            language=ctx.language or "en",
+            device=str(getattr(_settings, "TACT_FORCED_ALIGN_DEVICE", "cpu")),
+            min_word_confidence=float(getattr(
+                _settings, "TACT_FORCED_ALIGN_MIN_WORD_CONFIDENCE", 0.6,
+            )),
+        )
+    except Exception as e:
+        return RungResult(
+            rung_name="rung_4_forced_alignment",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes=f"align_failed:{type(e).__name__}",
+        )
+
+    if not aln.words:
+        return RungResult(
+            rung_name="rung_4_forced_alignment",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes=f"no_alignment:{aln.reason}",
+        )
+
+    spans: list[LedgerSpan] = []
+    for s_sec, e_sec, word, conf in aln.words:
+        seg_start_ms = int(round(s_sec * 1000.0))
+        seg_end_ms = int(round(e_sec * 1000.0))
+        # Clamp to the original interval — alignment occasionally
+        # places a word slightly outside the slice bounds due to
+        # frame-to-time rounding.
+        seg_start_ms = max(seg_start_ms, start_ms)
+        seg_end_ms = min(seg_end_ms, end_ms)
+        if seg_end_ms <= seg_start_ms:
+            continue
+        spans.append(LedgerSpan(
+            start_ms=seg_start_ms,
+            end_ms=seg_end_ms,
+            status="covered_speech",
+            content=word,
+            content_type="word",
+            source_pass="rung_4_forced_alignment",
+            confidence=float(conf),
+        ))
+
+    avg_conf = sum(s.confidence for s in spans) / len(spans) if spans else 0.0
     return RungResult(
         rung_name="rung_4_forced_alignment",
-        notes="not_yet_implemented",
+        spans=spans,
+        elapsed_ms=int((time.monotonic() - started) * 1000),
+        confidence=avg_conf,
+        notes=f"aligned={len(spans)}",
     )
 
 
