@@ -16,6 +16,8 @@ from backend.services.reframe_segmenter import (
     EASE_SPEAKER_TURN_MS,
     WIDE_MASTER_X,
     ReframeSegment,
+    _resolve_slot_for_interval,
+    _slot_visible_in_interval,
     build_reframe_segments,
 )
 
@@ -441,3 +443,125 @@ class TestMinimumHoldEnforcement:
             assert dur >= MIN_HOLD_SECONDS - 0.01, (
                 f"Segment {seg.start:.2f}-{seg.end:.2f} ({dur:.2f}s) shorter than MIN_HOLD ({MIN_HOLD_SECONDS}s)"
             )
+
+
+# ── Off-screen-active-speaker visibility gate ────────────────────
+
+
+class TestOffscreenSpeakerVisibilityGate:
+    """The audio-attributed slot (transcript Priority 1, active-speaker
+    majority Priority 2) should NOT win when the dense face track shows
+    that slot has no face on camera in the interval. The fall-through
+    gives Priority 3/4 a chance to pick the visible speaker instead."""
+
+    def test_transcript_priority_skips_offscreen_speaker(self):
+        # Speaker 1 → slot 2 covers 100% of [0, 5], but dense_faces only
+        # contains slot 4 (the visible reaction shot). Expect the
+        # function to NOT return active_speaker_slot.
+        registry = _FaceRegistry(slots=[
+            _FaceSlot(slot_id=2, x_center=50.0),
+            _FaceSlot(slot_id=4, x_center=80.0),
+        ])
+        transcript = [_TranscriptSeg(start=0.0, end=5.0, speaker="Speaker 1")]
+        dense = _make_dense_frames(slot_id=4, x=80.0, start=0.0, end=5.0, step=0.25)
+        slot, conf, layout, source = _resolve_slot_for_interval(
+            start=0.0, end=5.0,
+            transcript_segments=transcript,
+            speaker_to_slot={"Speaker 1": 2},
+            active_speaker_events=[],
+            dense_faces=dense,
+            face_registry=registry,
+        )
+        # The audio-attributed slot 2 has no faces in the interval; the
+        # off-screen-speaker guard must drop it. Either Priority 3
+        # (dense dominance) picks slot 4, or we fall through to wide.
+        assert source != "active_speaker_slot", (
+            "transcript priority must not crown an off-camera speaker"
+        )
+
+    def test_transcript_priority_keeps_visible_speaker(self):
+        # Sanity: when the audio-attributed slot IS visible, behavior
+        # is unchanged (Priority 1 still fires).
+        registry = _FaceRegistry(slots=[
+            _FaceSlot(slot_id=2, x_center=50.0),
+        ])
+        transcript = [_TranscriptSeg(start=0.0, end=5.0, speaker="Speaker 1")]
+        dense = _make_dense_frames(slot_id=2, x=50.0, start=0.0, end=5.0, step=0.25)
+        slot, conf, layout, source = _resolve_slot_for_interval(
+            start=0.0, end=5.0,
+            transcript_segments=transcript,
+            speaker_to_slot={"Speaker 1": 2},
+            active_speaker_events=[],
+            dense_faces=dense,
+            face_registry=registry,
+        )
+        assert slot == 2
+        assert source == "active_speaker_slot"
+
+    def test_active_speaker_majority_skips_offscreen_speaker(self):
+        # No transcript path; active-speaker events say slot 0 is the
+        # majority but no slot-0 faces are visible. Don't crown slot 0.
+        registry = _FaceRegistry(slots=[
+            _FaceSlot(slot_id=0, x_center=20.0),
+            _FaceSlot(slot_id=1, x_center=80.0),
+        ])
+        as_events = [_SpeakerEvent(start=0.0, end=5.0, slot_id=0, confidence=0.9)]
+        dense = _make_dense_frames(slot_id=1, x=80.0, start=0.0, end=5.0, step=0.25)
+        slot, conf, layout, source = _resolve_slot_for_interval(
+            start=0.0, end=5.0,
+            transcript_segments=[],
+            speaker_to_slot={},
+            active_speaker_events=as_events,
+            dense_faces=dense,
+            face_registry=registry,
+        )
+        assert source != "active_speaker_slot"
+
+    def test_slot_visible_helper_threshold(self):
+        # ≥30% of frames must contain the slot to pass.
+        dense_30 = (
+            _make_dense_frames(slot_id=4, x=80.0, start=0.0, end=1.0, step=0.1)
+            + _make_dense_frames(slot_id=2, x=50.0, start=1.0, end=3.0, step=0.1)
+        )
+        # First 10/30 frames carry slot 4 → ratio 33%, just over.
+        assert _slot_visible_in_interval(4, 0.0, 3.0, dense_30)
+        # Slot 99 isn't in any frame.
+        assert not _slot_visible_in_interval(99, 0.0, 3.0, dense_30)
+        # No frames in the interval → False.
+        assert not _slot_visible_in_interval(4, 5.0, 6.0, dense_30)
+
+
+class TestPerFrameSlotVisibleRate:
+    """Fix 2: stricter per-segment visibility gate. The original
+    per_frame_in_crop_pass_rate accepts any tracked slot whose face
+    center sits inside the candidate crop, so a slot-3 face at x=68%
+    can spuriously satisfy a slot-2 9:16 crop. The new helper checks
+    the specific slot and rejects boundary leaks."""
+
+    def test_slot_strict_rejects_boundary_neighbor(self):
+        # Build a SubjectConfidenceEstimator with two slots: slot 2 at
+        # the center of the frame, slot 3 at the right edge. The dense
+        # face track only contains slot 3. A slot-2 visibility query
+        # must return 0.0 even though slot 3 is in frame.
+        from backend.services.subject_confidence import (
+            SubjectConfidenceEstimator,
+        )
+        registry = _FaceRegistry(slots=[
+            _FaceSlot(slot_id=2, x_center=50.0),
+            _FaceSlot(slot_id=3, x_center=68.0),
+        ])
+        dense = _make_dense_frames(slot_id=3, x=68.0, start=0.0, end=2.0, step=0.1)
+        est = SubjectConfidenceEstimator(
+            face_registry=registry,
+            dense_faces=dense,
+            active_speaker_events=[],
+            transcript_segments=[],
+            speaker_to_slot={},
+            source_width=1920, source_height=1080,
+        )
+        slot2_rate = est.per_frame_slot_visible_rate(0.0, 2.0, 2)
+        slot3_rate = est.per_frame_slot_visible_rate(0.0, 2.0, 3)
+        assert slot2_rate == 0.0, (
+            "slot-strict gate must NOT count adjacent slot 3 toward slot 2"
+        )
+        assert slot3_rate == 1.0

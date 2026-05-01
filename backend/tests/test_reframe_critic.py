@@ -183,3 +183,104 @@ class TestOscillationGuard:
         # At most one fix per window.
         keys = set((round(f.t_start, 3), round(f.t_end, 3)) for f in fixes)
         assert len(keys) == len(fixes)
+
+
+class TestSpeakerOffscreen:
+    """Layer 6: chosen-speaker visibility check.
+
+    The segmenter sets ``RenderOp.speaker_slot`` to the audio-attributed
+    slot. When that slot has no face on screen but other faces ARE
+    visible (panel cut to a reaction shot), the original critic missed
+    it — the largest-face lookup picked whoever was visible and reported
+    that as the subject. This class asserts the new check fires and the
+    repair branch either retargets to the visible speaker or falls back
+    to wide_master.
+    """
+
+    def _faces_only_slot(self, slot_id: int, nose_x: float, n: int = 11):
+        return [
+            _FrameFaces(
+                timestamp=i * 0.1,
+                faces=[_Face(
+                    nose_x=nose_x, nose_y=24.0, height=12.0,
+                    identity_id=slot_id,
+                )],
+            )
+            for i in range(n)
+        ]
+
+    def test_speaker_offscreen_triggers_wide(self):
+        """Op declares speaker_slot=0; only slot 4 is visible AND it
+        spans the frame so no single visible slot dominates well."""
+        # Two off-center faces in different slots — neither dominates
+        # ≥60% so the repair must fall back to wide_master.
+        dense: list = []
+        for i in range(11):
+            t = i * 0.1
+            dense.append(_FrameFaces(
+                timestamp=t,
+                faces=[
+                    _Face(nose_x=20.0, nose_y=24.0, height=12.0, identity_id=4),
+                    _Face(nose_x=80.0, nose_y=24.0, height=12.0, identity_id=5),
+                ],
+            ))
+        plan = _plan_with_op(RenderOp(
+            kind=RenderOpKind.CROP,
+            start_sec=0.0, end_sec=1.0,
+            primary_rect=Rect(x=0.22, y=0.10, w=0.56, h=0.80),
+            strategy_label="test",
+            speaker_slot=0,  # off-camera
+        ), duration=1.0)
+        scores = score_plan(plan, dense_faces=dense)
+        # speaker_offscreen flagged on the window covering [0, 1.0).
+        assert any("speaker_offscreen" in s.reasons for s in scores)
+        # Aggregate score is bounded by 3.0 on those windows.
+        offscreen = [s for s in scores if "speaker_offscreen" in s.reasons]
+        for s in offscreen:
+            assert s.score <= 3.0
+
+    def test_speaker_offscreen_retargets_when_one_visible_dominant(self):
+        """One visible slot dominates the window → repair retargets to it
+        instead of falling back to wide_master."""
+        dense = self._faces_only_slot(slot_id=4, nose_x=80.0)
+        plan = _plan_with_op(RenderOp(
+            kind=RenderOpKind.CROP,
+            start_sec=0.0, end_sec=1.0,
+            primary_rect=Rect(x=0.22, y=0.10, w=0.56, h=0.80),
+            strategy_label="test",
+            speaker_slot=2,  # off-camera
+        ), duration=1.0)
+        config = get_default_config()
+        scores = score_plan(plan, dense_faces=dense, config=config)
+        offscreen = [s for s in scores if "speaker_offscreen" in s.reasons]
+        assert offscreen, "speaker_offscreen must flag"
+        fix = attempt_window_fix(
+            offscreen[0], plan, dense_faces=dense, config=config,
+        )
+        assert fix is not None
+        assert fix.reason == "speaker_offscreen_retarget"
+        # Repair retargets to the visible slot (4) — not wide_master.
+        assert fix.new_op.kind == RenderOpKind.CROP
+        assert fix.new_op.speaker_slot == 4
+        # Crop center is near the visible face at x=0.80.
+        new_cx = fix.new_op.primary_rect.x + fix.new_op.primary_rect.w * 0.5
+        assert 0.70 <= new_cx <= 0.90
+
+    def test_speaker_visible_no_offscreen_flag(self):
+        """Sanity check: when the chosen slot IS on camera, the new
+        check stays silent — no false positives that would tank the
+        score on healthy single-talking-head segments."""
+        dense = self._faces_only_slot(slot_id=2, nose_x=50.0)
+        plan = _plan_with_op(RenderOp(
+            kind=RenderOpKind.CROP,
+            start_sec=0.0, end_sec=1.0,
+            primary_rect=Rect(x=0.22, y=0.10, w=0.56, h=0.80),
+            strategy_label="test",
+            speaker_slot=2,
+        ), duration=1.0)
+        scores = score_plan(plan, dense_faces=dense)
+        for s in scores:
+            assert "speaker_offscreen" not in s.reasons
+            # The metric is recorded at 0.0 when chosen slot is fully
+            # present.
+            assert s.metrics.get("chosen_invisible_frac", 0.0) == 0.0

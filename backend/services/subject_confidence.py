@@ -509,6 +509,40 @@ class SubjectConfidenceEstimator:
             f"(need {WEIGHTED_FACE_RATIO_THRESHOLD:.0%})"
         )
 
+    def per_frame_slot_visible_rate(
+        self,
+        seg_start: float,
+        seg_end: float,
+        slot_id: Optional[int],
+    ) -> float:
+        """Fraction of dense face frames in ``[seg_start, seg_end]`` that
+        contain at least one face whose ``identity_id`` matches ``slot_id``.
+
+        Stricter than :meth:`per_frame_in_crop_pass_rate`: that helper
+        accepts ANY tracked slot whose face center sits inside the
+        candidate crop, which lets adjacent boundary slots satisfy the
+        gate even when the chosen slot is entirely off-camera. This
+        helper resolves the off-screen-speaker class of bug by checking
+        the specific slot only.
+        """
+        if not self.dense_faces or slot_id is None:
+            return 0.0
+        n_frames = 0
+        n_pass = 0
+        for df in self.dense_faces:
+            ts = getattr(df, "timestamp", 0.0)
+            if ts < seg_start or ts > seg_end:
+                continue
+            n_frames += 1
+            for f in df.faces:
+                sid = getattr(f, "identity_id", -1)
+                if sid is not None and int(sid) == int(slot_id):
+                    n_pass += 1
+                    break
+        if n_frames == 0:
+            return 0.0
+        return n_pass / n_frames
+
     def per_frame_in_crop_pass_rate(
         self,
         seg_start: float,

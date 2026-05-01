@@ -727,11 +727,24 @@ def build_reframe_segments(
                 _zero_face_override = False
                 if conf < _CONF_MED and _confidence_estimator is not None:
                     try:
-                        _zero_face_pass_rate = (
-                            _confidence_estimator.per_frame_in_crop_pass_rate(
-                                seg.start, seg.end, fb_x_pct,
+                        # Prefer the slot-strict rate when an active_slot
+                        # is present: the looser per_frame_in_crop check
+                        # accepts any boundary slot whose face center
+                        # happens to fall inside the candidate crop, which
+                        # lets the guard sleep when the actual chosen
+                        # speaker is entirely off-camera.
+                        if seg.active_slot is not None:
+                            _zero_face_pass_rate = (
+                                _confidence_estimator.per_frame_slot_visible_rate(
+                                    seg.start, seg.end, seg.active_slot,
+                                )
                             )
-                        )
+                        else:
+                            _zero_face_pass_rate = (
+                                _confidence_estimator.per_frame_in_crop_pass_rate(
+                                    seg.start, seg.end, fb_x_pct,
+                                )
+                            )
                         if _zero_face_pass_rate < 0.10:
                             seg.strategy = "wide_master"
                             seg.layout = "wide_master"
@@ -2202,6 +2215,40 @@ def _check_speaker_overlap(
     return total_overlap
 
 
+def _slot_visible_in_interval(
+    slot_id: Optional[int],
+    start: float,
+    end: float,
+    dense_faces: list,
+    *,
+    min_frame_fraction: float = 0.30,
+) -> bool:
+    """True when ≥``min_frame_fraction`` of dense-face frames in
+    ``[start, end]`` contain at least one face whose identity_id matches
+    ``slot_id``. Used to gate audio-attributed slot picks: if the
+    audio-attributed speaker has no visible face in the interval, the
+    segmenter must NOT force a tight crop on the empty seat — it should
+    fall through to dense-face dominance / spread resolution.
+    """
+    if slot_id is None or not dense_faces:
+        return False
+    n_total = 0
+    n_with_slot = 0
+    for df in dense_faces:
+        ts = float(getattr(df, "timestamp", 0.0))
+        if ts < start or ts > end:
+            continue
+        n_total += 1
+        for f in getattr(df, "faces", []) or []:
+            sid = getattr(f, "identity_id", -1)
+            if sid is not None and int(sid) == int(slot_id):
+                n_with_slot += 1
+                break
+    if n_total == 0:
+        return False
+    return (n_with_slot / n_total) >= min_frame_fraction
+
+
 def _resolve_slot_for_interval(
     start: float,
     end: float,
@@ -2217,7 +2264,9 @@ def _resolve_slot_for_interval(
 
     Priority:
       1. Transcript-speaker override (>60% coverage, confidence > 0.6)
+         — gated on visible-slot evidence in dense_faces
       2. Active-speaker majority (mode > 50%)
+         — gated on visible-slot evidence in dense_faces
       3. Dense face dominance (one slot in 70%+ frames)
       4. Multi-face spread check — pick active speaker or split/blur
       5. Wide master fallback
@@ -2234,13 +2283,22 @@ def _resolve_slot_for_interval(
         slot, coverage = _transcript_slot_coverage(
             start, end, transcript_segments, speaker_to_slot)
         if slot is not None and coverage >= SPEAKER_COVERAGE_THRESHOLD:
-            return slot, min(1.0, coverage), "single", "active_speaker_slot"
+            # Off-screen-speaker guard: only honor the audio-attributed
+            # slot when the dense face track confirms that slot is
+            # actually visible in this interval. Reaction-shot edits and
+            # B-roll cuts away from the talking head are common in panel
+            # shows; forcing a tight crop on the empty seat is wrong.
+            if _slot_visible_in_interval(slot, start, end, dense_faces):
+                return slot, min(1.0, coverage), "single", "active_speaker_slot"
+            # else: fall through to visible-face priorities below.
 
     # Priority 2: Active-speaker majority
     if active_speaker_events:
         slot, coverage = _active_speaker_majority(start, end, active_speaker_events)
         if slot is not None and coverage >= 0.5:
-            return slot, min(1.0, coverage), "single", "active_speaker_slot"
+            if _slot_visible_in_interval(slot, start, end, dense_faces):
+                return slot, min(1.0, coverage), "single", "active_speaker_slot"
+            # else: fall through.
 
     # Priority 3: Dense face dominance
     if dense_faces and face_registry:

@@ -91,6 +91,43 @@ def _face_at(dense_faces: list, t: float, window: float = 0.15) -> Optional[obje
     return best
 
 
+def _slot_face_at(
+    dense_faces: list,
+    t: float,
+    slot_id: Optional[int],
+    window: float = 0.15,
+) -> Optional[object]:
+    """Largest face whose ``identity_id == slot_id`` at the nearest
+    dense-face frame within ``window``. Returns None when ``slot_id`` is
+    None or when that slot has no face in the search window.
+
+    Companion to :func:`_face_at`: the unrestricted lookup picks the
+    largest face regardless of identity, which silently switches
+    reference points across reaction-shot cuts in panel content. The
+    critic uses this helper to detect "segmenter chose slot X but slot
+    X is not visible" — the off-screen-active-speaker class of bug.
+    """
+    if slot_id is None:
+        return None
+    best = None
+    best_dt = window
+    for df in dense_faces or []:
+        if not df.faces:
+            continue
+        dt = abs(getattr(df, "timestamp", 0.0) - t)
+        if dt > best_dt:
+            continue
+        candidates = [
+            f for f in df.faces
+            if int(getattr(f, "identity_id", -1)) == int(slot_id)
+            and getattr(f, "is_human", True)
+        ]
+        if candidates:
+            best = max(candidates, key=lambda f: f.width * f.height)
+            best_dt = dt
+    return best
+
+
 # ── Scoring ───────────────────────────────────────────────────────
 
 
@@ -159,6 +196,14 @@ def _score_window(
     chin_clip_frames = 0
     side_clip_bad = 0
     n_scored = 0
+    # Layer 6 (speaker_offscreen): count samples where the segmenter
+    # picked a specific speaker_slot but that slot has no face in the
+    # dense track at this timestamp, while some other face IS visible.
+    # This is the "we cropped to the empty seat" failure mode — the
+    # generic _face_at lookup hides it because it picks whatever face
+    # happens to be largest, even if it's a different speaker.
+    chosen_slot_invisible_frames = 0
+    chosen_slot_present_frames = 0
 
     for i in range(n_steps + 1):
         t = t0 + i * step
@@ -169,6 +214,17 @@ def _score_window(
         if rect is None:
             continue
         face = _face_at(dense_faces, t)
+        # Layer 6: chosen-speaker visibility, evaluated whenever the op
+        # has a speaker_slot set, regardless of whether ANY face was
+        # found by _face_at. Tracks invisible-vs-present for the slot
+        # the segmenter intended to frame.
+        chosen_slot = getattr(op, "speaker_slot", None)
+        if chosen_slot is not None:
+            slot_face = _slot_face_at(dense_faces, t, chosen_slot)
+            if slot_face is None and face is not None:
+                chosen_slot_invisible_frames += 1
+            elif slot_face is not None:
+                chosen_slot_present_frames += 1
         if face is None:
             continue
         n_scored += 1
@@ -297,6 +353,19 @@ def _score_window(
     if n_scored == 0:
         score = 2.0
         reasons.append("subject_missing")
+
+    # Layer 6: chosen-speaker visibility. Acts only when the op declared
+    # a speaker_slot AND at least one sample resolved a face — otherwise
+    # subject_missing already covers the case. A high invisible fraction
+    # means the segmenter targeted a slot that is not on camera while
+    # the panel cut to a reaction shot.
+    chosen_total = chosen_slot_invisible_frames + chosen_slot_present_frames
+    if chosen_total >= 3:
+        chosen_invisible_frac = chosen_slot_invisible_frames / chosen_total
+        metrics["chosen_invisible_frac"] = round(chosen_invisible_frac, 2)
+        if chosen_invisible_frac > 0.50:
+            score = min(score, 3.0)
+            reasons.append("speaker_offscreen")
 
     # Layer 1: saliency-in-crop summary + flag. Only acts when we
     # actually saw saliency data for ≥3 sample frames in the window
@@ -438,6 +507,68 @@ def attempt_window_fix(
         return WindowFix(
             t_start=score.t_start, t_end=score.t_end,
             reason="head_clip_shift", new_op=new_op,
+        )
+
+    if "speaker_offscreen" in score.reasons:
+        # The segmenter's chosen speaker is not on camera during this
+        # window. Two reasonable repairs in priority order:
+        #   1. If a single visible slot dominates ≥60% of the window,
+        #      retarget the crop onto that visible speaker (matches the
+        #      "panel cut to reaction shot" editorial intent).
+        #   2. Otherwise, wide_master so the audience at least sees
+        #      whoever happens to be on camera.
+        from collections import Counter
+        visible_faces: list = []
+        t = score.t_start
+        while t < score.t_end:
+            f = _face_at(dense_faces, t)
+            if f is not None:
+                visible_faces.append(f)
+            t += 0.1
+        slot_counts: Counter = Counter()
+        for f in visible_faces:
+            sid = int(getattr(f, "identity_id", -1))
+            if sid >= 0:
+                slot_counts[sid] += 1
+        total = sum(slot_counts.values())
+        dominant = slot_counts.most_common(1)[0] if slot_counts else None
+        if dominant and total > 0 and dominant[1] / total >= 0.60:
+            dominant_slot, _ = dominant
+            new_slot_faces = [
+                f for f in visible_faces
+                if int(getattr(f, "identity_id", -1)) == dominant_slot
+            ]
+            mean_x = sum(
+                float(f.nose_x) / 100.0 for f in new_slot_faces
+            ) / len(new_slot_faces)
+            new_x = max(0.0, min(
+                1.0 - op.primary_rect.w,
+                mean_x - op.primary_rect.w * 0.5,
+            ))
+            new_rect = Rect(
+                x=new_x, y=op.primary_rect.y,
+                w=op.primary_rect.w, h=op.primary_rect.h,
+            )
+            new_op = _clone_op(
+                op, start=score.t_start, end=score.t_end,
+                rect=new_rect,
+                reason="critic:speaker_offscreen_retarget",
+            )
+            new_op.motion_path = None
+            new_op.speaker_slot = dominant_slot
+            return WindowFix(
+                t_start=score.t_start, t_end=score.t_end,
+                reason="speaker_offscreen_retarget", new_op=new_op,
+            )
+        new_op = RenderOp(
+            kind=RenderOpKind.WIDE_MASTER,
+            start_sec=score.t_start, end_sec=score.t_end,
+            primary_rect=Rect(x=0.0, y=0.0, w=1.0, h=1.0),
+            strategy_label="critic:speaker_offscreen:wide",
+        )
+        return WindowFix(
+            t_start=score.t_start, t_end=score.t_end,
+            reason="speaker_offscreen_wide", new_op=new_op,
         )
 
     if "subject_missing" in score.reasons:
