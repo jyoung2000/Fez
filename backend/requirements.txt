@@ -47,3 +47,24 @@ onnxruntime>=1.17.0
 # production pipeline — only invoked on demand by the diagnostics
 # router.
 pytest>=8.0.0
+
+# ── TACT optional dependencies ──
+# All three are CAPABILITY deps — listed here so a Dockerfile build
+# can install them, but never imported by the production pipeline
+# unless the matching feature flag is True.
+#
+# TACT Phase 2 Rung 5: non-speech event classifier (PANNs CNN14).
+# panns_inference is pure-torch (no TF / torch CUDA conflict). Loaded
+# only when TACT_LADDER_RUNG_5_ENABLED=True. ~80 MB checkpoint
+# downloaded on first use; vendor it into the Docker image to keep
+# runtime offline-capable.
+panns_inference>=0.1.1; python_version >= "3.8"
+# TACT Phase 4 (opt-in via TACT_CONSENSUS_ENABLED): Parakeet via NeMo.
+# Heavyweight (~1 GB+ install). Only imported inside
+# parakeet_worker.py — never in the parent process. Tested by
+# backend/tests/test_parakeet_transcriber.py::test_consensus_disabled_no_import.
+nemo_toolkit[asr]>=2.0.0; python_version >= "3.10"
+# TACT Phase 5 (opt-in via TACT_TRANSLATION_CONSENSUS_ENABLED):
+# LaBSE multilingual sentence embeddings for semantic translation
+# reconciliation. CPU-only by default; doesn't compete for GPU VRAM.
+sentence-transformers>=3.0.0; python_version >= "3.9"

@@ -324,8 +324,95 @@ def _rung_alt_whisper_checkpoint(
 def _rung_consensus_model(
     audio_path: str, start_ms: int, end_ms: int, ctx: EscalationContext,
 ) -> RungResult:
-    # Phase 4: Parakeet consensus pass. Returns empty until then.
-    return RungResult(rung_name="rung_3_consensus_model", notes="phase_4_stub")
+    """Phase 4 — independent-architecture consensus.
+
+    Slices the gap audio, runs Parakeet (NeMo) via subprocess, returns
+    Parakeet's segments as ledger spans. Skips when consensus is
+    disabled or VRAM is insufficient (gate decision is structured so
+    declining is logged as info, not warning).
+
+    This rung doesn't itself reconcile against the primary pass —
+    that's the pipeline's job, before the ladder runs. Inside the
+    ladder, Rung 3 just answers "did Parakeet hear something here?".
+    """
+    started = time.monotonic()
+    if end_ms <= start_ms:
+        return RungResult(rung_name="rung_3_consensus_model")
+
+    try:
+        from backend.services.parakeet_transcriber import (
+            _can_run_consensus,
+            transcribe_with_parakeet_subprocess_sync,
+        )
+        from backend.services.transcription_gap_filler import (
+            _extract_audio_slice,
+        )
+    except Exception as e:
+        return RungResult(
+            rung_name="rung_3_consensus_model",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes=f"deps_unavailable: {type(e).__name__}",
+        )
+
+    gate = _can_run_consensus()
+    if not gate.allowed:
+        return RungResult(
+            rung_name="rung_3_consensus_model",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes=f"declined:{gate.reason}",
+        )
+
+    import os
+    import tempfile
+    start_sec = start_ms / 1000.0
+    end_sec = end_ms / 1000.0
+    with tempfile.NamedTemporaryFile(
+        suffix=".wav", delete=False, dir=tempfile.gettempdir(),
+    ) as tmp:
+        slice_path = tmp.name
+    try:
+        if not _extract_audio_slice(audio_path, start_sec, end_sec, slice_path):
+            return RungResult(
+                rung_name="rung_3_consensus_model",
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                notes="slice_failed",
+            )
+        timeout = min(ctx.per_interval_timeout_sec, max(60.0, (end_sec - start_sec) * 6.0))
+        segs = transcribe_with_parakeet_subprocess_sync(
+            slice_path, language=ctx.language, timeout_sec=timeout,
+        )
+        spans: list[LedgerSpan] = []
+        for s in segs or []:
+            text = (s.text or "").strip()
+            if not text:
+                continue
+            seg_start_ms = int(round((s.start + start_sec) * 1000.0))
+            seg_end_ms = int(round((s.end + start_sec) * 1000.0))
+            if seg_end_ms <= seg_start_ms:
+                continue
+            confidence = float(s.confidence) if s.confidence is not None else 0.7
+            spans.append(LedgerSpan(
+                start_ms=seg_start_ms,
+                end_ms=seg_end_ms,
+                status="covered_speech",
+                content=text,
+                content_type="phrase",
+                source_pass="rung_3_consensus_model",
+                confidence=confidence,
+            ))
+        return RungResult(
+            rung_name="rung_3_consensus_model",
+            spans=spans,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            confidence=(sum(sp.confidence for sp in spans) / len(spans))
+                       if spans else 0.0,
+            notes="filled" if spans else "empty",
+        )
+    finally:
+        try:
+            os.unlink(slice_path)
+        except OSError:
+            pass
 
 
 def _rung_forced_alignment(
