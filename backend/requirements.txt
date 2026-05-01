@@ -49,22 +49,34 @@ onnxruntime>=1.17.0
 pytest>=8.0.0
 
 # ── TACT optional dependencies ──
-# All three are CAPABILITY deps — listed here so a Dockerfile build
-# can install them, but never imported by the production pipeline
-# unless the matching feature flag is True.
+# All three are CAPABILITY deps. They are COMMENTED OUT BY DEFAULT
+# because their transitive closure (especially NeMo) pulls in ~1.5 GB
+# of CUDA-13 NVIDIA wheels that conflict with this image's pinned
+# CUDA 12 stack and exhaust /tmp during the Docker build.
 #
-# TACT Phase 2 Rung 5: non-speech event classifier (PANNs CNN14).
-# panns_inference is pure-torch (no TF / torch CUDA conflict). Loaded
-# only when TACT_LADDER_RUNG_5_ENABLED=True. ~80 MB checkpoint
-# downloaded on first use; vendor it into the Docker image to keep
-# runtime offline-capable.
-panns_inference>=0.1.1; python_version >= "3.8"
-# TACT Phase 4 (opt-in via TACT_CONSENSUS_ENABLED): Parakeet via NeMo.
-# Heavyweight (~1 GB+ install). Only imported inside
-# parakeet_worker.py — never in the parent process. Tested by
-# backend/tests/test_parakeet_transcriber.py::test_consensus_disabled_no_import.
-nemo_toolkit[asr]>=2.0.0; python_version >= "3.10"
-# TACT Phase 5 (opt-in via TACT_TRANSLATION_CONSENSUS_ENABLED):
-# LaBSE multilingual sentence embeddings for semantic translation
-# reconciliation. CPU-only by default; doesn't compete for GPU VRAM.
-sentence-transformers>=3.0.0; python_version >= "3.9"
+# Production code imports each of these LAZILY inside the rung that
+# uses it, and degrades gracefully when the package isn't installed:
+#   * Rung 5 (non_speech_events.py) returns label="other" → falls
+#     through to Rung 6.
+#   * Consensus pass (parakeet_transcriber.py) declines the
+#     gate with reason="vram_probe_unavailable".
+#   * Translation track (translation_track.py) skips semantic
+#     reconciliation and picks the highest-confidence candidate.
+#
+# To enable any of them, uncomment the corresponding line and rebuild.
+# Vendor model checkpoints into the image build step rather than
+# downloading at first run.
+#
+# TACT Phase 2 Rung 5 — PANNs CNN14 event classifier (~80 MB).
+# Pure-torch, no CUDA conflict. Safe to enable on existing image.
+# panns_inference>=0.1.1
+#
+# TACT Phase 4 — Parakeet TDT consensus via NeMo (~1.5 GB transitive).
+# Pulls torch>=2.11 + nvidia-*-cu13 wheels. Need a separate Dockerfile
+# variant or a larger build context to install. DO NOT enable without
+# rebuilding the GPU image with cu13 base.
+# nemo_toolkit[asr]>=2.0.0
+#
+# TACT Phase 5 consensus — LaBSE multilingual embeddings (~500 MB).
+# CPU-only. Pulls transformers but compatible with current image.
+# sentence-transformers>=3.0.0
