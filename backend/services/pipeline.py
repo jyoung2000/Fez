@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import json
 import os
@@ -2598,14 +2599,282 @@ async def _run_analysis_inner(job_id: str):
                     settings.WHISPER_BEAM_SIZE = original_beam
                     settings.GPU_ACCELERATION_ENABLED = original_gpu
 
-        # ── Phase 2 coverage booster: gap-fill recall pass ──
-        # Compare transcript coverage against an independent webrtcvad
-        # speech-presence mask. For any window >2s where VAD says speech
-        # is present but Whisper returned nothing, re-run Whisper on that
-        # slice with recall-first parameters. Additive only — never
-        # removes or mutates existing segments.
-        if (getattr(settings, "WHISPER_GAP_FILL_ENABLED", True)
+        # ── TACT Phases 2-5: Coverage ladder + reconciliation + translation ──
+        # Replaces the legacy gap-fill + Phase 1 post-hoc ledger blocks.
+        # The ledger is the source of truth: bootstrap from the
+        # post-Whisper segments + quarantined segments, optionally run
+        # disjoint-offset and consensus passes and reconcile, run the
+        # ladder against (uncovered ∪ quarantined), persist the report.
+        #
+        # When TACT_LADDER_ENABLED=False, the elif at the bottom of
+        # this block runs the legacy gap-fill path verbatim — this is
+        # the byte-identical-with-flags-off contract.
+        if (getattr(settings, "TACT_LADDER_ENABLED", True)
                 and result and audio_duration > 30):
+            try:
+                from backend.services.transcription_ledger import (
+                    CoverageLedger,
+                )
+                from backend.services.escalation_ladder import (
+                    EscalationContext, escalate_uncovered_intervals_sync,
+                )
+                from backend.services.transcription import (
+                    get_last_quarantined_segments,
+                    transcribe_audio_subprocess,
+                )
+                from backend.services.transcription_reconciler import (
+                    get_last_reconciliation_stats, reconcile_n_passes,
+                )
+                from backend.services.active_speaker import build_vad_presence
+
+                # Collect passes for reconciliation. Primary always
+                # present. Offset and consensus are conditional.
+                passes = [("primary", list(result))]
+                chunk_grid_offsets: dict[str, float] = {"primary": 0.0}
+
+                # ── Phase 3: Disjoint-offset second pass ──
+                if (getattr(settings, "TACT_DISJOINT_OFFSET_ENABLED", True)
+                        and audio_duration > 60):
+                    try:
+                        offset_sec = float(getattr(
+                            settings, "TACT_DISJOINT_OFFSET_SEC", 15.0,
+                        ))
+                        await _update_branch_progress(
+                            "transcription", 90, JobStatus.TRANSCRIBING,
+                            f"Running phase-shifted second pass "
+                            f"(+{offset_sec}s offset)...",
+                        )
+                        offset_result = await transcribe_audio_subprocess(
+                            audio_path, language=job.language,
+                            task=whisper_task,
+                            initial_prompt=initial_prompt,
+                            audio_duration=audio_duration,
+                            progress_callback=None,
+                            is_animated=_early_anime_hint,
+                            cancel_check=cancel_check,
+                            offset_sec=offset_sec,
+                        )
+                        passes.append(
+                            (f"offset_{int(offset_sec)}s", list(offset_result)),
+                        )
+                        chunk_grid_offsets[f"offset_{int(offset_sec)}s"] = offset_sec
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] offset pass failed (%s) — primary only",
+                            job_id, e,
+                        )
+
+                # ── Phase 4: Independent-architecture consensus pass ──
+                if getattr(settings, "TACT_CONSENSUS_ENABLED", False):
+                    try:
+                        from backend.services.parakeet_transcriber import (
+                            can_run_consensus,
+                            transcribe_with_parakeet_subprocess,
+                        )
+                        gate = can_run_consensus()
+                        if gate.allowed:
+                            await _update_branch_progress(
+                                "transcription", 92, JobStatus.TRANSCRIBING,
+                                "Running independent-architecture consensus "
+                                "pass (Parakeet)...",
+                            )
+                            parakeet_result = await transcribe_with_parakeet_subprocess(
+                                audio_path,
+                                language=job.language or "",
+                                cancel_check=cancel_check,
+                            )
+                            passes.append(("parakeet", list(parakeet_result)))
+                            # Parakeet's TDT decoder doesn't have a fixed
+                            # 30 s chunk grid, so distance-to-boundary
+                            # tiebreaks favour it appropriately.
+                            chunk_grid_offsets["parakeet"] = 0.0
+                        else:
+                            logger.info(
+                                "[%s] consensus pass declined: %s",
+                                job_id, gate.reason,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] consensus pass failed (%s)", job_id, e,
+                        )
+
+                # ── Reconcile ──
+                if len(passes) >= 2:
+                    reconciled, _recon_stats = reconcile_n_passes(
+                        passes,
+                        chunk_grid_offsets=chunk_grid_offsets,
+                        align_tolerance_sec=float(getattr(
+                            settings, "TACT_RECONCILE_ALIGN_TOLERANCE_SEC", 0.2,
+                        )),
+                    )
+                    logger.info(
+                        "[%s] reconciliation: passes=%s words=%d "
+                        "agreed=%d disagreed=%d single=%d contested=%d",
+                        job_id, [n for n, _ in passes],
+                        _recon_stats.total_words, _recon_stats.agreed,
+                        _recon_stats.disagreed, _recon_stats.single_source,
+                        _recon_stats.contested,
+                    )
+                    result = reconciled
+
+                # ── Build the ledger ──
+                await _update_branch_progress(
+                    "transcription", 95, JobStatus.TRANSCRIBING,
+                    "Building coverage ledger and escalating uncovered audio...",
+                )
+                bin_ms = int(getattr(settings, "TACT_LEDGER_BIN_MS", 20))
+                ledger = CoverageLedger(
+                    int(audio_duration * 1000), bin_ms=bin_ms,
+                )
+                ledger.from_segments(list(result), source_pass="whisper_main")
+                if getattr(settings, "TACT_QUARANTINE_HALLUCINATIONS", True):
+                    quarantined = get_last_quarantined_segments()
+                    if quarantined:
+                        ledger.from_segments(
+                            quarantined,
+                            source_pass="quarantined_hallucinations",
+                            status="quarantined",
+                            flag_key="quarantine_reason",
+                        )
+
+                try:
+                    vad_intervals = build_vad_presence(audio_path) or []
+                except Exception:
+                    vad_intervals = []
+
+                ctx = EscalationContext(
+                    audio_path=audio_path,
+                    audio_duration_ms=int(audio_duration * 1000),
+                    language=(job.language or "en"),
+                    task=whisper_task,
+                    initial_prompt=initial_prompt,
+                    is_animated=_early_anime_hint,
+                    neighbor_text_before="",
+                    neighbor_text_after="",
+                    vad_intervals=vad_intervals,
+                    event_priors=None,
+                    budget_ms_remaining=int(
+                        float(getattr(
+                            settings, "TACT_LADDER_MAX_AUDIO_SEC", 600.0,
+                        )) * 1000,
+                    ),
+                    per_interval_timeout_sec=float(getattr(
+                        settings, "TACT_LADDER_PER_INTERVAL_TIMEOUT_SEC", 30.0,
+                    )),
+                )
+
+                _loop = asyncio.get_event_loop()
+                stats = await _loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        escalate_uncovered_intervals_sync, ledger, ctx,
+                        max_audio_sec=float(getattr(
+                            settings, "TACT_LADDER_MAX_AUDIO_SEC", 600.0,
+                        )),
+                    ),
+                )
+
+                # Coverage invariant. Rung 6 should make this impossible
+                # to fire; explicit check makes a regression loud, not
+                # silent.
+                uncovered_after = ledger.query({"uncovered"})
+                if uncovered_after:
+                    logger.error(
+                        "[%s] TACT coverage invariant violated: %d "
+                        "uncovered intervals after ladder (rung_6 "
+                        "should have caught these)",
+                        job_id, len(uncovered_after),
+                    )
+
+                result = ledger.to_segments()
+                coverage_report = ledger.to_report_dict()
+                coverage_report["voiced_coverage_ratio"] = round(
+                    ledger.voiced_coverage_ratio(vad_intervals), 4,
+                )
+                coverage_report["ladder_stats"] = stats.as_dict()
+                _recon = get_last_reconciliation_stats()
+                if _recon is not None:
+                    coverage_report["reconciliation"] = _recon.as_dict()
+
+                # ── Phase 5: Translation track ──
+                if (whisper_task == "translate"
+                        or getattr(settings, "TACT_TRANSLATION_TRACK_ENABLED", False)):
+                    try:
+                        from backend.services.translation_track import (
+                            run_translation_track,
+                        )
+                        target_lang = (
+                            getattr(job, "target_language", None)
+                            or getattr(job, "subtitle_language", "")
+                            or "en"
+                        )
+                        translation_ledger, _t_stats = await _loop.run_in_executor(
+                            None,
+                            functools.partial(
+                                run_translation_track, ledger,
+                                target_language=target_lang,
+                                backend=str(getattr(
+                                    settings, "TACT_TRANSLATION_BACKEND",
+                                    "whisper_passthrough",
+                                )),
+                            ),
+                        )
+                        coverage_report = ledger.to_paired_report_dict(
+                            translation_ledger,
+                        )
+                        coverage_report["ladder_stats"] = stats.as_dict()
+                        if _recon is not None:
+                            coverage_report["reconciliation"] = _recon.as_dict()
+                        coverage_report["translation_stats"] = _t_stats.as_dict()
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] translation track failed (%s) — "
+                            "source-only report", job_id, e,
+                        )
+
+                await database.update_job_status(
+                    job_id, coverage_report=coverage_report,
+                )
+                logger.info(
+                    "[%s] coverage_ledger: ratio=%.3f voiced=%.3f "
+                    "uncovered=%.3f spans=%d ladder=%s",
+                    job_id,
+                    coverage_report.get("coverage_ratio")
+                    or coverage_report.get("source", {}).get("coverage_ratio", 0.0),
+                    coverage_report.get("voiced_coverage_ratio") or 0.0,
+                    coverage_report.get("uncovered_ratio")
+                    or coverage_report.get("source", {}).get("uncovered_ratio", 0.0),
+                    coverage_report.get("span_count")
+                    or coverage_report.get("source", {}).get("span_count", 0),
+                    stats.as_dict(),
+                )
+            except Exception as e:
+                logger.warning(
+                    "[%s] TACT ladder failed (%s) — falling back to "
+                    "legacy gap-fill", job_id, e,
+                )
+                if (getattr(settings, "WHISPER_GAP_FILL_ENABLED", True)
+                        and result):
+                    try:
+                        from backend.services.transcription_gap_filler import (
+                            fill_transcript_gaps,
+                        )
+                        result_list, _gap_stats = await fill_transcript_gaps(
+                            audio_path, list(result), audio_duration,
+                            language=job.language, task=whisper_task,
+                            is_animated=_early_anime_hint,
+                            initial_prompt=initial_prompt,
+                        )
+                        result = result_list
+                    except Exception as e2:
+                        logger.warning(
+                            "[%s] legacy gap-fill also failed (%s)",
+                            job_id, e2,
+                        )
+        elif (getattr(settings, "WHISPER_GAP_FILL_ENABLED", True)
+                and result and audio_duration > 30):
+            # TACT ladder disabled by config — preserve legacy gap-fill
+            # path exactly as it was. Byte-identical-with-flags-off.
             try:
                 from backend.services.transcription_gap_filler import (
                     fill_transcript_gaps,
@@ -2644,63 +2913,6 @@ async def _run_analysis_inner(job_id: str):
                 logger.warning(
                     "[%s] gap-fill pass failed (%s) — continuing with main transcript",
                     job_id, e,
-                )
-
-        # ── TACT Phase 1: Temporal Coverage Ledger ──
-        # Bootstrap a CoverageLedger from the post-gap-fill segment list
-        # and persist a coverage_report dict on the job. Pure
-        # observability — does not modify ``result``. Bounded by a
-        # try/except so any ledger failure logs and proceeds.
-        if (getattr(settings, "TACT_LEDGER_ENABLED", True)
-                and result and audio_duration > 0):
-            try:
-                from backend.services.transcription_ledger import (
-                    CoverageLedger,
-                )
-                ledger = CoverageLedger(
-                    int(audio_duration * 1000),
-                    bin_ms=int(getattr(settings, "TACT_LEDGER_BIN_MS", 20)),
-                )
-                ledger.from_segments(
-                    list(result),
-                    source_pass="whisper_main+gap_fill",
-                )
-                coverage_report = ledger.to_report_dict()
-                # Cross-check against the gap-filler's voiced-coverage
-                # number when VAD is available — same primitive that
-                # transcription_gap_filler uses, just routed through
-                # the ledger so the two numbers are guaranteed
-                # consistent in Phase 1.
-                try:
-                    from backend.services.active_speaker import (
-                        build_vad_presence,
-                    )
-                    vad_intervals = build_vad_presence(audio_path) or []
-                    coverage_report["voiced_coverage_ratio"] = round(
-                        ledger.voiced_coverage_ratio(vad_intervals), 4,
-                    )
-                except Exception as _vad_e:
-                    logger.debug(
-                        "[%s] ledger: voiced-coverage cross-check skipped "
-                        "(%s)", job_id, _vad_e,
-                    )
-                await database.update_job_status(
-                    job_id, coverage_report=coverage_report,
-                )
-                logger.info(
-                    "[%s] coverage_ledger: ratio=%.3f voiced=%s "
-                    "uncovered=%.3f spans=%d source=%s",
-                    job_id,
-                    coverage_report["coverage_ratio"],
-                    coverage_report.get("voiced_coverage_ratio"),
-                    coverage_report["uncovered_ratio"],
-                    coverage_report["span_count"],
-                    coverage_report["source_pass_ms"],
-                )
-            except Exception as e:
-                logger.warning(
-                    "[%s] coverage_ledger emission failed (%s) — "
-                    "continuing", job_id, e,
                 )
 
         await database.update_job_status(job_id, transcript=list(result))

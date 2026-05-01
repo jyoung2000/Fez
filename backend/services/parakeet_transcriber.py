@@ -42,6 +42,16 @@ class ConsensusGateResult:
     free_vram_mb: int = 0
 
 
+def can_run_consensus(*, override_min_vram_mb: Optional[int] = None) -> ConsensusGateResult:
+    """Public alias for ``_can_run_consensus``.
+
+    The pipeline imports this name; the underscore-prefixed version is
+    kept for backwards compatibility with code already inside this
+    module.
+    """
+    return _can_run_consensus(override_min_vram_mb=override_min_vram_mb)
+
+
 def _can_run_consensus(*, override_min_vram_mb: Optional[int] = None) -> ConsensusGateResult:
     """Decide whether Parakeet may run for this job.
 
