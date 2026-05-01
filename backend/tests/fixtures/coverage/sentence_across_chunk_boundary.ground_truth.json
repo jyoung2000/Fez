@@ -1,0 +1,6 @@
+{
+  "duration_sec": 35.0,
+  "min_overall_coverage_ratio": 1.0,
+  "expected_event_tags": [],
+  "notes": "35 s synthetic waveform with a louder section spanning the 30 s chunk boundary. Real audio would test disjoint-offset reconciliation; synthetic input only exercises the coverage invariant + ledger structure."
+}

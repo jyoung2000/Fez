@@ -512,3 +512,126 @@ of these (3 + 4 + 5 + 6).
 After the seven commits, push and add a "Pipeline wire-up complete"
 section to this notes file with commit SHAs and the smoke-test
 result placeholder for the user to fill.
+
+---
+
+## Pipeline wire-up complete
+
+| # | Item | Commit |
+|---|------|--------|
+| 0 | Wire-up plan | `3e2fde6` |
+| 1a | Rung 2 — alt-checkpoint Whisper | `3d27ec6` |
+| 1b | Rung 4 — wav2vec2 forced alignment | `0cd89da` |
+| 1c | Rung 5 — PANNs event classifier | `2088bd6` |
+| 2 | Per-interval neighbor text + reconciler stats accessor | `cfc6901` |
+| 3-6 | Pipeline.py rewire (ladder + offset + consensus + translation) | `ff4979f` |
+| 7 | Fixture pack + `test_tact_integration.py` | (this commit) |
+
+**Test count after wire-up:** 156 TACT-related tests passing.
+
+### Real-video smoke test (homelab acceptance step)
+
+The §4 single acceptance criterion ("on a real video,
+`coverage_report["coverage_ratio"] == 1.0`") cannot be verified in
+the dev container — no GPU, no Whisper model, no real audio.
+Instead, the homelab runs:
+
+```bash
+python -m backend.cli transcribe --input some_30min_video.mp4 \
+    --job-id smoke_test
+python -c "
+import json
+from pathlib import Path
+job = json.loads(Path('jobs/smoke_test/job.json').read_text())
+cr = job['coverage_report']
+src = cr.get('source', cr)  # paired-report shape vs single-ledger shape
+total_ms = sum(src['status_distribution_ms'].values())
+print('coverage_ratio:', src['coverage_ratio'])
+print('voiced_coverage_ratio:', cr.get('voiced_coverage_ratio'))
+print('total_ms:', total_ms,
+      'audio_duration_ms:', src['audio_duration_ms'])
+print('ladder_stats:', cr.get('ladder_stats'))
+assert src['coverage_ratio'] == 1.0, 'coverage invariant violated'
+"
+```
+
+Expected output structure:
+
+```
+coverage_ratio: 1.0
+voiced_coverage_ratio: <typically 0.95+>
+total_ms: <equals audio_duration_ms exactly>
+ladder_stats: {
+  'intervals_total': N,
+  'intervals_resolved': N,
+  'rung_resolutions': {'rung_1_relaxed_whisper': K1, 'rung_5_event_classifier': K5, ...},
+  ...
+}
+```
+
+If the assertion fires, look at `ladder_stats["intervals_resolved"]`
+vs `intervals_total`. The most common cause is the orchestrator
+skipping a catch-all interval — fix in the orchestrator (Item 2),
+not the rungs.
+
+### Deviations from the wire-up prompt
+
+1. **Reconciler `boundary_window_sec` kwarg.** The prompt's example
+   pipeline code passes `boundary_window_sec` to `reconcile_passes`,
+   but the actual reconciler signature doesn't take that kwarg.
+   Skipped from the pipeline call site rather than adding a no-op
+   parameter. The reconciler's existing distance-to-boundary logic
+   already does what `boundary_window_sec` was meant to gate.
+
+2. **`JobResult.target_language` added; existing
+   `subtitle_language` preserved.** The pipeline reads
+   `target_language` first, then falls back to `subtitle_language`,
+   then to `"en"`. This avoids breaking existing job.json files
+   that only have `subtitle_language`.
+
+3. **Quarantine recovery requires a higher rung than Rung 6.**
+   The integration test
+   (`test_quarantined_segments_re_presented_to_ladder`) uses a
+   stub "replacer" rung at confidence 0.7 to demonstrate proper
+   quarantine recovery. Rung 6's confidence=0.0 cannot supersede a
+   typical quarantined claim (Whisper hallucinations carry
+   non-trivial avg_logprob). In production, Rung 5 (PANNs event
+   classifier) is the rung that actually replaces music/applause-
+   region quarantined hallucinations with correct event tags.
+
+### Follow-up work that surfaced during implementation
+
+1. **PANNs CNN14 vendoring in Dockerfile.gpu** — the rung
+   gracefully falls through when the model isn't available, but
+   first-run downloads block the production pipeline ~30 s. Vendor
+   step should be added to the GPU image build.
+
+2. **Concurrent-job thread safety of module-level accessors** —
+   `_last_quarantined_segments` (transcription.py) and
+   `_last_reconciliation_stats` (transcription_reconciler.py) are
+   module globals that race across simultaneous jobs. Single-job
+   homelab use is the design center today. If concurrent jobs
+   become a concern, refactor both into per-job dicts keyed on
+   `job_id`. Documented as a known limitation.
+
+3. **Real-audio integration tests** beyond the synthetic-WAV
+   fixtures depend on TTS-generated speech samples. Festival or
+   piper-tts could populate
+   `backend/tests/fixtures/coverage/quiet_speech_60db.wav` etc.
+   with actual speech — would catch regressions in
+   reconciliation that synthetic tones can't surface.
+
+4. **Coverage report payload size on long files.** A 90-min file
+   with hundreds of source-pass entries can produce
+   `coverage_report` >100 KB. Monitor on long-form test content;
+   if it gets unwieldy, trim `confidence_histogram` resolution or
+   summarize per-rung detail.
+
+5. **Translation backends** beyond `whisper_passthrough` (NLLB,
+   Seamless-M4T) need to be registered at startup time when the
+   user opts into them. Out of scope for the wire-up commit; the
+   plug-in mechanism (`register_backend` decorator) is in place.
+
+The wire-up code paths are exercised by 156 unit/integration tests
+that run in any environment. The end-to-end real-video smoke is the
+final acceptance gate the homelab user runs.

@@ -1,0 +1,6 @@
+{
+  "duration_sec": 10.0,
+  "min_overall_coverage_ratio": 1.0,
+  "expected_event_tags": [],
+  "notes": "Quiet (-40 dBFS) tone surrogate for whispered speech. Synthetic \u2014 real-Whisper cannot transcribe it; the ladder should still cover via Rung 5 (noise) or Rung 6 (unintelligible) so the invariant holds."
+}

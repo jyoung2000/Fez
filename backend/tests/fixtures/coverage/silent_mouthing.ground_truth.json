@@ -1,0 +1,8 @@
+{
+  "duration_sec": 10.0,
+  "min_overall_coverage_ratio": 1.0,
+  "expected_event_tags": [
+    "[silence]"
+  ],
+  "notes": "Pure -72 dBFS silence; PANNs should label as silence."
+}

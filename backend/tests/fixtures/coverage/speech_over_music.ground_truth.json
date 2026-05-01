@@ -1,0 +1,6 @@
+{
+  "duration_sec": 10.0,
+  "min_overall_coverage_ratio": 1.0,
+  "expected_event_tags": [],
+  "notes": "Sine + noise mix simulating speech-over-music."
+}
