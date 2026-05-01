@@ -1095,16 +1095,36 @@ export default function PipelineDiagnostics() {
             backend SSE stream attaches the per-run aggregate to
             sotaResult.critic so this row lights up without a JSON
             re-fetch. */}
-        {sotaResult?.critic?.saliency && (() => {
+        {(sotaResult?.critic?.saliency || sotaResult?.critic?.quality_delta) && (() => {
           const sal = sotaResult.critic.saliency;
-          const inCrop = (
-            sal.in_crop_mean ?? sal.in_crop_fraction
-          );
+          const qd = sotaResult.critic.quality_delta;
+          const inCrop = sal && (sal.in_crop_mean ?? sal.in_crop_fraction);
           const salColor = (v) => {
             if (v == null) return 'var(--text-muted)';
             if (v >= 0.75) return '#22c55e';
             if (v >= 0.50) return '#ff9f0a';
             return '#ef4444';
+          };
+          // Layer 2 helpers: signed delta formatting + traffic-light
+          // color. Green ≥ -0.02 (no regression), amber -0.10..-0.02
+          // (slight degrade), red < -0.10 (significant degrade — the
+          // verdict-gate threshold, see compare_autoflip_vs_clipai's
+          // L2_QUALITY_DELTA_*_MIN constants).
+          const fmtDelta = (d) => {
+            if (d == null) return '—';
+            const sign = d >= 0 ? '+' : '';
+            return `${sign}${d.toFixed(2)}`;
+          };
+          const deltaColor = (d) => {
+            if (d == null) return 'var(--text-muted)';
+            if (d >= -0.02) return '#22c55e';
+            if (d >= -0.10) return '#ff9f0a';
+            return '#ef4444';
+          };
+          const rowStyle = {
+            display: 'flex', gap: 12, flexWrap: 'wrap',
+            fontSize: 12, alignItems: 'center',
+            marginBottom: 4,
           };
           return (
             <div style={{
@@ -1120,41 +1140,85 @@ export default function PipelineDiagnostics() {
               }}>
                 Critic engine
               </div>
-              <div style={{
-                display: 'flex', gap: 12, flexWrap: 'wrap',
-                fontSize: 12, alignItems: 'center',
-              }}>
-                <span style={{ minWidth: 110, color: 'var(--text-muted)' }}>
-                  Saliency (L1):
-                </span>
-                <span style={{ color: salColor(inCrop), fontWeight: 600 }}>
-                  {inCrop != null
-                    ? `${Math.round(inCrop * 100)}% in-crop`
-                    : 'not measured'}
-                </span>
-                {sal.windows_flagged > 0 && (
-                  <span style={{ color: '#ff9f0a', fontSize: 11 }}>
-                    {sal.windows_flagged} window{sal.windows_flagged === 1 ? '' : 's'} flagged
+              {sal && (
+                <div style={rowStyle}>
+                  <span style={{ minWidth: 130, color: 'var(--text-muted)' }}>
+                    Saliency (L1):
                   </span>
-                )}
-                {sal.windows_fixed > 0 && (
-                  <span style={{ color: '#3b82f6', fontSize: 11 }}>
-                    +{sal.windows_fixed} fixed
+                  <span style={{ color: salColor(inCrop), fontWeight: 600 }}>
+                    {inCrop != null
+                      ? `${Math.round(inCrop * 100)}% in-crop`
+                      : 'not measured'}
                   </span>
-                )}
-                {sal.backend && sal.backend !== 'tased_net' && (
-                  <span style={{
-                    color: 'var(--text-muted)', fontSize: 10,
-                    padding: '1px 6px',
-                    border: '1px solid var(--border)',
-                    borderRadius: 4,
-                  }}>
-                    {sal.backend === 'spectral_residual'
-                      ? '(spectral fallback)'
-                      : `(${sal.backend})`}
+                  {sal.windows_flagged > 0 && (
+                    <span style={{ color: '#ff9f0a', fontSize: 11 }}>
+                      {sal.windows_flagged} window{sal.windows_flagged === 1 ? '' : 's'} flagged
+                    </span>
+                  )}
+                  {sal.windows_fixed > 0 && (
+                    <span style={{ color: '#3b82f6', fontSize: 11 }}>
+                      +{sal.windows_fixed} fixed
+                    </span>
+                  )}
+                  {sal.backend && sal.backend !== 'tased_net' && (
+                    <span style={{
+                      color: 'var(--text-muted)', fontSize: 10,
+                      padding: '1px 6px',
+                      border: '1px solid var(--border)',
+                      borderRadius: 4,
+                    }}>
+                      {sal.backend === 'spectral_residual'
+                        ? '(spectral fallback)'
+                        : `(${sal.backend})`}
+                    </span>
+                  )}
+                </div>
+              )}
+              {qd && (
+                <div style={rowStyle}>
+                  <span style={{ minWidth: 130, color: 'var(--text-muted)' }}>
+                    Quality vs source (L2):
                   </span>
-                )}
-              </div>
+                  <span
+                    style={{ color: deltaColor(qd.aesthetic_delta), fontWeight: 600 }}
+                    title="Aesthetic = composition, framing, lighting, color"
+                  >
+                    Aesthetic: {fmtDelta(qd.aesthetic_delta)}
+                  </span>
+                  <span
+                    style={{ color: deltaColor(qd.technical_delta), fontWeight: 600 }}
+                    title="Technical = sharpness, blur, compression"
+                  >
+                    Technical: {fmtDelta(qd.technical_delta)}
+                  </span>
+                  {qd.cache_hit && (
+                    <span style={{
+                      color: 'var(--text-muted)', fontSize: 10,
+                      padding: '1px 6px',
+                      border: '1px solid var(--border)',
+                      borderRadius: 4,
+                    }}>
+                      (cached)
+                    </span>
+                  )}
+                  {qd.source && qd.reframed && (
+                    <span
+                      style={{
+                        color: 'var(--text-muted)', fontSize: 10,
+                        marginLeft: 4,
+                      }}
+                      title={
+                        `Source: aesthetic ${qd.source.aesthetic?.toFixed(2)}, ` +
+                        `technical ${qd.source.technical?.toFixed(2)}\n` +
+                        `Reframed: aesthetic ${qd.reframed.aesthetic?.toFixed(2)}, ` +
+                        `technical ${qd.reframed.technical?.toFixed(2)}`
+                      }
+                    >
+                      ⓘ
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
           );
         })()}
