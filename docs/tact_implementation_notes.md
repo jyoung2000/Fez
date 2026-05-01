@@ -397,3 +397,118 @@ sequence; each one merges the corresponding pipeline-integration
 slice. The data structures, types, and unit-tested algorithms are all
 in place — the remaining work is wiring them into the existing
 pipeline orchestration.
+
+---
+
+## Pipeline wire-up plan
+
+This is the operationalization of the seven items above. Every item
+is plumbing — no new architectural decisions, no new TACT modules
+beyond the two needed for Rungs 4 and 5 (which the previous prompts
+explicitly anticipated as new files).
+
+### Pre-flight grep result
+
+`grep -rn "TACT\|coverage_ledger\|escalation_ladder\|reconcile_passes\|run_translation_track" backend/services/pipeline.py`
+
+Only matches: the Phase 1 ledger emission block at lines 2649–2704
+and the legacy gap-fill at lines 2607–2647. Confirmed nothing else is
+wired yet.
+
+### API verifications before code edits
+
+* `transcribe_audio_slice_subprocess(slice_path, *, model_name=None, ...)` —
+  accepts a `model_name` kwarg (transcription.py:1011). Used by Rung 2.
+* `transcribe_audio_subprocess(..., offset_sec=0.0)` — kwarg landed in
+  Phase 3 (transcription.py:489). Used by the disjoint-offset pass.
+* `_can_run_consensus()` exists in parakeet_transcriber.py:45 as a
+  private helper. Will expose a public alias `can_run_consensus` per
+  the prompt's instruction.
+* `reconcile_passes` does not currently take a `boundary_window_sec`
+  kwarg — only `chunk_window_sec` and `align_tolerance_sec`. The
+  prompt's Item 4 example passes `boundary_window_sec`; will skip
+  passing it from the pipeline since the reconciler doesn't use it
+  yet, rather than adding a no-op kwarg to a stable signature.
+* `EscalationContext` is a `@dataclass` so `dataclasses.replace` works
+  for per-interval neighbor-text rewriting.
+
+### The seven items, mapped
+
+| Item | What | Files | Pipeline lines |
+|------|------|-------|----------------|
+| 1a | Rung 2 implementation | `escalation_ladder.py:315` (replace stub) | n/a |
+| 1b | Rung 4 implementation | new `forced_alignment.py` + `escalation_ladder.py:418` | n/a |
+| 1c | Rung 5 implementation | new `non_speech_events.py` + `escalation_ladder.py:427` | n/a |
+| 2 | Per-interval neighbor text | `escalation_ladder.py:497` (orchestrator loop) | n/a |
+| 3 | Replace gap-fill + Phase 1 ledger blocks with ladder | `pipeline.py:2607-2704` | 2607–2704 (entire region replaced) |
+| 4 | Disjoint-offset pass + reconciler | `pipeline.py` (before Item 3 block); `transcription_reconciler.py` (add `_last_reconciliation_stats`) | new code immediately before Item 3 region |
+| 5 | Consensus pass (opt-in) | same region as Item 4 | same |
+| 6 | Translation track | inside Item 3 block, after `coverage_report` is built | inside the new Item 3 region |
+| 7 | Fixture pack + integration test | new `backend/tests/fixtures/coverage/` and `backend/tests/test_tact_integration.py` | n/a |
+
+### Items 4, 5, 6 collapse into the same `pipeline.py` region
+
+The §1 prompt presents the disjoint-offset pass, the consensus pass,
+and the translation track as three separate items, but in the
+pipeline they're a single contiguous block of code: the multi-pass
+collection feeding `reconcile_n_passes` (Items 4 + 5), then the
+ledger build + ladder (Item 3), then the optional translation track
+(Item 6). Implementing them in one commit avoids three rounds of
+"now move this block before that block." One commit covers all four
+of these (3 + 4 + 5 + 6).
+
+### Rung 2 design pinning
+
+* Selection rule: large-v3-turbo → large-v3; medium → large-v3-turbo
+  (if free VRAM ≥ 3000 MB) else large-v3 (CPU int8); small → medium;
+  anything else → decline.
+* Module-level cache `_alt_checkpoint_cache` is `dict[str, dict]` mapping
+  model name to `{"loaded_at": float, "model_name": str}` — actually
+  there's no in-process model object to cache (the slice helper
+  spawns a fresh subprocess each call), so the "cache" is really just
+  a TTL guard that skips re-validating that an alternate is selectable.
+  The Whisper subprocess itself reloads weights every call — that's
+  the contract of `transcribe_audio_slice_subprocess`. The cache as
+  described in the prompt is therefore largely cosmetic. I'll keep
+  the lock + TTL structure for forward-compat with an in-process
+  variant but acknowledge it's a minimal TTL gate today.
+
+### Open ambiguities resolved
+
+1. **`reconcile_passes` no `boundary_window_sec`.** Skip from
+   pipeline call site rather than touch the reconciler signature.
+   The kwarg is documented in the design doc but the implementation
+   doesn't use it; adding a no-op kwarg violates "don't change
+   public APIs."
+2. **Translation track has no `target_language` on `JobResult`.**
+   `backend/models.py` doesn't expose this field today. Adding it as
+   `target_language: Optional[str] = None` is a one-line additive
+   change to JobResult (Pydantic). Acceptable per the prompt's "if
+   it's not there, add it" clause.
+3. **PANNs vendoring in Dockerfile.** Out of scope for this commit
+   — the rung gracefully declines (returns "other" with low
+   confidence → falls through) when the model isn't available, so
+   Rung 6 still catches every interval. The vendor step is a
+   follow-up.
+4. **Acceptance criterion (real-video coverage_ratio == 1.0)**
+   cannot be verified in the current dev container — no GPU, no
+   Whisper weights, no ffmpeg-decoded audio. The integration test in
+   Item 7 uses synthesized fixtures plus mocking to prove the wiring
+   is correct by construction; the real-video smoke test is a
+   homelab step the user runs.
+
+### Commit plan
+
+1. `docs(tact)`: this section. (current commit)
+2. `feat(tact)`: Rung 2 (`_rung_alt_whisper_checkpoint`) + tests.
+3. `feat(tact)`: `forced_alignment.py` + Rung 4 + tests.
+4. `feat(tact)`: `non_speech_events.py` + Rung 5 + tests.
+5. `feat(tact)`: orchestrator per-interval neighbor text +
+   reconciler stats accessor + tests.
+6. `feat(tact)`: `pipeline.py` rewire (Items 3 + 4 + 5 + 6) +
+   `JobResult.target_language` + `can_run_consensus` public alias.
+7. `test(tact)`: fixture pack + `test_tact_integration.py`.
+
+After the seven commits, push and add a "Pipeline wire-up complete"
+section to this notes file with commit SHAs and the smoke-test
+result placeholder for the user to fill.
