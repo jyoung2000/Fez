@@ -84,7 +84,15 @@ _MAX_SPANS = 100_000
 
 @dataclass
 class LedgerSpan:
-    """One contiguous range of the ledger with a single status / source."""
+    """One contiguous range of the ledger with a single status / source.
+
+    ``target_language`` (TACT Phase 5): ISO 639-1 code of the
+    translation target when this span belongs to a translation
+    ledger. ``None`` for source-language spans. Two ledgers run in
+    parallel when translation is active: the source ledger has all
+    target_language=None spans; the translation ledger mirrors the
+    source structure with target_language="fr" / "es" / etc.
+    """
 
     start_ms: int
     end_ms: int
@@ -95,6 +103,7 @@ class LedgerSpan:
     confidence: float = 0.0
     speaker: Optional[str] = None
     flags: list[str] = field(default_factory=list)
+    target_language: Optional[str] = None
 
     def duration_ms(self) -> int:
         return max(0, self.end_ms - self.start_ms)
@@ -202,6 +211,7 @@ class CoverageLedger:
                 and prev.content == s.content
                 and abs(prev.confidence - s.confidence) < 1e-6
                 and prev.flags == s.flags
+                and prev.target_language == s.target_language
             ):
                 prev.end_ms = s.end_ms
             else:
@@ -247,6 +257,7 @@ class CoverageLedger:
             confidence=float(span.confidence),
             speaker=span.speaker,
             flags=list(span.flags),
+            target_language=span.target_language,
         )
 
         if allow_overlap or not self._spans:
@@ -282,6 +293,7 @@ class CoverageLedger:
                         confidence=inc.confidence,
                         speaker=inc.speaker,
                         flags=list(inc.flags),
+                        target_language=inc.target_language,
                     ))
                 if inc.end_ms > new_end:
                     rebuilt.append(LedgerSpan(
@@ -294,6 +306,7 @@ class CoverageLedger:
                         confidence=inc.confidence,
                         speaker=inc.speaker,
                         flags=list(inc.flags),
+                        target_language=inc.target_language,
                     ))
                 self._contested_attempts += 1
             else:
@@ -309,6 +322,7 @@ class CoverageLedger:
                         confidence=new_span.confidence,
                         speaker=new_span.speaker,
                         flags=list(new_span.flags),
+                        target_language=new_span.target_language,
                     ))
                     any_written = True
                 rebuilt.append(inc)
@@ -334,6 +348,7 @@ class CoverageLedger:
                 confidence=new_span.confidence,
                 speaker=new_span.speaker,
                 flags=list(new_span.flags),
+                target_language=new_span.target_language,
             ))
             any_written = True
 
@@ -656,6 +671,115 @@ class CoverageLedger:
             "confidence_histogram": self.confidence_histogram(10),
             "source_pass_ms": self.source_pass_breakdown(),
             "contested_attempts": self._contested_attempts,
+        }
+
+    # ── Translation track (TACT Phase 5) ─────────────────────────
+
+    def to_translation_ledger(self, target_language: str) -> "CoverageLedger":
+        """Create a paired ledger for a translation target.
+
+        Copies the audio_duration_ms / bin_ms structure of ``self`` but
+        starts empty. Translation passes claim into the new ledger
+        with ``target_language`` set on every span. Coverage ratio is
+        computed identically — the translation track holds the
+        100% invariant in the target language too.
+
+        Event spans (``[music]`` / ``[silence]`` etc.) and silence
+        spans pass through unchanged into the target ledger so
+        non-lexical labels don't get spuriously translated.
+        """
+        new = CoverageLedger(self.audio_duration_ms, bin_ms=self.bin_ms)
+        for s in self._spans:
+            if s.content_type in ("event", "silence", "unintelligible"):
+                # Pass-through. Same content, same status, same time
+                # range, but tag with target_language so the ledger is
+                # internally consistent.
+                new.claim(LedgerSpan(
+                    start_ms=s.start_ms,
+                    end_ms=s.end_ms,
+                    status=s.status,
+                    content=s.content,
+                    content_type=s.content_type,
+                    source_pass=s.source_pass,
+                    confidence=s.confidence,
+                    speaker=s.speaker,
+                    flags=list(s.flags),
+                    target_language=target_language,
+                ))
+            # Speech spans get NO content yet — the translation track
+            # fills them in with translated text. We still pre-claim
+            # them at low confidence so the structure mirrors source.
+            elif s.status in ("covered_speech", "low_confidence"):
+                new.claim(LedgerSpan(
+                    start_ms=s.start_ms,
+                    end_ms=s.end_ms,
+                    status="low_confidence",  # waiting for translation
+                    content=None,
+                    content_type=s.content_type,
+                    source_pass="translation_pending",
+                    confidence=0.0,
+                    speaker=s.speaker,
+                    flags=list(s.flags) + ["awaiting_translation"],
+                    target_language=target_language,
+                ))
+        return new
+
+    def to_paired_report_dict(
+        self,
+        translation_ledger: "CoverageLedger",
+    ) -> dict:
+        """Coverage report covering both source and target ledgers.
+
+        Returns a dict with the source report under ``source`` and a
+        translation block under ``translation``:
+
+            {
+              "source": <self.to_report_dict()>,
+              "translation": {
+                "target_language": str,
+                "coverage_ratio": float,
+                "untranslated_ratio": float,
+                "spans_with_translation": int,
+                "spans_total": int,
+                ... (translation_ledger.to_report_dict() summary)
+              }
+            }
+
+        ``untranslated_ratio`` is the fraction of source covered_speech
+        ms that the translation ledger left in
+        ``low_confidence``/``awaiting_translation`` — those are the
+        spans where translation either failed or hasn't run yet. The
+        translation-track coverage invariant says this should be 0.0
+        after run_translation_track completes.
+        """
+        translated_ms = sum(
+            s.duration_ms() for s in translation_ledger.spans
+            if s.status in COVERED_STATUSES
+            and "awaiting_translation" not in s.flags
+            and s.content
+        )
+        awaiting_ms = sum(
+            s.duration_ms() for s in translation_ledger.spans
+            if "awaiting_translation" in s.flags
+        )
+        target_total = translation_ledger.audio_duration_ms or 1
+        target_lang = ""
+        for s in translation_ledger.spans:
+            if s.target_language:
+                target_lang = s.target_language
+                break
+        return {
+            "source": self.to_report_dict(),
+            "translation": {
+                "target_language": target_lang,
+                "coverage_ratio": round(translated_ms / target_total, 4),
+                "untranslated_ratio": round(awaiting_ms / target_total, 4),
+                "spans_with_translation": sum(
+                    1 for s in translation_ledger.spans if s.content
+                ),
+                "spans_total": len(translation_ledger.spans),
+                "report": translation_ledger.to_report_dict(),
+            },
         }
 
     # ── Misc ─────────────────────────────────────────────────────
