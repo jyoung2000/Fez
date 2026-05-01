@@ -216,6 +216,21 @@ RUN mkdir -p /app/backend/models && \
        echo "WARN: Light-ASD pre-download failed — will retry at runtime"; \
     fi
 
+# Layer 2 (DOVER-Mobile) ONNX model. Operators rebuild this image
+# with ``--build-context dover_export=docker-image://clipai/dover-mobile-export:latest``
+# (or via docker-compose with a ``dover_export`` service in the
+# build context) to bake the ~35 MB ONNX in. When the build context
+# isn't supplied, the COPY is skipped and the runtime wrapper
+# logs "DOVER-Mobile model not at /opt/clipai/models/..." and the
+# critic engine's L2 row stays empty — production isn't affected.
+#
+# To pin the ONNX SHA at runtime, set DOVER_MOBILE_SHA256 in the
+# image's environment. The wrapper refuses to load on mismatch.
+# See infra/dover_mobile/README.md.
+ENV DOVER_MOBILE_MODEL_PATH=/opt/clipai/models/dover_mobile.onnx
+ENV DOVER_MOBILE_SHA256=""
+ENV DOVER_CACHE_DIR=/var/cache/clipai/dover_cache
+
 EXPOSE 1353
 
 CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "1353", "--workers", "1"]
