@@ -488,8 +488,16 @@ async def transcribe_audio_subprocess(
     progress_callback=None,
     is_animated: bool = False,
     cancel_check=None,
+    offset_sec: float = 0.0,
 ) -> list[TranscriptSegment]:
     """Run Whisper in a subprocess to fully release CTranslate2's CUDA memory.
+
+    ``offset_sec`` (TACT Phase 3): when non-zero, the worker trims the
+    audio to ``[offset, end]`` before transcription and post-shifts
+    every segment / word timestamp by ``+offset`` so the returned
+    timestamps are in the original audio's frame of reference. Used
+    by the disjoint-offset multi-pass to phase-shift Whisper's
+    internal 30-s chunk grid.
 
     CTranslate2 (used by faster-whisper) holds ~1.6GB VRAM in its CUDA context
     even after the model is deleted. torch.cuda.empty_cache() is a no-op because
@@ -793,8 +801,14 @@ async def transcribe_audio_subprocess(
             cmd.extend(["--initial-prompt", initial_prompt])
         if audio_duration > 0:
             cmd.extend(["--audio-duration", str(audio_duration)])
+        # TACT Phase 3 disjoint-offset pass.
+        if offset_sec and offset_sec > 0.0:
+            cmd.extend(["--input-offset-sec", f"{float(offset_sec):.3f}"])
 
-        logger.info("Starting Whisper subprocess: model=%s device=%s", model_name, device)
+        logger.info(
+            "Starting Whisper subprocess: model=%s device=%s offset=%.2fs",
+            model_name, device, float(offset_sec or 0.0),
+        )
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,

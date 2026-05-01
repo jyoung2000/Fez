@@ -135,6 +135,47 @@ class Settings(BaseSettings):
     # and avoids contending with the Whisper model for VRAM.
     TACT_FORCED_ALIGN_DEVICE: str = "auto"
     TACT_FORCED_ALIGN_MIN_WORD_CONFIDENCE: float = 0.6
+    # ── TACT Phase 3: Disjoint-offset multi-pass ──
+    # When True, run Whisper a second time with a phase-shifted chunk
+    # grid (offset_sec into the audio) and reconcile the two passes
+    # at word level. Catches words that were truncated or hallucinated
+    # at chunk boundaries in the primary pass.
+    TACT_DISJOINT_OFFSET_ENABLED: bool = True
+    # Half of Whisper's 30 s chunk window puts every primary chunk
+    # boundary in the middle of an offset chunk (and vice versa).
+    TACT_DISJOINT_OFFSET_SEC: float = 15.0
+    # Optional third pass at a finer offset (typically 7.5 s). 0
+    # disables. Worth ~0.3 percentage points of WER on 1+ hour
+    # content but doubles serial transcription cost.
+    TACT_DISJOINT_OFFSET_THIRD_PASS_SEC: float = 0.0
+    # Word alignment tolerance for the reconciler — primary and
+    # offset words within this many seconds are paired and ROVER-
+    # voted. 0.2 s is robust to Whisper's typical timestamp jitter.
+    TACT_RECONCILE_ALIGN_TOLERANCE_SEC: float = 0.2
+    TACT_RECONCILE_BOUNDARY_WINDOW_SEC: float = 2.0
+    # ── TACT Phase 4: Independent-architecture consensus ──
+    # Heavyweight, opt-in. NeMo Toolkit dependency is loaded only
+    # when this flag is True AND VRAM probe passes the threshold.
+    TACT_CONSENSUS_ENABLED: bool = False
+    TACT_CONSENSUS_MODEL: str = "nvidia/parakeet-tdt-0.6b-v3"
+    # Minimum free VRAM after Whisper unload before Parakeet may run.
+    # Parakeet-tdt-0.6b int8 needs ~1.8 GB; 2.2 GB gives headroom.
+    TACT_CONSENSUS_MIN_FREE_VRAM_MB: int = 2200
+    TACT_OVERLAP_SEPARATION_ENABLED: bool = True
+    # ── TACT Phase 5: Translation track ──
+    # When True (and either task=="translate" or an explicit target
+    # language is set), build a paired source/target ledger so the
+    # 100% coverage invariant applies in both languages.
+    TACT_TRANSLATION_TRACK_ENABLED: bool = True
+    # Translation backend. "whisper" uses Whisper's task=translate
+    # (English target only); "nllb" / "seamless" enable arbitrary
+    # target languages but require their respective weights.
+    TACT_TRANSLATION_BACKEND: str = "whisper"
+    # When True and ≥2 backends are available, run both and reconcile
+    # via semantic similarity (LaBSE embeddings).
+    TACT_TRANSLATION_CONSENSUS_ENABLED: bool = False
+    TACT_TRANSLATION_SIMILARITY_AGREE: float = 0.85
+    TACT_TRANSLATION_SIMILARITY_CONTEST: float = 0.70
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
     # Adaptive frame extraction

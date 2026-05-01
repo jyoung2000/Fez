@@ -172,6 +172,18 @@ def main():
     parser.add_argument("--vad-min-speech-ms", type=int, default=100)
     parser.add_argument("--audio-duration", type=float, default=0,
                         help="Total audio duration in seconds (for progress reporting)")
+    # ── TACT Phase 3: disjoint-offset multi-pass ──
+    # When non-zero, the worker trims the input audio to [offset, end]
+    # via ffmpeg before transcription, then post-shifts every segment
+    # and word timestamp by +offset before emitting JSON. This phase-
+    # shifts Whisper's internal 30-s chunk grid relative to the primary
+    # pass, so words at primary-pass chunk boundaries land in mid-chunk
+    # in the offset pass.
+    parser.add_argument(
+        "--input-offset-sec", type=float, default=0.0,
+        help="Trim audio to [offset, end] before Whisper; "
+             "post-shift output timestamps by +offset.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -412,6 +424,43 @@ def main():
         _vad_label = "with VAD filtering" if args.vad_filter else "without VAD"
         print(f'PROGRESS:{json.dumps({"segments": 0, "pct": 0, "lang": "", "position_sec": 0, "eta_sec": 0, "last_text": "", "phase": "vad_start", "message": f"Audio preprocessed — starting transcription {_vad_label}..."})}', file=sys.stderr, flush=True)
 
+        # ── TACT Phase 3 offset trim ──
+        # Trim preprocessed audio to [offset_sec, end] for the disjoint-
+        # offset second pass. Done after preprocessing so the loudnorm /
+        # noise-gate chain runs on the full file (consistent levels)
+        # before slicing.
+        offset_trim_path = None
+        offset_sec = float(args.input_offset_sec or 0.0)
+        if offset_sec > 0.0:
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as _otmp:
+                    offset_trim_path = _otmp.name
+                _trim_cmd = [
+                    "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+                    "-ss", f"{offset_sec:.3f}",
+                    "-i", preprocessed_path,
+                    "-c:a", "pcm_s16le",
+                    offset_trim_path,
+                ]
+                _trim_res = subprocess.run(_trim_cmd, capture_output=True, timeout=120)
+                if _trim_res.returncode != 0 or not os.path.exists(offset_trim_path):
+                    raise RuntimeError(
+                        f"ffmpeg offset trim failed (rc={_trim_res.returncode})"
+                    )
+                logger.info(
+                    "TACT: trimmed audio for offset pass at %.3fs", offset_sec,
+                )
+                preprocessed_path = offset_trim_path
+            except Exception as _e:
+                logger.warning("TACT offset trim failed: %s — continuing with offset=0", _e)
+                offset_sec = 0.0
+                if offset_trim_path:
+                    try:
+                        os.unlink(offset_trim_path)
+                    except OSError:
+                        pass
+                    offset_trim_path = None
+
         segments_gen, info = model.transcribe(preprocessed_path, **transcribe_kwargs)
 
         # Materialize segments with real-time progress reporting to stderr.
@@ -448,6 +497,25 @@ def main():
                     "lang": _detected_lang,
                 })
                 print(f"PROGRESS:{progress_line}", file=sys.stderr, flush=True)
+
+        # ── TACT Phase 3 post-shift ──
+        # When the offset trim above succeeded, every segment timestamp
+        # is in trimmed-audio time. Shift back to original-audio time
+        # by +offset_sec so downstream callers (the reconciler, the
+        # ledger) see absolute timestamps.
+        if offset_sec > 0.0:
+            for s in result_segments:
+                s["start"] = float(s.get("start", 0.0)) + offset_sec
+                s["end"] = float(s.get("end", 0.0)) + offset_sec
+                if s.get("words"):
+                    for w in s["words"]:
+                        w["start"] = float(w.get("start", 0.0)) + offset_sec
+                        w["end"] = float(w.get("end", 0.0)) + offset_sec
+            if offset_trim_path:
+                try:
+                    os.unlink(offset_trim_path)
+                except OSError:
+                    pass
 
         # Filter hallucinations (ghosts, loops, backward jumps, duplicates)
         result_segments = _filter_segments(result_segments, initial_prompt=args.initial_prompt or "", task=args.task)
