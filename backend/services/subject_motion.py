@@ -56,3 +56,48 @@ def subject_xs_look_like_motion(subject_xs: list) -> tuple:
         return False, peak_centers
     motion_frac = sum(1 for d in deltas if d > 8) / len(deltas)
     return (motion_frac > 0.6), peak_centers
+
+
+def choose_snap_centers(
+    registry_centers: list,
+    peak_centers: list,
+) -> tuple:
+    """Pick snap targets between face_registry slot centers and bimodality
+    peak centers.
+
+    The bimodality peaks are derived from AI-attributed ``subject_x`` values,
+    which are unreliable when VLM scene analysis fell back to synthesized
+    scenes (rate-limited, error-fallback, etc.). A clean N-slot registry
+    built from dense-face evidence should win over a degraded peak histogram.
+
+    Bimodality peaks only override the registry when the registry is
+    genuinely degenerate:
+      * empty (no slots), OR
+      * over-fragmented embedding-style: at least 2x the peak count AND
+        contains at least one pair of slots within 8% of each other (a
+        sign of cross-shot embedding split).
+
+    Returns ``(slot_centers, used_peaks)``.
+    """
+    plausible_peaks = bool(peak_centers) and 2 <= len(peak_centers) <= 4
+
+    if not registry_centers:
+        if plausible_peaks:
+            return list(peak_centers), True
+        return [], False
+
+    registry_overfragmented = False
+    if plausible_peaks:
+        sorted_centers = sorted(registry_centers)
+        close_pairs = sum(
+            1 for i in range(len(sorted_centers) - 1)
+            if sorted_centers[i + 1] - sorted_centers[i] < 8.0
+        )
+        registry_overfragmented = (
+            len(registry_centers) >= 2 * len(peak_centers)
+            and close_pairs >= 1
+        )
+
+    if plausible_peaks and registry_overfragmented:
+        return list(peak_centers), True
+    return list(registry_centers), False

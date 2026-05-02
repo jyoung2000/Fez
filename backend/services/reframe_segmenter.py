@@ -2302,9 +2302,15 @@ def _resolve_slot_for_interval(
 
     # Priority 3: Dense face dominance
     if dense_faces and face_registry:
-        slot = _dense_face_dominant_slot(start, end, dense_faces, face_registry)
-        if slot is not None:
+        slot = _dense_face_dominant_slot(
+            start, end, dense_faces, face_registry,
+            active_speaker_events=active_speaker_events,
+        )
+        if slot is not None and _slot_visible_in_interval(
+            slot, start, end, dense_faces, min_frame_fraction=0.30,
+        ):
             return slot, 0.7, "single", "dense_face_dominant"
+        # else: slot exists in aggregate but not in this interval — fall through.
 
     # Priority 4: Multi-face spread check
     # When multiple confident faces are visible but none dominates,
@@ -2388,8 +2394,19 @@ def _dense_face_dominant_slot(
     end: float,
     dense_faces: list,
     face_registry,
+    active_speaker_events: Optional[list] = None,
 ) -> Optional[int]:
-    """Check if one face slot dominates the dense frames in this interval."""
+    """Check if one face slot dominates the dense frames in this interval.
+
+    A slot is considered dominant when:
+      * it appears in >= DENSE_DOMINANCE_THRESHOLD of frames with faces, AND
+      * no other slot appears in >= 30% of frames, AND
+      * if active_speaker_events are provided, no other slot has stronger
+        active-speaker majority in the same interval (which would mean we
+        should be tracking the talker, not the most-photographed seat).
+
+    Returns the dominant slot id, or None if no slot meets the bar.
+    """
     frames_in_range = [
         df for df in dense_faces
         if start <= df.timestamp <= end and df.faces
@@ -2411,14 +2428,31 @@ def _dense_face_dominant_slot(
         return None
 
     best_slot_id, best_count = slot_counts.most_common(1)[0]
-    if best_count / total >= DENSE_DOMINANCE_THRESHOLD:
-        # Check other slots are <30%
-        for sid, cnt in slot_counts.items():
-            if sid != best_slot_id and cnt / total >= 0.30:
-                return None  # Multiple strong faces — not dominant
-        return best_slot_id
+    if best_count / total < DENSE_DOMINANCE_THRESHOLD:
+        return None
 
-    return None
+    # Other slots <30% rule.
+    for sid, cnt in slot_counts.items():
+        if sid != best_slot_id and cnt / total >= 0.30:
+            return None  # Multiple strong faces — not dominant
+
+    # Active-speaker tiebreaker: the most-photographed seat is not always
+    # the talker (panel reaction shots, B-roll cuts). If a different slot
+    # has voting majority in active_speaker_events for this interval AND
+    # is sufficiently visible, prefer that one.
+    if active_speaker_events:
+        as_slot, as_coverage = _active_speaker_majority(
+            start, end, active_speaker_events,
+        )
+        if (
+            as_slot is not None
+            and as_slot != best_slot_id
+            and as_coverage >= 0.50
+            and slot_counts.get(as_slot, 0) / total >= 0.30
+        ):
+            return as_slot
+
+    return best_slot_id
 
 
 def _resolve_multi_face_spread(

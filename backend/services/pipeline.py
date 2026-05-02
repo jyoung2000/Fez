@@ -876,6 +876,7 @@ async def run_analysis(job_id: str):
 # it without pulling in fastapi / PIL / cv2 via the pipeline module.
 from backend.services.subject_motion import (
     subject_xs_look_like_motion as _subject_xs_look_like_motion,
+    choose_snap_centers as _choose_snap_centers,
 )
 
 
@@ -2620,7 +2621,6 @@ async def _run_analysis_inner(job_id: str):
                 )
                 from backend.services.transcription import (
                     get_last_quarantined_segments,
-                    transcribe_audio_subprocess,
                 )
                 from backend.services.transcription_reconciler import (
                     get_last_reconciliation_stats, reconcile_n_passes,
@@ -3291,18 +3291,22 @@ async def _run_analysis_inner(job_id: str):
             # registry slot centers. Peak centers are a reliable panel
             # signal when face_registry.slots got over-split.
             registry_centers = [s.x_center for s in face_registry.slots]
-            if (_peak_centers
-                    and 2 <= len(_peak_centers) <= 4
-                    and (not registry_centers
-                         or len(registry_centers) > len(_peak_centers) + 1)):
-                slot_centers = _peak_centers
+            slot_centers, _used_peaks = _choose_snap_centers(
+                registry_centers, _peak_centers,
+            )
+            if _used_peaks:
                 logger.info(
                     "[%s] [SubjectTracking] using %d bimodality peak(s) as snap "
-                    "targets (registry had %d slots)",
+                    "targets (registry had %d slots, overfragmented=%s)",
                     job_id, len(_peak_centers), len(registry_centers),
+                    bool(registry_centers),
                 )
-            else:
-                slot_centers = registry_centers
+            elif _peak_centers and len(registry_centers) > len(_peak_centers) + 1:
+                logger.info(
+                    "[%s] [SubjectTracking] keeping %d registry slot(s) over "
+                    "%d bimodality peak(s) — registry not over-fragmented",
+                    job_id, len(registry_centers), len(_peak_centers),
+                )
             if not slot_centers:
                 # Nothing to snap to; skip the correction pass entirely.
                 slot_centers = []
