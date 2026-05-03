@@ -382,6 +382,7 @@ async def create_session(
         created_at=now, last_seen=now, expires_at=expires,
         remember=remember,
         fp_v2=True,
+        fp_v3=True,
     )
     async with _sessions_lock:
         data = await _read_json(SESSIONS_PATH, {"sessions": []})

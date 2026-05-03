@@ -89,6 +89,43 @@ def test_fingerprint_independent_of_ipv6():
     assert a == b
 
 
+def test_fingerprint_stable_across_devtools_responsive_mode():
+    """V3: Chrome with DevTools device-toolbar emulating a phone
+    swaps the platform / device tokens but keeps Chrome/<major> the
+    same. The fingerprint must be identical so opening Inspect
+    Element doesn't kill the session.
+    """
+    desktop = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    )
+    mobile_emulated = (
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+    )
+    assert (
+        security.compute_fingerprint("1.1.1.1", desktop)
+        == security.compute_fingerprint("1.1.1.1", mobile_emulated)
+    )
+
+
+def test_fingerprint_distinguishes_browser_families():
+    """V3 still rejects a cookie reused across genuinely different
+    browser families."""
+    chrome = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    )
+    firefox = (
+        "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 "
+        "Firefox/128.0"
+    )
+    assert (
+        security.compute_fingerprint("1.1.1.1", chrome)
+        != security.compute_fingerprint("1.1.1.1", firefox)
+    )
+
+
 # ── store: users + sessions ─────────────────────────────────
 
 

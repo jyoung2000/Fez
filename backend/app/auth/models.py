@@ -94,12 +94,15 @@ class Session:
     # Defaults to True so older session JSONs without this field
     # behave the way they always did.
     remember: bool = True
-    # ``fp_v2`` marks sessions whose stored ``fingerprint`` is the
-    # UA-only V2 digest. Legacy sessions default to False and are
-    # migrated to V2 on their first fingerprint check; after that the
-    # flag is True and the middleware treats a mismatch as a real
-    # rejection rather than a stale-format quirk.
+    # ``fp_v2`` / ``fp_v3`` mark which fingerprint algorithm produced
+    # the stored ``fingerprint``. The middleware treats any session
+    # without the *current* version flag as a legacy record and
+    # migrates it on the first fingerprint check. ``fp_v2`` is kept
+    # for storage round-trip compatibility with on-disk records
+    # written by the previous algorithm; only ``fp_v3`` is checked
+    # against by the current middleware.
     fp_v2: bool = False
+    fp_v3: bool = False
 
     def to_storage(self) -> dict:
         return asdict(self)

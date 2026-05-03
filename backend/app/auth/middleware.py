@@ -178,18 +178,18 @@ class AuthMiddleware(BaseHTTPMiddleware):
         ua = request.headers.get("user-agent", "")
         current_fp = compute_fingerprint(ip, ua)
         if current_fp != session.fingerprint:
-            # One-time migration: legacy sessions were stored with a
-            # V1 fingerprint (IP + UA). Accept the session once on
-            # the UA-only check and rewrite the stored fingerprint
-            # so subsequent requests match cleanly. Guarded by the
-            # fp_v2 flag on the session record.
-            if not _session_is_v2(session):
+            # One-time migration: sessions stored with an older
+            # fingerprint algorithm (V1: IP+UA, V2: full UA) are
+            # accepted once and rewritten to the current scheme so
+            # subsequent requests match cleanly. Guarded by the
+            # fp_v3 flag on the session record.
+            if not _session_is_current_fp_version(session):
                 try:
-                    await _migrate_session_to_v2(token, current_fp)
+                    await _migrate_session_fingerprint(token, current_fp)
                 except Exception as e:
-                    logger.warning("fingerprint V2 migration failed: %s", e)
-                # Continue as if the fingerprint matched — this was
-                # a known-good cookie from the V1 scheme.
+                    logger.warning("fingerprint migration failed: %s", e)
+                # Continue as if the fingerprint matched — the cookie
+                # itself is a valid credential from a prior scheme.
             else:
                 return self._reject_fingerprint()
 
@@ -249,24 +249,24 @@ class AuthMiddleware(BaseHTTPMiddleware):
         return self._clear_and_reject("fingerprint_mismatch")
 
 
-_FINGERPRINT_V2_FLAG = "fp_v2"
+_CURRENT_FP_VERSION = "fp_v3"
 
 
-def _session_is_v2(session) -> bool:
-    """True if this session was stored with the V2 (UA-only)
-    fingerprint. Legacy sessions lack the flag.
+def _session_is_current_fp_version(session) -> bool:
+    """True if this session's fingerprint was computed with the current
+    algorithm version. Sessions from older versions (V1: IP+UA, V2:
+    full UA) need a one-time migration.
     """
-    # Session is a frozen dataclass; check the raw storage too for
-    # forward-compat.
-    if getattr(session, _FINGERPRINT_V2_FLAG, False):
+    if getattr(session, _CURRENT_FP_VERSION, False):
         return True
     return False
 
 
-async def _migrate_session_to_v2(token: str, new_fingerprint: str) -> None:
-    """Rewrite an existing session's fingerprint to the UA-only V2
-    form and flip the ``fp_v2`` flag so the migration runs at most
-    once per session.
+async def _migrate_session_fingerprint(token: str, new_fingerprint: str) -> None:
+    """Rewrite a session's fingerprint to the current algorithm version
+    and set the version flag so the migration runs at most once.
+
+    Handles V1→V3 and V2→V3 in a single path.
     """
     from backend.app.auth.store import (
         SESSIONS_PATH,
@@ -281,7 +281,7 @@ async def _migrate_session_to_v2(token: str, new_fingerprint: str) -> None:
         for s in data.get("sessions", []):
             if s.get("token") == token:
                 s["fingerprint"] = new_fingerprint
-                s[_FINGERPRINT_V2_FLAG] = True
+                s[_CURRENT_FP_VERSION] = True
                 updated = True
                 break
         if updated:

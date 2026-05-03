@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import secrets
 import time
 from typing import Optional, Tuple
@@ -103,27 +104,45 @@ def normalize_ip(ip_raw: Optional[str]) -> str:
     return ip
 
 
-def compute_fingerprint(ip: str, user_agent: str) -> str:
-    """Return a short hex digest binding the session to User-Agent.
+_BROWSER_RE = re.compile(
+    r"(Chrome|Firefox|Safari|Edg|OPR|Opera)/(\d+)",
+)
 
-    V2 (UA-only). The IP component was dropped: behind any reverse
-    proxy (Swag / Traefik / nginx / Cloudflare) ``X-Forwarded-For``
-    can legitimately change between requests from the same browser
-    (CGNAT, ISP re-lease, WiFi → mobile, v4 ↔ v6 dual-stack hops).
-    Killing a session on IP change caused chunk uploads and media
-    range requests to 401 mid-flight. The UA-only fingerprint is
-    still a useful speed-bump against a stolen cookie being used
-    from a completely different browser or device.
+
+def compute_fingerprint(ip: str, user_agent: str) -> str:
+    """Return a short hex digest binding the session to browser identity.
+
+    V3 (browser-family + major-version only). The full UA was dropped
+    because Chrome DevTools responsive mode, the device toolbar, and
+    network-condition overrides all change the platform / device
+    tokens while keeping the browser version stable. Hashing the
+    full string caused sessions to be rejected when a developer
+    simply opened Inspect Element with the device toolbar active.
+
+    Non-browser clients (curl, scripts, mobile webviews without a
+    standard browser token) fall back to the full UA so different
+    tools still produce different fingerprints.
 
     The ``ip`` argument is accepted for call-site compatibility
     (``create_session`` still stores the IP on the session record
     for audit) but does not contribute to the hash.
     """
-    del ip  # ignored in V2 — see docstring
+    del ip  # ignored since V2 — see docstring
     norm_ua = (user_agent or "").strip()
+
+    # Extract the stable browser identity: family + major version.
+    # "Mozilla/5.0 ... Chrome/125.0.0.0 Safari/537.36" → "Chrome/125".
+    # Survives responsive-mode toggles, device-toolbar switches, and
+    # DevTools network-condition overrides.
+    match = _BROWSER_RE.search(norm_ua)
+    if match:
+        stable_part = f"{match.group(1)}/{match.group(2)}"
+    else:
+        stable_part = norm_ua
+
     h = hashlib.sha256()
-    h.update(b"ua-v2|")
-    h.update(norm_ua.encode("utf-8"))
+    h.update(b"ua-v3|")
+    h.update(stable_part.encode("utf-8"))
     return h.hexdigest()[:32]
 
 

@@ -168,15 +168,16 @@ def test_ip_change_alone_is_accepted(client):
     assert r2.status_code == 200
 
 
-def test_legacy_session_migrates_to_v2(client):
-    """Pre-fix sessions on disk stored a V1 fingerprint (IP + UA).
-    The middleware must accept such a session once under the V2
-    scheme and rewrite the stored fingerprint to the UA-only form.
+def test_legacy_session_migrates_to_current_version(client):
+    """Pre-fix sessions on disk stored an older fingerprint (V1: IP+UA,
+    V2: full UA). The middleware must accept such a session once under
+    the current scheme and rewrite the stored fingerprint to the V3
+    (browser-family + major-version) form.
     """
     async def _seed_legacy():
         u = await auth_store.create_user("alice", "supersecret")
         # Hand-craft a session with a V1-style fingerprint (IP+UA)
-        # and ``fp_v2`` left False to mark it as legacy.
+        # and both version flags left False to mark it as legacy.
         from backend.app.auth.models import Session
         from datetime import datetime, timedelta, timezone
         token = "legacy-token-abc"
@@ -192,7 +193,7 @@ def test_legacy_session_migrates_to_v2(client):
                 fingerprint=v1_fp,
                 ip="1.1.1.1", user_agent="BrowserA/1.0",
                 created_at=now, last_seen=now, expires_at=expires,
-                remember=True, fp_v2=False,
+                remember=True, fp_v2=False, fp_v3=False,
             ).to_storage())
             await auth_store._atomic_write_json(auth_store.SESSIONS_PATH, data)
         return token
@@ -206,18 +207,18 @@ def test_legacy_session_migrates_to_v2(client):
     )
     assert r.status_code == 200, r.text
 
-    # The stored fingerprint was rewritten to V2 (UA-only).
+    # The stored fingerprint was rewritten to V3.
     async def _reload():
         return await auth_store.get_session(token)
     got = asyncio.run(_reload())
     assert got is not None
-    assert got.fp_v2 is True
+    assert got.fp_v3 is True
     assert got.fingerprint == security.compute_fingerprint(
         "ignored", "BrowserA/1.0",
     )
 
-    # A second request with a DIFFERENT UA now fails the mismatch
-    # check (no more migration path left).
+    # A second request with a DIFFERENT browser family now fails the
+    # mismatch check (no more migration path left).
     r2 = client.get(
         "/api/auth/me",
         headers={"user-agent": "AttackerBrowser/0.0"},
