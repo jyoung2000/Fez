@@ -189,6 +189,9 @@ export class RenderPlanRenderer {
       case 'blur_fill':
         this._drawBlurFill(ctx, op);
         break;
+      case 'contextual_pan':
+        this._drawContextualPan(ctx, op, currentTimeSec);
+        break;
       case 'split_screen':
         this._drawSplitScreen(ctx, op);
         break;
@@ -249,20 +252,46 @@ export class RenderPlanRenderer {
   }
 
   /**
-   * WIDE_MASTER: letterbox with black bars.
-   * Mirrors FFmpeg: scale=tgt_w:-1, pad=tgt_w:tgt_h:0:(oh-ih)/2:black
+   * CONTEXTUAL_PAN: time-interpolated lateral pan (Ken Burns).
+   *
+   * Linear lerp between the first and last motion_path keypoints'
+   * crop x. Crop dimensions are constant; x is clamped so the
+   * window NEVER goes off-source (no black bars at the edges).
+   * Mirrors backend ffmpeg_filter_builder._filter_contextual_pan.
+   */
+  _drawContextualPan(ctx, op, currentTimeSec) {
+    const path = op.motion_path;
+    if (!path || path.length < 2) {
+      this._drawCrop(ctx, op);
+      return;
+    }
+    const tRel = currentTimeSec - op.start_sec;
+    const kp0 = path[0];
+    const kp1 = path[path.length - 1];
+    const dt = Math.max(1e-3, kp1.t - kp0.t);
+    let progress = (tRel - kp0.t) / dt;
+    if (progress < 0) progress = 0;
+    if (progress > 1) progress = 1;
+    const rect = lerpRect(kp0.rect, kp1.rect, progress);
+    const { x, y, w, h } = rectToPixels(rect, this.sourceW, this.sourceH);
+    ctx.drawImage(this.video, x, y, w, h, 0, 0, this.targetW, this.targetH);
+  }
+
+  /**
+   * WIDE_MASTER: full source frame preserved with a centered "letterbox-
+   * like" sharp content area, but the surrounding fill is a BLURRED,
+   * cover-fit duplicate of the source — NEVER solid black bars.
+   *
+   * Phase 4 of the reframing overhaul redefined this op's semantics:
+   * black-bar letterboxing was eliminated. Implementation mirrors
+   * _drawBlurFill (the two ops are functionally identical at the
+   * renderer level).
+   *
+   * Mirrors FFmpeg: split + gblur(sigma=50) + overlay (see
+   * backend/services/ffmpeg_filter_builder._filter_wide_master).
    */
   _drawWideMaster(ctx, op) {
-    // Fill with black
-    ctx.fillStyle = 'black';
-    ctx.fillRect(0, 0, this.targetW, this.targetH);
-
-    // Scale source to target width, maintain aspect ratio
-    const scaledH = Math.round(this.sourceH * (this.targetW / this.sourceW));
-    const yOffset = Math.round((this.targetH - scaledH) / 2);
-
-    ctx.drawImage(this.video, 0, 0, this.sourceW, this.sourceH,
-                  0, yOffset, this.targetW, scaledH);
+    this._drawBlurFill(ctx, op);
   }
 
   /**

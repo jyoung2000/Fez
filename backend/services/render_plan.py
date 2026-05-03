@@ -24,8 +24,20 @@ USE_RENDER_PLAN = os.environ.get("USE_RENDER_PLAN", "true").lower() in ("true", 
 class RenderOpKind(str, Enum):
     CROP = "crop"                          # static rectangle crop (STATIONARY)
     TRACKING_CROP = "tracking_crop"        # animated crop via motion_path
-    WIDE_MASTER = "wide_master"            # letterbox: source centered, black bars
-    BLUR_FILL = "blur_fill"               # source centered, blurred dup as bg
+    # WIDE_MASTER: full source frame preserved with a centered "letterbox-
+    # like" sharp content area, but the surrounding fill is a BLURRED,
+    # cover-fit duplicate of the source — never solid black bars. Both
+    # the FFmpeg filter builder and the frontend Canvas renderer enforce
+    # this: any black bar in the output is a Phase-4 regression bug.
+    WIDE_MASTER = "wide_master"
+    # BLUR_FILL: source centered, blurred duplicate of source as
+    # background. Same no-black-bars contract as WIDE_MASTER. The two
+    # ops are functionally identical at the renderer level; the
+    # distinction lets upstream pipelines route shots that *want* the
+    # full source preserved (BLUR_FILL) vs. shots that landed on a
+    # wide-master strategy because no specific subject was found
+    # (WIDE_MASTER). Either way: blurred-fill background, never black.
+    BLUR_FILL = "blur_fill"
     SPLIT_SCREEN = "split_screen"         # 2 crops stacked vertically, each 50%
     STACKED_GAMEPLAY = "stacked_gameplay"  # gameplay top 60%, facecam bottom 40%
     GRID_2X2 = "grid_2x2"                 # 4 tiles in 2x2
@@ -36,6 +48,14 @@ class RenderOpKind(str, Enum):
     # the FFmpeg builder interpolates w/h linearly along with x/y.
     MOTIVATED_PUSH_IN = "motivated_push_in"
     MOTIVATED_PULL_OUT = "motivated_pull_out"
+    # Phase 4: contextual Ken Burns pan. Time-interpolated crop x (and
+    # optionally y) producing a smooth lateral pan across an
+    # establishing/wide shot. ``primary_rect`` carries the starting
+    # crop; ``motion_path`` carries a 2-keypoint linear ramp from
+    # start crop -> end crop. The crop dimensions are constant (a
+    # single 9:16 window). x is clamped to [0, source_w - crop_w] so
+    # the renderer NEVER produces black bars.
+    CONTEXTUAL_PAN = "contextual_pan"
 
 
 @dataclass
@@ -76,10 +96,19 @@ class RenderOp:
     """A single reframing operation over a time window.
 
     primary_rect is always populated. Others depend on kind:
-      CROP, TRACKING_CROP, WIDE_MASTER, BLUR_FILL -> primary only
+      CROP, WIDE_MASTER, BLUR_FILL -> primary only
+      TRACKING_CROP, CONTEXTUAL_PAN, MOTIVATED_PUSH_IN, MOTIVATED_PULL_OUT
+        -> primary + motion_path (the start keypoint mirrors primary_rect;
+        the last motion_path entry is the end keypoint)
       SPLIT_SCREEN -> primary (top) + secondary (bottom)
       STACKED_GAMEPLAY -> primary (gameplay) + secondary (facecam)
       GRID_2X2 -> primary, secondary, tertiary, quaternary
+
+    WIDE_MASTER and BLUR_FILL ALWAYS render with a blurred-fill
+    background (never black bars). Phase 4 of the reframing overhaul
+    redefined WIDE_MASTER's semantics: black-bar letterboxing was
+    eliminated in both the FFmpeg filter builder and the frontend
+    Canvas renderer.
     """
     kind: RenderOpKind
     start_sec: float
@@ -187,11 +216,13 @@ class RenderPlan:
                     else:
                         _check_rect(violations, f"{prefix}.{label}", rect)
 
-            # TRACKING_CROP / motivated-zoom ops must have motion_path
+            # TRACKING_CROP / motivated-zoom / contextual-pan ops must
+            # have motion_path
             if op.kind in (
                 RenderOpKind.TRACKING_CROP,
                 RenderOpKind.MOTIVATED_PUSH_IN,
                 RenderOpKind.MOTIVATED_PULL_OUT,
+                RenderOpKind.CONTEXTUAL_PAN,
             ):
                 if not op.motion_path:
                     violations.append(

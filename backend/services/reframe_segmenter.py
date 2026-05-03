@@ -170,6 +170,14 @@ class ReframeSegment:
     # render plan + clip exporter read this to pick the FFmpeg
     # filter graph per segment instead of one mode per clip.
     gaming_layout_mode: Optional[str] = None
+    # ── Phase 4 (reframing overhaul): contextual_pan endpoints ──
+    # When ``strategy == "contextual_pan"``, these carry the LEFT
+    # edge of the crop window at the start and end of the segment,
+    # as fractions of source width in [0, 1]. The render_plan_builder
+    # turns them into a 2-keypoint motion_path. ``None`` => default
+    # left-to-right pan (limited by speed cap).
+    pan_start: Optional[float] = None
+    pan_end: Optional[float] = None
 
 
 def build_reframe_segments(
@@ -1819,6 +1827,105 @@ def build_reframe_segments(
         logger.warning(
             "[%s] speaker_cut_engine override failed (non-fatal): %s",
             job_id, _scs_exc,
+        )
+
+    # ── Stage 10a-bis: Phase 4 contextual pan + blur-fill preserve ──
+    # For shots whose advisor strategy is CONTEXTUAL_PAN or
+    # BLUR_FILL_PRESERVE, rewrite the segments inside that shot's
+    # bounds to use the matching layout/strategy. CONSERVATIVE: only
+    # touch shots whose advice is one of these two, leave everything
+    # else alone. The render_plan_builder picks up the rewritten
+    # strategy and emits a CONTEXTUAL_PAN or BLUR_FILL RenderOp.
+    try:
+        if shot_advice_list:
+            from backend.services.shot_reframe_advisor import ReframeStrategy as _RFS
+
+            _phase4_starts = [0.0] + sorted(shot_cuts or [])
+            _phase4_ends = sorted(shot_cuts or []) + [video_duration]
+            _phase4_shot_bounds = list(zip(_phase4_starts, _phase4_ends))
+
+            _phase4_pan_count = 0
+            _phase4_blur_count = 0
+
+            for _advice in shot_advice_list:
+                _adv_strategy = getattr(_advice, "strategy", None)
+                if _adv_strategy not in (
+                    _RFS.CONTEXTUAL_PAN, _RFS.BLUR_FILL_PRESERVE,
+                ):
+                    continue
+                _adv_idx = int(getattr(_advice, "shot_idx", -1))
+                if _adv_idx < 0 or _adv_idx >= len(_phase4_shot_bounds):
+                    continue
+                _shot_s, _shot_e = _phase4_shot_bounds[_adv_idx]
+                if _shot_e <= _shot_s:
+                    continue
+
+                # Compute pan endpoints from the advisor's primary
+                # subject bbox (highest-saliency peak) when present.
+                # Spec: start at highest saliency, end at second
+                # highest, else left-to-right.
+                _pan_start_frac = None
+                _pan_end_frac = None
+                if _adv_strategy == _RFS.CONTEXTUAL_PAN:
+                    # 9:16 crop window width as a fraction of source.
+                    # Source aspect varies; assume target_aspect ~= 9/16
+                    # downstream — the builder will re-clamp anyway.
+                    _crop_w = (9.0 / 16.0) * (
+                        float(source_height) / float(max(1, source_width))
+                    )
+                    _crop_w = max(0.05, min(_crop_w, 1.0))
+
+                    _primary_bbox = getattr(_advice, "primary_subject_bbox", None)
+                    _secondary = getattr(_advice, "secondary_subjects", None) or []
+
+                    def _bbox_left(bb, w):
+                        cx = float(bb[0])
+                        return max(0.0, min(cx - w / 2.0, 1.0 - w))
+
+                    if _primary_bbox is not None:
+                        _pan_start_frac = _bbox_left(_primary_bbox, _crop_w)
+                        if _secondary:
+                            _pan_end_frac = _bbox_left(_secondary[0], _crop_w)
+                        else:
+                            # Only one peak: pan toward the side that
+                            # has more travel room (typically L→R).
+                            _max_left = max(0.0, 1.0 - _crop_w)
+                            _pan_end_frac = _max_left if _pan_start_frac < _max_left / 2.0 else 0.0
+
+                for seg in raw_segments:
+                    if seg.start + 1e-9 < _shot_s:
+                        continue
+                    if seg.end - 1e-9 > _shot_e:
+                        continue
+
+                    if _adv_strategy == _RFS.BLUR_FILL_PRESERVE:
+                        seg.strategy = "blur_fill"
+                        seg.layout = "blur_fill"
+                        seg.reason = "shot_advice_blur_fill_preserve"
+                        seg.ease_in_ms = 0
+                        seg.motion_path = None
+                        _phase4_blur_count += 1
+                    elif _adv_strategy == _RFS.CONTEXTUAL_PAN:
+                        seg.strategy = "contextual_pan"
+                        seg.layout = "single"
+                        seg.reason = "shot_advice_contextual_pan"
+                        seg.ease_in_ms = 0
+                        seg.motion_path = None
+                        if _pan_start_frac is not None:
+                            seg.pan_start = _pan_start_frac
+                        if _pan_end_frac is not None:
+                            seg.pan_end = _pan_end_frac
+                        _phase4_pan_count += 1
+
+            if _phase4_pan_count or _phase4_blur_count:
+                _log(
+                    "phase4 advisor override: %d contextual_pan, %d blur_fill_preserve",
+                    _phase4_pan_count, _phase4_blur_count,
+                )
+    except Exception as _phase4_exc:
+        logger.warning(
+            "[%s] phase4 advisor override failed (non-fatal): %s",
+            job_id, _phase4_exc,
         )
 
     # ── Stage 10b: Phase 2 composition guardrails ──

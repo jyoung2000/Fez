@@ -154,9 +154,72 @@ def _build_op_filter(
         return _filter_grid_2x2(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
     elif op.kind in (RenderOpKind.MOTIVATED_PUSH_IN, RenderOpKind.MOTIVATED_PULL_OUT):
         return _filter_motivated_zoom(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
+    elif op.kind == RenderOpKind.CONTEXTUAL_PAN:
+        return _filter_contextual_pan(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
     else:
         # Fallback to crop
         return _filter_crop(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
+
+
+def _filter_contextual_pan(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> str:
+    """CONTEXTUAL_PAN: time-interpolated crop x (Ken Burns lateral pan).
+
+    Two ``motion_path`` keypoints define a linear x-ramp across the
+    source. Crop dimensions are constant (single 9:16 window). The
+    ``x`` expression is clamped to ``[0, source_w - crop_w]`` via
+    ``clip()`` so the renderer NEVER produces black bars at the
+    source edges. Compatible with FFmpeg 5.x/6.x.
+
+    Returns the filter chain string. Falls back to a static CROP if
+    the motion_path is missing or has < 2 keypoints.
+    """
+    kps = op.motion_path or []
+    if len(kps) < 2:
+        return _filter_crop(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
+
+    kp0, kp1 = kps[0], kps[-1]
+    # Crop dimensions come from the first keypoint (must be constant
+    # across keypoints by construction; we use kp0 deterministically).
+    _, _, pw, ph = kp0.rect.to_pixels(src_w, src_h)
+
+    # Clamp keypoint times to the segment-relative window. The ffmpeg
+    # ``t`` variable is rebased to 0 by the ``setpts=PTS-STARTPTS``
+    # ahead of the crop, so motion_path times are already in
+    # segment-local seconds (consistent with how
+    # ``_filter_motivated_zoom`` handles them).
+    t0 = max(0.0, float(kp0.t))
+    t1 = max(t0 + 1e-3, float(kp1.t))
+
+    # Convert normalized x-positions to pixel-space x offsets for the
+    # crop. Note: kp.rect.x is the LEFT edge of the crop window in
+    # normalized [0, 1].
+    x0_px = float(kp0.rect.x) * src_w
+    x1_px = float(kp1.rect.x) * src_w
+
+    max_x = max(0, src_w - pw)
+
+    # Even if the planner already clamped the keypoints, defend with
+    # an additional clamp inside the FFmpeg expression (NEVER produce
+    # black bars). FFmpeg expression escapes commas with backslashes.
+    if abs(x1_px - x0_px) < 1e-3:
+        x_expr = f"{x0_px:.2f}"
+    else:
+        x_expr = (
+            f"{x0_px:.2f}+({x1_px - x0_px:.2f})*"
+            f"clip((t-{t0:.3f})/{t1 - t0:.3f}\\,0\\,1)"
+        )
+    x_expr_clamped = f"clip({x_expr}\\,0\\,{max_x})"
+
+    # y is locked to the keypoint's y (typical: 0 for full-height crop).
+    y_px = float(kp0.rect.y) * src_h
+    max_y = max(0, src_h - ph)
+    y_clamped = max(0, min(int(round(y_px)), max_y))
+
+    return (
+        f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
+        f"crop={pw}:{ph}:{x_expr_clamped}:{y_clamped},"
+        f"scale={tgt_w}:{tgt_h}:flags=lanczos[{label}]"
+    )
 
 
 def _filter_motivated_zoom(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> str:
@@ -366,11 +429,24 @@ def _build_piecewise_x_expr(keypoints, src_w, src_h, crop_w) -> str:
 
 
 def _filter_wide_master(op, label, tgt_w, tgt_h, start, end) -> str:
-    """WIDE_MASTER: letterbox with black bars."""
+    """WIDE_MASTER: full source frame preserved with a centered "letterbox-
+    like" sharp content area, but the surrounding fill is a BLURRED,
+    cover-fit duplicate of the source — never solid black bars.
+
+    Phase 4 of the reframing overhaul redefined this op's semantics
+    explicitly to kill black bars (any black bar in the output is a
+    Phase-4 regression). The implementation is the same blurred-fill
+    chain as :func:`_filter_blur_fill`; the two ops are functionally
+    identical at the renderer level.
+    """
     return (
         f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
-        f"scale={tgt_w}:-1:flags=lanczos,"
-        f"pad={tgt_w}:{tgt_h}:0:(oh-ih)/2:black[{label}]"
+        f"split=2[fg{label}][bg{label}];\n"
+        f"[bg{label}]scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=increase,"
+        f"crop={tgt_w}:{tgt_h},"
+        f"gblur=sigma={BLUR_SIGMA},eq=brightness={BLUR_BRIGHTNESS}[bgblur{label}];\n"
+        f"[fg{label}]scale={tgt_w}:-1:flags=lanczos[fgs{label}];\n"
+        f"[bgblur{label}][fgs{label}]overlay=(W-w)/2:(H-h)/2[{label}]"
     )
 
 

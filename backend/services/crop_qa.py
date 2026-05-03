@@ -18,14 +18,33 @@ Gated behind ``CLIPAI_CROP_QA`` env var. Default OFF.
 Pure scoring module: all heavy lifting (VLM call, FFmpeg frame
 extraction) is injected as callables so the module is testable
 without opencv / ffmpeg / httpx in the test environment.
+
+Phase 4 of the reframing overhaul also added
+:func:`validate_no_black_bars` — a structural QA pass that catches
+black-bar regressions on rendered output. It samples the rendered
+file at ~1 fps and inspects the four edges of each frame; any
+near-black border is logged and reported as a QA failure.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
+from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 CROP_QA_ENV = "CLIPAI_CROP_QA"
+
+# ── No-black-bars validation (Phase 4) ─────────────────────────────
+# Mean pixel value below this threshold counts a border as "black".
+BLACK_BAR_PIXEL_THRESHOLD = 10.0
+# Border thickness sampled at each edge, in pixels.
+BLACK_BAR_BORDER_PX = 5
 
 # Threshold table for recovery decisions. Tuned against the
 # prompt spec (see docs/vlm_upgrade/PHASE_5_NOTES.md).
@@ -171,3 +190,194 @@ def apply_recovery_params(
         return (dead_zone_px, lambda2, crop_padding_frac + 0.05)
     # safety_center or unknown → caller handles centering separately.
     return (dead_zone_px, lambda2, crop_padding_frac)
+
+
+# ── Phase 4: no-black-bars structural QA ───────────────────────────
+
+
+@dataclass
+class CropQaReport:
+    """Structural QA report for a rendered output file (Phase 4).
+
+    ``passed`` is True iff no sampled frame had a black border on any
+    of its four edges. ``frames_with_black`` lists the frame indices
+    (0-based; one frame per second of sampling) that flagged. The
+    optional ``note`` carries a one-line diagnostic when the QA
+    pass could not run (e.g. ffmpeg not on the PATH).
+    """
+
+    passed: bool
+    frames_with_black: List[int] = field(default_factory=list)
+    total_frames_sampled: int = 0
+    note: Optional[str] = None
+
+
+def _ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+def _probe_dimensions(rendered_path: str) -> Optional[tuple]:
+    """Return (width, height, duration_sec) for ``rendered_path`` or None."""
+    if shutil.which("ffprobe") is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height:format=duration",
+                "-of", "default=noprint_wrappers=1",
+                rendered_path,
+            ],
+            capture_output=True, text=True, timeout=15.0,
+        )
+        if result.returncode != 0:
+            return None
+        meta = {}
+        for line in result.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                meta[k.strip()] = v.strip()
+        w = int(meta.get("width", 0) or 0)
+        h = int(meta.get("height", 0) or 0)
+        dur = float(meta.get("duration", 0.0) or 0.0)
+        if w <= 0 or h <= 0:
+            return None
+        return (w, h, dur)
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return None
+
+
+def _extract_raw_frames(rendered_path: str, fps: float, w: int, h: int) -> Optional[bytes]:
+    """Extract raw rgb24 frames at ``fps`` to memory. Returns bytes or None.
+
+    Each frame is ``w*h*3`` bytes. Limits at 600 frames (~10 min @ 1 fps)
+    to keep memory bounded.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-nostdin",
+                "-i", rendered_path,
+                "-vf", f"fps={fps:g}",
+                "-frames:v", "600",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-",
+            ],
+            capture_output=True, timeout=120.0,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+
+def _frame_edge_means(frame: "object", w: int, h: int) -> tuple:
+    """Return mean pixel intensity for each edge: (top, bottom, left, right).
+
+    ``frame`` is a numpy array of shape (h, w, 3) with dtype uint8.
+    Computes a luma-ish mean over a ``BLACK_BAR_BORDER_PX``-wide
+    border on each edge.
+    """
+    import numpy as np
+    border = max(1, int(BLACK_BAR_BORDER_PX))
+    border = min(border, h // 2, w // 2)
+    top = float(np.mean(frame[:border, :, :]))
+    bottom = float(np.mean(frame[-border:, :, :]))
+    left = float(np.mean(frame[:, :border, :]))
+    right = float(np.mean(frame[:, -border:, :]))
+    return (top, bottom, left, right)
+
+
+def validate_no_black_bars(rendered_path: str, fps: float = 1.0) -> CropQaReport:
+    """Sample frames from ``rendered_path`` and check all 4 edges for black.
+
+    Phase 4 of the reframing overhaul. Black bars on any side are a
+    regression: WIDE_MASTER and BLUR_FILL render with a blurred
+    background, never solid black. This pass catches it.
+
+    Parameters
+    ----------
+    rendered_path : str
+        Path to the rendered output mp4.
+    fps : float
+        Sampling rate; default 1 frame per second.
+
+    Returns
+    -------
+    CropQaReport
+        ``passed=False`` when any sampled frame has a near-black
+        border. Gracefully returns ``passed=True`` with a ``note``
+        when ffmpeg/ffprobe or numpy is not available so callers do
+        not break.
+    """
+    if not rendered_path or not os.path.exists(rendered_path):
+        return CropQaReport(
+            passed=True, total_frames_sampled=0,
+            note=f"file not found: {rendered_path!r}",
+        )
+
+    if not _ffmpeg_available():
+        logger.info(
+            "validate_no_black_bars: ffmpeg/ffprobe not available; skipping",
+        )
+        return CropQaReport(
+            passed=True, total_frames_sampled=0,
+            note="ffmpeg or ffprobe not available — QA skipped",
+        )
+
+    try:
+        import numpy as np  # noqa: F401
+    except ImportError:
+        return CropQaReport(
+            passed=True, total_frames_sampled=0,
+            note="numpy not available — QA skipped",
+        )
+
+    dims = _probe_dimensions(rendered_path)
+    if dims is None:
+        return CropQaReport(
+            passed=True, total_frames_sampled=0,
+            note="ffprobe failed to read video dimensions",
+        )
+    w, h, _dur = dims
+
+    raw = _extract_raw_frames(rendered_path, fps=fps, w=w, h=h)
+    if not raw:
+        return CropQaReport(
+            passed=True, total_frames_sampled=0,
+            note="ffmpeg frame extraction returned no data",
+        )
+
+    import numpy as np
+    frame_size = w * h * 3
+    n_frames = len(raw) // frame_size
+    if n_frames == 0:
+        return CropQaReport(
+            passed=True, total_frames_sampled=0,
+            note="no frames decoded from extraction",
+        )
+
+    arr = np.frombuffer(raw, dtype=np.uint8, count=n_frames * frame_size)
+    arr = arr.reshape((n_frames, h, w, 3))
+
+    bad: List[int] = []
+    for idx in range(n_frames):
+        top, bottom, left, right = _frame_edge_means(arr[idx], w, h)
+        if (top < BLACK_BAR_PIXEL_THRESHOLD or
+                bottom < BLACK_BAR_PIXEL_THRESHOLD or
+                left < BLACK_BAR_PIXEL_THRESHOLD or
+                right < BLACK_BAR_PIXEL_THRESHOLD):
+            bad.append(idx)
+            logger.warning(
+                "validate_no_black_bars: frame %d has black border "
+                "(top=%.1f bot=%.1f left=%.1f right=%.1f, threshold=%.1f)",
+                idx, top, bottom, left, right, BLACK_BAR_PIXEL_THRESHOLD,
+            )
+
+    return CropQaReport(
+        passed=len(bad) == 0,
+        frames_with_black=bad,
+        total_frames_sampled=n_frames,
+    )

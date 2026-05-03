@@ -27,7 +27,19 @@ _STRATEGY_TO_KIND = {
     "split_screen": RenderOpKind.SPLIT_SCREEN,
     "stacked_gameplay": RenderOpKind.STACKED_GAMEPLAY,
     "grid": RenderOpKind.GRID_2X2,
+    # Phase 4: contextual Ken Burns pan. Segmenter sets strategy
+    # ``contextual_pan`` and (if a saliency peak is known) writes a
+    # ``pan_start`` / ``pan_end`` pair as fractional source x in
+    # [0, 1] of the LEFT edge of the crop window. The builder reads
+    # those into a 2-keypoint motion_path. Falls back to L→R full pan
+    # when no pan_start/pan_end exists.
+    "contextual_pan": RenderOpKind.CONTEXTUAL_PAN,
 }
+
+# Phase 4: pan-speed limits for CONTEXTUAL_PAN, in fractions of source
+# width per second. Spec: 5–15% of source width / second.
+PAN_SPEED_MIN_FRAC_PER_SEC = 0.05
+PAN_SPEED_MAX_FRAC_PER_SEC = 0.15
 
 # Aspect ratio string -> float (width / height)
 _ASPECT_RATIOS = {
@@ -279,6 +291,37 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             speaker_slot=speaker_slot,
         )
 
+    elif kind == RenderOpKind.CONTEXTUAL_PAN:
+        # Phase 4: Ken Burns lateral pan across an establishing/wide
+        # shot. ``primary_rect`` carries the starting crop window;
+        # ``motion_path`` carries a 2-keypoint linear ramp from
+        # start crop -> end crop. The crop dimensions are constant
+        # (a 9:16 window). Pan endpoints come from the segment's
+        # ``pan_start`` / ``pan_end`` (each = the LEFT edge of the
+        # crop window, as a 0-1 fraction of source width).
+        pan_start_frac = getattr(seg, "pan_start", None)
+        pan_end_frac = getattr(seg, "pan_end", None)
+        primary_rect, motion_path = _compute_contextual_pan_rects(
+            pan_start_frac=pan_start_frac,
+            pan_end_frac=pan_end_frac,
+            seg_start=seg.start,
+            seg_end=seg.end,
+            source_w=source_w,
+            source_h=source_h,
+            target_aspect=aspect_ratio,
+        )
+        return RenderOp(
+            kind=kind,
+            start_sec=seg.start,
+            end_sec=seg.end,
+            primary_rect=primary_rect,
+            motion_path=motion_path,
+            ease_in_ms=ease_in_ms,
+            strategy_label=f"contextual_pan_{reason}",
+            content_type=content_type,
+            speaker_slot=speaker_slot,
+        )
+
     elif kind == RenderOpKind.SPLIT_SCREEN:
         primary_rect, secondary_rect = _compute_split_rects(
             seg, source_w, source_h, aspect_ratio, ratio_top=0.5, ratio_bottom=0.5,
@@ -446,6 +489,72 @@ def _build_motion_path(
         keypoints = decimated
 
     return keypoints
+
+
+def _compute_contextual_pan_rects(
+    pan_start_frac,
+    pan_end_frac,
+    seg_start: float,
+    seg_end: float,
+    source_w: int,
+    source_h: int,
+    target_aspect: float,
+) -> Tuple[Rect, List[MotionKeypoint]]:
+    """Compute the primary rect + 2-keypoint motion path for CONTEXTUAL_PAN.
+
+    ``pan_start_frac`` and ``pan_end_frac`` are the LEFT edge of the
+    crop window as fractions of source width in [0, 1]. They may be
+    None — in that case the pan defaults to a left-to-right pan
+    across as much source as the speed limit (5–15% of source width
+    per second) allows.
+
+    Crop dimensions are a constant 9:16-or-other window matching
+    ``target_aspect``. Pan distance is clamped to the speed band
+    so short shots get partial pans.
+    """
+    src_aspect = source_w / source_h if source_h > 0 else 1.0
+    duration = max(0.0, float(seg_end) - float(seg_start))
+
+    if target_aspect < src_aspect:
+        # Vertical crop window inside a wider source.
+        crop_w_norm = (target_aspect * source_h) / source_w
+        crop_h_norm = 1.0
+    else:
+        crop_w_norm = 1.0
+        crop_h_norm = (source_w / target_aspect) / source_h
+        crop_h_norm = min(1.0, crop_h_norm)
+
+    max_left_norm = max(0.0, 1.0 - crop_w_norm)
+
+    # Resolve start/end LEFT-edge positions in 0-1 normalized source.
+    if pan_start_frac is None:
+        start_left = 0.0
+    else:
+        start_left = max(0.0, min(float(pan_start_frac), max_left_norm))
+
+    if pan_end_frac is None:
+        end_left = max_left_norm
+    else:
+        end_left = max(0.0, min(float(pan_end_frac), max_left_norm))
+
+    # Apply pan-speed limit. Speed band 5–15% of source width / sec
+    # (spec). The MAX is the hard cap; we clamp the requested travel
+    # to ``max_speed * duration``. Short shots → only partial pan.
+    max_travel = PAN_SPEED_MAX_FRAC_PER_SEC * duration
+    requested_travel = end_left - start_left
+    if abs(requested_travel) > max_travel and max_travel > 0:
+        sign = 1.0 if requested_travel >= 0 else -1.0
+        end_left = start_left + sign * max_travel
+        end_left = max(0.0, min(end_left, max_left_norm))
+
+    primary_rect = Rect(x=start_left, y=0.0, w=crop_w_norm, h=crop_h_norm)
+    end_rect = Rect(x=end_left, y=0.0, w=crop_w_norm, h=crop_h_norm)
+
+    motion_path = [
+        MotionKeypoint(t=0.0, rect=primary_rect),
+        MotionKeypoint(t=max(duration, 1e-3), rect=end_rect),
+    ]
+    return primary_rect, motion_path
 
 
 def _compute_split_rects(

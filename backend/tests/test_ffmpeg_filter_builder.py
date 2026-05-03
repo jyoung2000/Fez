@@ -65,15 +65,23 @@ class TestCropFilter:
 
 
 class TestWideMasterFilter:
-    def test_wide_master_has_pad(self):
+    def test_wide_master_uses_blurred_fill(self):
+        """Phase 4: WIDE_MASTER renders a blurred-fill background,
+        NOT black-bar letterboxing. Any ``pad=`` in the graph would
+        be a regression."""
         plan = _make_plan([RenderOp(
             kind=RenderOpKind.WIDE_MASTER,
             start_sec=0.0, end_sec=5.0,
             primary_rect=Rect(0, 0, 1, 1),
         )])
         graph = _build_filter_graph(plan)
-        assert "pad=1080:1920" in graph
-        assert "scale=1080:-1" in graph
+        # Blurred-fill chain hallmarks
+        assert "gblur=" in graph
+        assert "overlay=" in graph
+        assert "split=2" in graph
+        # No black-bar pad anywhere
+        assert "pad=" not in graph
+        assert ":black" not in graph
 
 
 class TestBlurFillFilter:
