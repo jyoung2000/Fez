@@ -120,3 +120,86 @@ The solver selection (`CLIPAI_L1_SOLVER=auto`, the new default) works as follows
 
 Baseline (before): Sub-second recall 100%, overlaps 0, lag -6 frames.
 After parity pass: Sub-second recall 100%, overlaps 0, lag -6 frames. No regression.
+
+## Universal Reframe Quality Scorer (Phase 6)
+
+`backend/services/reframe_quality_scorer.py` is a single-call grader
+that walks any finished `RenderPlan` and produces a 0-100 score along
+five axes plus an aggregate. It is the contract surface used by the
+smoke harness, by pipeline self-checks, and (eventually) by the
+auto-recovery loop.
+
+### Five quality axes and weights
+
+| Axis | Weight | What it measures |
+|------|-------:|------------------|
+| Subject Visibility     | 30 % | % of expected primary-subject bbox visible per frame, averaged. Target > 85. |
+| Composition            | 25 % | Per-frame 5-axis × 20pt: headroom in [5%, 15%], not within 5% of any crop edge, near rule-of-thirds, look space when gaze angled, essential text visible. |
+| Motion Smoothness      | 20 % | `100 − (mean |2nd-derivative crop_cx| / max_expected) × 100`. Hard cuts excluded. |
+| Black Bar              | 15 % | Estimated mode: `100 × (1 − ops_with_aspect_mismatch / ops_total)`. Rendered mode (when `rendered_path` is supplied): `100 × (1 − frames_with_black / sampled)` from `crop_qa.validate_no_black_bars`. The smaller of the two wins. |
+| Genre Appropriateness  | 10 % | Per-genre rule (table below). |
+
+`overall = 0.30 × subject + 0.25 × composition + 0.20 × smoothness + 0.15 × black_bar + 0.10 × genre`
+
+### Per-genre target scores
+
+| Content type | Rule | Score 100 if … |
+|--------------|------|-----------------|
+| `talking_head`, `multi_speaker_panel`, `podcast`, `vlog` | Speaker-driven layout | `STATIC_CENTER + SPEAKER_ALTERNATING ≥ 80%` of total duration |
+| `sports*` (basketball, racing, generic) | No blur-fill on action | `BLUR_FILL_PRESERVE = 0%` |
+| `animation`, `animation_dialogue`, `anime` | Hold steady on dialogue | `STATIC_CENTER ≥ 70%` |
+| `gameplay*`, `stream` | Tile facecam | When `has_facecam=True` → `MULTI_REGION > 0%`. Without facecam → always 100. |
+| `music_video` | Don't snap to one performer | `SPEAKER_ALTERNATING = 0%` |
+
+Anything not listed scores 100 (no-op).
+
+### Operating modes
+
+* **Estimated mode** (default, fast, no I/O): score from the render plan + the source-side analysis (face tracks, gaze, OCR text regions). Used in CI, pipeline self-check, and the smoke harness. Performance budget: < 2 s per minute of source on CPU.
+* **Rendered mode** (optional): pass `rendered_path=<output.mp4>`. The scorer runs `crop_qa.validate_no_black_bars` against the actual rendered file. Skips silently when ffmpeg / numpy are missing (a note is appended to `QualityScores.notes`).
+
+### How to run the smoke harness
+
+```
+python backend/scripts/smoke_test_universal_reframe.py \
+    --input /path/to/test_videos/ \
+    --output report.json
+```
+
+Behavior:
+
+1. Walks the directory (or accepts a single file).
+2. Runs each clip through the full pipeline with `CLIPAI_HUMAN_REFRAME=1`.
+3. Extracts the `RenderPlan` and grades it via `score_render_plan`.
+4. Prints per-clip scores + a summary line.
+5. Writes the JSON report to `--output`.
+
+Exit codes: `0` everything passes (≥ 75), `1` something needs review (50-74), `2` something fails (< 50), `3` no clips found.
+
+### Reading the guardrail report
+
+The composition guardrails (Phase 2 of the overhaul, see `backend/services/composition_guardrails.py`) populate a `GuardrailReport` whenever they run. The fields:
+
+* `total_frames` — frames in the analyzed crop path
+* `violations_found` — every rule trip we detected (priority order: no-black-space → pan-speed → min-hold → headroom → edge-avoidance → look-space → text-protection)
+* `violations_fixed` — automatically corrected by the guardrail pass
+* `violations_unfixable` — flagged but couldn't be corrected (typically: text + subject conflict where subject wins)
+* `per_rule_counts` — which rule fired how many times
+* `worst_frame` — the index with the highest violation count
+* `needs_human_review` — True when > 10 % of frames have unfixable violations
+
+Output line in the smoke summary:
+
+```
+Guardrail Report: 12 violations found, 12 fixed, 0 unfixable
+```
+
+A non-zero `unfixable` count is the operator's cue to inspect the clip — usually it points at a shot where essential burned-in text and the subject can't both fit in 9:16.
+
+### Known limitations
+
+* The smoke harness requires the full pipeline stack (numpy + ffmpeg + the rest of the heavy deps). When those are missing, every clip is marked `SKIPPED: missing dependency — …` and the JSON report shape is preserved. CI uses the GPU image; the bare test sandbox does not run the harness end-to-end.
+* The estimated black-bar score is structural, not perceptual: it flags op kinds whose primary rect aspect mismatches the target. The rendered mode catches actual black borders that slip through the renderer (regression sentinel for Phase 4).
+* The Motion Smoothness axis ignores hard cuts (frame-to-frame deltas > 50 % of the source width). It is therefore a poor metric on speaker-alternating timelines unless you score per-shot.
+* Genre rules are static; they don't penalize obvious within-genre quality regressions (e.g. a podcast that locks one speaker for 100 % of duration would score 100 on Genre Appropriateness — Subject Visibility carries the load there).
+
