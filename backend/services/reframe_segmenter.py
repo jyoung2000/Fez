@@ -195,6 +195,7 @@ def build_reframe_segments(
     diarization_segments: list = None,
     cluster_to_slot: dict = None,
     debug_out: Optional[dict] = None,
+    shot_advice_list: Optional[list] = None,
 ) -> list[ReframeSegment]:
     """Build a segment-based reframe timeline.
 
@@ -1694,6 +1695,131 @@ def build_reframe_segments(
 
     if l1_count > 0:
         _log("L1 camera path solved for %d segments", l1_count)
+
+    # ── Stage 10a: Phase 3 speaker-cut engine override ──
+    # For shots whose advisor strategy is SPEAKER_ALTERNATING, replace
+    # the L1-solved smooth path with hard cuts produced by the
+    # speaker_cut_engine. This is a CONSERVATIVE override: only the
+    # segments that fall inside a SPEAKER_ALTERNATING shot are touched;
+    # everything else keeps its existing behavior.
+    try:
+        if shot_advice_list:
+            from backend.services.shot_reframe_advisor import ReframeStrategy
+            from backend.services.speaker_cut_engine import (
+                SpeakerTurn as _SCSpeakerTurn,
+                plan_speaker_cuts as _plan_speaker_cuts,
+            )
+            from backend.services.reframe_config import (
+                get_default_config as _scs_default_cfg,
+            )
+
+            _scs_cfg = _scs_default_cfg()
+
+            # Build the shot start/end list from the same shot_cuts the
+            # caller used (matching pipeline.py's _starts/_ends layout).
+            _scs_starts = [0.0] + sorted(shot_cuts or [])
+            _scs_ends = sorted(shot_cuts or []) + [video_duration]
+            _scs_shot_bounds = list(zip(_scs_starts, _scs_ends))
+
+            # Build slot → x_frac map from the registry (slot.x_center
+            # is in 0-100 percent space).
+            _scs_positions: dict = {}
+            try:
+                for sid, slot in (face_registry.slots or {}).items():
+                    xc = float(getattr(slot, "x_center", 50.0)) / 100.0
+                    _scs_positions[str(sid)] = xc
+            except Exception:
+                _scs_positions = {}
+
+            scs_segments_replaced = 0
+            for advice in shot_advice_list:
+                if advice.strategy != ReframeStrategy.SPEAKER_ALTERNATING:
+                    continue
+                idx = int(getattr(advice, "shot_idx", -1))
+                if idx < 0 or idx >= len(_scs_shot_bounds):
+                    continue
+                shot_start, shot_end = _scs_shot_bounds[idx]
+                if shot_end <= shot_start:
+                    continue
+
+                # Build SpeakerTurn list from active_speaker_events
+                # falling inside this shot.
+                _shot_turns: list = []
+                for ev in active_speaker_events or []:
+                    ev_s = float(getattr(ev, "start", 0.0))
+                    ev_e = float(getattr(ev, "end", 0.0))
+                    sid = int(getattr(ev, "slot_id", -1))
+                    if sid < 0:
+                        continue
+                    if ev_e <= shot_start or ev_s >= shot_end:
+                        continue
+                    _shot_turns.append(_SCSpeakerTurn(
+                        speaker_id=str(sid),
+                        start_sec=max(ev_s, shot_start),
+                        end_sec=min(ev_e, shot_end),
+                    ))
+                if not _shot_turns:
+                    continue
+
+                kfs = _plan_speaker_cuts(
+                    speaker_turns=_shot_turns,
+                    speaker_positions=_scs_positions,
+                    shot_start_sec=float(shot_start),
+                    shot_end_sec=float(shot_end),
+                    source_width=int(source_width),
+                    config=_scs_cfg,
+                )
+                if not kfs:
+                    continue
+
+                # For each raw_segment INSIDE this shot, snap its
+                # subject_x to the keyframe whose interval covers
+                # ``seg.start``. This preserves the existing segment
+                # boundary structure (which encodes shot cuts +
+                # speaker turns) while replacing the smooth L1 path
+                # with hard-cut speaker positions.
+                kf_times = [kf.time_sec for kf in kfs]
+
+                def _kf_for_t(t: float):
+                    last = kfs[0]
+                    for kf in kfs:
+                        if kf.time_sec <= t + 1e-9:
+                            last = kf
+                        else:
+                            break
+                    return last
+
+                for seg in raw_segments:
+                    if seg.start + 1e-9 < shot_start:
+                        continue
+                    if seg.end - 1e-9 > shot_end:
+                        continue
+                    if seg.layout != "single":
+                        continue
+                    kf = _kf_for_t(seg.start)
+                    seg.subject_x = float(kf.x_frac) * float(source_width)
+                    seg.strategy = "speaker_alternating"
+                    seg.reason = "speaker_cut_engine"
+                    seg.ease_in_ms = 0  # hard cut
+                    seg.motion_path = None  # static within segment
+                    if kf.speaker_id is not None:
+                        try:
+                            seg.active_slot = int(kf.speaker_id)
+                        except (TypeError, ValueError):
+                            pass
+                    scs_segments_replaced += 1
+
+            if scs_segments_replaced > 0:
+                _log(
+                    "speaker_cut_engine: overrode %d segments across "
+                    "SPEAKER_ALTERNATING shots",
+                    scs_segments_replaced,
+                )
+    except Exception as _scs_exc:
+        logger.warning(
+            "[%s] speaker_cut_engine override failed (non-fatal): %s",
+            job_id, _scs_exc,
+        )
 
     # ── Stage 10b: Phase 2 composition guardrails ──
     # Post-solver pass that enforces hard compositional rules (no

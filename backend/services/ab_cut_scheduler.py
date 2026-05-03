@@ -207,6 +207,9 @@ def plan_ab_schedule(
     non_speaker_slots_at: callable | None = None,
     config: Optional[ReframeConfig] = None,
     content_type: str = "",
+    use_speaker_cut_engine: bool = False,
+    speaker_positions: Optional[dict] = None,
+    source_width: int = 1920,
 ) -> AbScheduleResult:
     """Plan an A/B (or A/B/C) cut schedule for an overlap region.
 
@@ -242,6 +245,57 @@ def plan_ab_schedule(
     # Panel content: A/B/C rotation allowed if ≥ 3 distinct slots fire.
     if content_type == "multi_speaker_panel" and len(unique_slots) < 3:
         return AbScheduleResult(enabled=False, fallback_reason="panel-dyad-keep-split")
+
+    # Phase 3: optional delegation to the speaker_cut_engine for cut
+    # TIMING. When ``use_speaker_cut_engine=True``, the base segment
+    # boundaries below are replaced by the engine's keyframe times;
+    # reaction cuts and the rate cap are still layered on afterward.
+    if use_speaker_cut_engine:
+        try:
+            from backend.services.speaker_cut_engine import (
+                compute_cut_keyframes_from_speaker_engine,
+            )
+            kfs = compute_cut_keyframes_from_speaker_engine(
+                overlap_start=overlap_start,
+                overlap_end=overlap_end,
+                speaker_windows=long_enough,
+                speaker_positions=speaker_positions,
+                source_width=source_width,
+                config=config,
+            )
+            if kfs:
+                segments = []
+                n_kfs = len(kfs)
+                for i, kf in enumerate(kfs):
+                    seg_start = max(kf.time_sec, overlap_start)
+                    seg_end = (
+                        kfs[i + 1].time_sec if i + 1 < n_kfs else overlap_end
+                    )
+                    if seg_end <= seg_start:
+                        continue
+                    try:
+                        sid = int(kf.speaker_id) if kf.speaker_id is not None else -1
+                    except (TypeError, ValueError):
+                        sid = -1
+                    segments.append(AbCutSegment(
+                        start=seg_start,
+                        end=seg_end,
+                        slot_id=sid,
+                        ease_ms=0,  # always hard cut from this engine
+                        reason="speaker-cut-engine",
+                    ))
+                # Reaction cuts + rate cap still apply on top.
+                if non_speaker_slots_at is not None:
+                    segments = _insert_reaction_cuts(
+                        segments, reactions, non_speaker_slots_at, config,
+                    )
+                segments = _cap_cut_rate(segments, config.ab_max_cuts_per_sec)
+                return AbScheduleResult(enabled=True, segments=segments)
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.warning(
+                "speaker_cut_engine delegation failed; falling back to "
+                "legacy A/B scheduler: %s", exc,
+            )
 
     segments = [
         AbCutSegment(

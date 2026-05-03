@@ -5309,6 +5309,7 @@ async def _run_analysis_inner(job_id: str):
                                     source_fps=float(metadata.get("fps", 30.0) or 30.0),
                                     job_id=job_id,
                                     saliency_peaks_per_second=_l1_saliency_peaks_per_second,
+                                    shot_advice_list=shot_advice_list or None,
                                 )
                             except Exception as _hr_e:
                                 logger.info("[%s] human-reframe hook skipped: %s", job_id, _hr_e)
@@ -5600,6 +5601,12 @@ async def _run_analysis_inner(job_id: str):
                         else None
                     ),
                     debug_out=_reframe_debug_out,
+                    # Phase 3 (reframing overhaul): per-shot advice from
+                    # the strategy advisor. The segmenter uses this to
+                    # decide which shots take the speaker_cut_engine
+                    # override path (hard cuts on speaker turns) instead
+                    # of the smooth L1 camera-path solver.
+                    shot_advice_list=shot_advice_list or None,
                 )
                 if reframe_segments:
                     # Replace scenes with one scene per reframe segment
@@ -5667,6 +5674,7 @@ async def _run_analysis_inner(job_id: str):
                                     source_fps=float(metadata.get("fps", 30.0) or 30.0),
                                     job_id=job_id,
                                     saliency_peaks_per_second=_l1_saliency_peaks_per_second,
+                                    shot_advice_list=shot_advice_list or None,
                                 )
                             except Exception as _hr_e:
                                 logger.info("[%s] human-reframe hook skipped: %s", job_id, _hr_e)

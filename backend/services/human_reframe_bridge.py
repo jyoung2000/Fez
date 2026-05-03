@@ -94,6 +94,8 @@ def maybe_override_render_plan(
     config: Optional[ReframeConfig] = None,
     job_id: str = "",
     saliency_peaks_per_second: Optional[list] = None,
+    shot_advice_list: Optional[list] = None,
+    speaker_positions: Optional[dict] = None,
 ) -> RenderPlan:
     """Return ``legacy_rp`` unchanged unless the human-reframe flag is on
     and the inputs are sufficient to produce a better plan.
@@ -138,6 +140,8 @@ def maybe_override_render_plan(
             motion_beats=list(motion_beats or []),
             entrances=list(entrances or []),
             reactions=list(reactions or []),
+            shot_advice_list=list(shot_advice_list or []),
+            speaker_positions=dict(speaker_positions or {}),
         )
         human: HumanReframePlan = run_human_reframe(inputs, config=config)
         new_rp = render_plan_from_human_plan(

@@ -125,6 +125,14 @@ class HumanReframeInputs:
     hud_regions: list[dict] = field(default_factory=list)
     impact_frames: list[float] = field(default_factory=list)
 
+    # Phase 3 (reframing overhaul): per-shot strategy advice. When any
+    # shot's strategy is SPEAKER_ALTERNATING the A/B scheduler delegates
+    # cut timing to the speaker_cut_engine. ``speaker_positions`` is a
+    # ``slot_id -> x_frac`` map used by the engine to know where to
+    # crop on each cut.
+    shot_advice_list: list = field(default_factory=list)
+    speaker_positions: dict = field(default_factory=dict)
+
 
 def _speaker_windows_from_events(events: list) -> list[SpeakerWindow]:
     out: list[SpeakerWindow] = []
@@ -238,6 +246,18 @@ def run_human_reframe(
 
     # 4. A/B cut scheduler over the whole clip's speaker windows.
     sp_windows = _speaker_windows_from_events(inputs.active_speaker_events)
+    # Phase 3: when any shot is flagged SPEAKER_ALTERNATING, delegate
+    # cut TIMING to speaker_cut_engine; ab_cut_scheduler still owns the
+    # motivated zoom + reaction layering on top of that timing.
+    _use_scs = False
+    try:
+        from backend.services.shot_reframe_advisor import ReframeStrategy
+        _use_scs = any(
+            getattr(a, "strategy", None) == ReframeStrategy.SPEAKER_ALTERNATING
+            for a in (inputs.shot_advice_list or [])
+        )
+    except Exception:
+        _use_scs = False
     ab = plan_ab_schedule(
         overlap_start=0.0,
         overlap_end=inputs.duration_sec,
@@ -246,6 +266,9 @@ def run_human_reframe(
         non_speaker_slots_at=lambda _t: [],
         config=config,
         content_type=inputs.content_type,
+        use_speaker_cut_engine=_use_scs,
+        speaker_positions=inputs.speaker_positions or None,
+        source_width=inputs.source_w,
     )
 
     # 5. Motivated zoom (merged with genre-forced zooms).
