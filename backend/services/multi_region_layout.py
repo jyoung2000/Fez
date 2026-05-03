@@ -452,6 +452,221 @@ def promote_required_regions_for_segment(
     return required, optional
 
 
+# ─────────────────── Phase 5: Dynamic region split ───────────────────
+
+
+# Default split fractions (primary on top) for the supported multi-region
+# layouts. Used as the "rest" baseline when no importance signal fires.
+DEFAULT_SPLIT_BY_KIND = {
+    "split_screen": 0.5,
+    "stacked_gameplay": 0.6,
+}
+
+# Smoothing window for split-ratio transitions (seconds). Linear
+# interpolation between the previous and current target across this
+# window prevents instant visual jumps.
+SPLIT_SMOOTH_SEC = 0.5
+
+
+def compute_region_split(
+    primary_importance: float,
+    secondary_importance: float,
+    min_region_fraction: float = 0.25,
+) -> float:
+    """Return the fraction of vertical space for the primary (top) region.
+
+    The total split is 1.0 — secondary gets ``1.0 - return``. Both
+    regions are clamped to be at least ``min_region_fraction`` of the
+    output, so the primary fraction is constrained to
+    ``[min_region_fraction, 1 - min_region_fraction]``.
+
+    The two importance scalars are 0-1; higher means the corresponding
+    region should get more space. The mapping is:
+
+        primary_fraction = clamp(
+            (primary_importance + 1 - secondary_importance) / 2,
+            min_region_fraction,
+            1 - min_region_fraction,
+        )
+
+    so equal importance yields a 50/50 split, primary=1/secondary=0
+    saturates to ``1 - min_region_fraction``, and the symmetric case
+    saturates to ``min_region_fraction``.
+    """
+    p = max(0.0, min(1.0, float(primary_importance)))
+    s = max(0.0, min(1.0, float(secondary_importance)))
+    raw = (p + (1.0 - s)) / 2.0
+    lo = float(min_region_fraction)
+    hi = 1.0 - lo
+    if lo > hi:
+        lo = hi = 0.5
+    return max(lo, min(hi, raw))
+
+
+def lecture_primary_importance(
+    *,
+    seconds_since_slide_change: Optional[float],
+    boost_value: float = 0.8,
+    decay_to: float = 0.6,
+    boost_window_sec: float = 3.0,
+) -> float:
+    """Lecture/tutorial importance signal.
+
+    When a slide change just occurred (``seconds_since_slide_change``
+    is small), boost the primary region (the slide) to ``boost_value``
+    (0.8) and linearly decay back to ``decay_to`` (0.6) over
+    ``boost_window_sec`` (3s). When no slide change is known the
+    primary baseline ``decay_to`` is returned.
+    """
+    if seconds_since_slide_change is None:
+        return float(decay_to)
+    t = max(0.0, float(seconds_since_slide_change))
+    if t >= boost_window_sec:
+        return float(decay_to)
+    progress = t / boost_window_sec
+    return float(boost_value) + (float(decay_to) - float(boost_value)) * progress
+
+
+def gaming_secondary_importance(
+    *,
+    facecam_speaker_active: bool,
+    active_value: float = 0.5,
+    silent_value: float = 0.3,
+) -> float:
+    """Gameplay+facecam importance signal for the facecam (secondary).
+
+    When the facecam speaker is talking, ``active_value`` (0.5) gives
+    the facecam ~40% of the output; when silent, ``silent_value``
+    (0.3) reduces it to ~25%. Used together with a fixed primary of
+    0.5 inside :func:`smooth_split_at` to produce 60/40 vs 75/25.
+    """
+    return float(active_value if facecam_speaker_active else silent_value)
+
+
+@dataclass
+class _SplitKeyframe:
+    """One target split value at an absolute timestamp."""
+
+    t: float
+    primary_fraction: float
+
+
+def smooth_split_at(
+    keyframes: list,
+    now_t: float,
+    *,
+    smooth_sec: float = SPLIT_SMOOTH_SEC,
+) -> float:
+    """Linearly interpolate the primary fraction at ``now_t``.
+
+    ``keyframes`` is a list of :class:`_SplitKeyframe` (or any object
+    with ``.t`` and ``.primary_fraction`` attributes), sorted by
+    ascending ``t``. Within ``smooth_sec`` of a keyframe transition,
+    the value is linearly interpolated between the previous and
+    current keyframe — no instant jumps.
+
+    Returns the keyframe value verbatim outside the transition window.
+    """
+    if not keyframes:
+        return 0.5
+    sorted_kp = sorted(keyframes, key=lambda k: float(getattr(k, "t", 0.0)))
+    if now_t <= float(sorted_kp[0].t):
+        return float(sorted_kp[0].primary_fraction)
+    # Find the segment surrounding now_t
+    prev = sorted_kp[0]
+    for kp in sorted_kp[1:]:
+        if now_t < float(kp.t):
+            # Linear ramp begins ``smooth_sec`` before kp.t and lands at kp.t.
+            ramp_start = float(kp.t) - float(smooth_sec)
+            if now_t <= ramp_start:
+                return float(prev.primary_fraction)
+            denom = max(1e-6, float(kp.t) - ramp_start)
+            progress = (now_t - ramp_start) / denom
+            progress = max(0.0, min(1.0, progress))
+            p0 = float(prev.primary_fraction)
+            p1 = float(kp.primary_fraction)
+            return p0 + (p1 - p0) * progress
+        prev = kp
+    return float(sorted_kp[-1].primary_fraction)
+
+
+def build_lecture_split_keyframes(
+    slide_change_times: list,
+    seg_start: float,
+    seg_end: float,
+    *,
+    boost_window_sec: float = 3.0,
+    boost_value: float = 0.8,
+    decay_to: float = 0.6,
+    min_region_fraction: float = 0.25,
+) -> list:
+    """Build _SplitKeyframe list for a lecture segment.
+
+    Each slide change emits two keyframes: a boost at the change time
+    and a decayed value ``boost_window_sec`` later. The primary
+    fraction is computed from importance via :func:`compute_region_split`
+    using the secondary baseline 0.4 (matches the lecture spec
+    treatment where the slide dominates).
+    """
+    kps: list[_SplitKeyframe] = []
+    # Baseline at segment start
+    base_primary = compute_region_split(decay_to, 0.4, min_region_fraction)
+    kps.append(_SplitKeyframe(t=float(seg_start), primary_fraction=base_primary))
+    for tc in slide_change_times or []:
+        tc_f = float(tc)
+        if tc_f < seg_start - 0.01 or tc_f > seg_end + 0.01:
+            continue
+        boost_primary = compute_region_split(
+            boost_value, 0.4, min_region_fraction,
+        )
+        decay_primary = compute_region_split(
+            decay_to, 0.4, min_region_fraction,
+        )
+        kps.append(_SplitKeyframe(t=tc_f, primary_fraction=boost_primary))
+        kps.append(_SplitKeyframe(
+            t=min(seg_end, tc_f + float(boost_window_sec)),
+            primary_fraction=decay_primary,
+        ))
+    return kps
+
+
+def build_gaming_split_keyframes(
+    facecam_active_windows: list,
+    seg_start: float,
+    seg_end: float,
+    *,
+    primary_baseline: float = 0.5,
+    active_secondary: float = 0.5,
+    silent_secondary: float = 0.3,
+    min_region_fraction: float = 0.25,
+) -> list:
+    """Build _SplitKeyframe list for a gameplay+facecam segment.
+
+    ``facecam_active_windows`` is a list of ``(start, end)`` tuples
+    where the facecam speaker is talking. Outside those windows the
+    facecam shrinks to ~25% (silent baseline). Inside, it expands to
+    ~40% (active value). Edge keyframes are emitted at each window
+    boundary; the smoothing window of :func:`smooth_split_at`
+    interpolates the actual ramps.
+    """
+    kps: list[_SplitKeyframe] = []
+    silent_primary = compute_region_split(
+        primary_baseline, silent_secondary, min_region_fraction,
+    )
+    active_primary = compute_region_split(
+        primary_baseline, active_secondary, min_region_fraction,
+    )
+    kps.append(_SplitKeyframe(t=float(seg_start), primary_fraction=silent_primary))
+    for ws, we in facecam_active_windows or []:
+        ws_f = max(float(seg_start), float(ws))
+        we_f = min(float(seg_end), float(we))
+        if we_f <= ws_f:
+            continue
+        kps.append(_SplitKeyframe(t=ws_f, primary_fraction=active_primary))
+        kps.append(_SplitKeyframe(t=we_f, primary_fraction=silent_primary))
+    return kps
+
+
 def slot_to_pixel_bbox(
     slot,
     *,

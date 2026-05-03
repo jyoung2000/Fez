@@ -56,6 +56,16 @@ class RenderOpKind(str, Enum):
     # single 9:16 window). x is clamped to [0, source_w - crop_w] so
     # the renderer NEVER produces black bars.
     CONTEXTUAL_PAN = "contextual_pan"
+    # Phase 5 (reframing overhaul): HUD-aware gaming composite. The
+    # ``primary_rect`` carries the gameplay viewport crop that occupies
+    # the top portion of the output. ``secondary_rect`` collapses to the
+    # full strip area at the bottom of the output. Per-HUD-element
+    # source rects are carried in ``hud_strip_rects`` (list of Rects);
+    # the FFmpeg builder and Canvas renderer arrange them horizontally
+    # within the bottom strip. The split between viewport and strip is
+    # configurable via ``hud_strip_fraction`` on the op (default 0.25,
+    # meaning the HUD strip occupies 25% of the output height).
+    HUD_COMPOSITE = "hud_composite"
 
 
 @dataclass
@@ -135,6 +145,19 @@ class RenderOp:
     gaming_layout_mode: Optional[str] = None
     speaker_slot: Optional[int] = None   # slot_id driving this crop segment, None if unknown
     speaker_label: Optional[str] = None  # resolved display name ("Alice" if renamed, else None)
+    # Phase 5 (multi-region compositor):
+    # ``primary_fraction`` overrides the fixed 50/50 (SPLIT_SCREEN) and
+    # 60/40 (STACKED_GAMEPLAY) splits. None = legacy fixed split.
+    primary_fraction: Optional[float] = None
+    # Per-HUD-element source rects for HUD_COMPOSITE arrangement.
+    hud_strip_rects: List[Rect] = field(default_factory=list)
+    # HUD_COMPOSITE: fraction of output height reserved for the HUD strip.
+    hud_strip_fraction: float = 0.25
+    # Multi-region separator width in output pixels (0 disables).
+    separator_px: int = 0
+    # Phase 5 transition: duration of fade-out FROM multi-region TO
+    # single-crop layouts. 0 = no fade.
+    transition_fade_out_ms: int = 0
 
 
 @dataclass
@@ -215,6 +238,17 @@ class RenderPlan:
                         violations.append(f"{prefix}: grid_2x2 requires {label}")
                     else:
                         _check_rect(violations, f"{prefix}.{label}", rect)
+
+            # HUD_COMPOSITE: primary_rect (gameplay viewport) is required;
+            # hud_strip_rects may be empty (renderer falls back to a
+            # blurred strip).
+            if op.kind == RenderOpKind.HUD_COMPOSITE:
+                for j, rect in enumerate(op.hud_strip_rects):
+                    _check_rect(
+                        violations,
+                        f"{prefix}.hud_strip_rects[{j}]",
+                        rect,
+                    )
 
             # TRACKING_CROP / motivated-zoom / contextual-pan ops must
             # have motion_path

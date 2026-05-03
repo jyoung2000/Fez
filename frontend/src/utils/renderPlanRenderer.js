@@ -154,6 +154,16 @@ export class RenderPlanRenderer {
 
     const ctx = this.ctx;
 
+    // Phase 5: multi-region → single-crop fade-out has priority over
+    // the standard ease_in_ms cross-fade.
+    const idx = this.plan.ops.indexOf(op);
+    if (idx > 0) {
+      const prevOp = this.plan.ops[idx - 1];
+      if (this._multiToSingleFadeOut(ctx, prevOp, op, currentTimeSec)) {
+        return;
+      }
+    }
+
     // Check if we're in a transition zone
     const transition = this._getTransitionState(currentTimeSec);
 
@@ -201,9 +211,40 @@ export class RenderPlanRenderer {
       case 'grid_2x2':
         this._drawGrid(ctx, op);
         break;
+      case 'hud_composite':
+        this._drawHudComposite(ctx, op);
+        break;
       default:
         this._drawCrop(ctx, op);
     }
+  }
+
+  /**
+   * Resolve the dynamic primary fraction (top region height as a 0-1
+   * fraction of total output height). Falls back to `defaultFraction`
+   * when `op.primary_fraction` is null/undefined. Mirrors the Python
+   * `_resolve_primary_fraction` helper in ffmpeg_filter_builder.py.
+   */
+  _resolvePrimaryFraction(op, defaultFraction) {
+    const pf = op && op.primary_fraction;
+    if (pf == null) return defaultFraction;
+    return Math.max(0.05, Math.min(0.95, Number(pf)));
+  }
+
+  /**
+   * Phase 5: paint a 2px (or `op.separator_px`) dark line at the
+   * boundary between the top and bottom regions of a multi-region
+   * composite. No-op when separator_px <= 0. Color locked to #333333
+   * to match the FFmpeg drawbox `color=0x333333`.
+   */
+  _drawSeparator(ctx, topH, op) {
+    const sep = (op && op.separator_px) || 0;
+    if (sep <= 0) return;
+    ctx.save();
+    ctx.fillStyle = '#333333';
+    const y = Math.max(0, topH - Math.floor(sep / 2));
+    ctx.fillRect(0, y, this.targetW, sep);
+    ctx.restore();
   }
 
   /**
@@ -328,40 +369,163 @@ export class RenderPlanRenderer {
   }
 
   /**
-   * SPLIT_SCREEN: two crops stacked vertically, 50/50.
-   * Mirrors FFmpeg: crop + scale + vstack
+   * SPLIT_SCREEN: two crops stacked vertically. Default 50/50;
+   * `op.primary_fraction` overrides the top-region share for Phase-5
+   * dynamic-region behavior. Draws a 2px separator at the seam when
+   * `op.separator_px > 0`.
+   * Mirrors FFmpeg: crop + scale + vstack + drawbox
    */
   _drawSplitScreen(ctx, op) {
-    const halfH = Math.floor(this.targetH / 2);
+    const frac = this._resolvePrimaryFraction(op, 0.5);
+    let topH = Math.floor(this.targetH * frac);
+    topH = Math.max(2, Math.min(topH, this.targetH - 2));
 
     // Top half
     const top = rectToPixels(op.primary_rect, this.sourceW, this.sourceH);
     ctx.drawImage(this.video, top.x, top.y, top.w, top.h,
-                  0, 0, this.targetW, halfH);
+                  0, 0, this.targetW, topH);
 
     // Bottom half
     const bot = rectToPixels(op.secondary_rect, this.sourceW, this.sourceH);
     ctx.drawImage(this.video, bot.x, bot.y, bot.w, bot.h,
-                  0, halfH, this.targetW, this.targetH - halfH);
+                  0, topH, this.targetW, this.targetH - topH);
+
+    this._drawSeparator(ctx, topH, op);
   }
 
   /**
-   * STACKED_GAMEPLAY: gameplay top 60%, facecam bottom 40%.
-   * Mirrors FFmpeg: 60/40 split with vstack
+   * STACKED_GAMEPLAY: gameplay on top, facecam on bottom. Default
+   * 60/40; `op.primary_fraction` overrides for Phase-5 dynamic-region
+   * behavior. Draws a 2px separator at the seam when
+   * `op.separator_px > 0`.
+   * Mirrors FFmpeg: 60/40 split with vstack + drawbox.
    */
   _drawStackedGameplay(ctx, op) {
-    const topH = Math.round(this.targetH * 0.6);
+    const frac = this._resolvePrimaryFraction(op, 0.6);
+    let topH = Math.floor(this.targetH * frac);
+    topH = Math.max(2, Math.min(topH, this.targetH - 2));
     const botH = this.targetH - topH;
 
-    // Gameplay (top 60%)
+    // Gameplay (top)
     const game = rectToPixels(op.primary_rect, this.sourceW, this.sourceH);
     ctx.drawImage(this.video, game.x, game.y, game.w, game.h,
                   0, 0, this.targetW, topH);
 
-    // Facecam (bottom 40%)
+    // Facecam (bottom)
     const cam = rectToPixels(op.secondary_rect, this.sourceW, this.sourceH);
     ctx.drawImage(this.video, cam.x, cam.y, cam.w, cam.h,
                   0, topH, this.targetW, botH);
+
+    this._drawSeparator(ctx, topH, op);
+  }
+
+  /**
+   * HUD_COMPOSITE: gameplay viewport on top + horizontal HUD strip on
+   * bottom (Phase 5). The viewport occupies (1 - hud_strip_fraction)
+   * of the height (default 75%) and the HUD strip the remainder. Each
+   * `hud_strip_rects[i]` source rect is scaled into a horizontal slot
+   * inside the strip. When no HUD rects are provided, the strip falls
+   * back to a blurred-cover duplicate of the source — never a black
+   * bar (Phase 4 contract).
+   * Mirrors FFmpeg: split + crop + scale + xstack + vstack.
+   */
+  _drawHudComposite(ctx, op) {
+    const stripFrac = Math.max(0.10, Math.min(0.50,
+      Number(op.hud_strip_fraction != null ? op.hud_strip_fraction : 0.25)));
+    let stripH = Math.floor(this.targetH * stripFrac);
+    stripH = Math.max(2, Math.min(stripH, this.targetH - 2));
+    const viewH = this.targetH - stripH;
+
+    // Viewport (top)
+    const view = rectToPixels(op.primary_rect, this.sourceW, this.sourceH);
+    ctx.drawImage(this.video, view.x, view.y, view.w, view.h,
+                  0, 0, this.targetW, viewH);
+
+    // HUD strip (bottom)
+    const hudRects = (op.hud_strip_rects || []);
+    if (hudRects.length === 0) {
+      // Blurred-cover fallback (no black bar).
+      const offCtx = this._offscreenCtx;
+      offCtx.save();
+      offCtx.clearRect(0, 0, this.targetW, this.targetH);
+      offCtx.filter = 'blur(50px) brightness(0.9)';
+      const scaleX = this.targetW / this.sourceW;
+      const scaleY = stripH / this.sourceH;
+      const scale = Math.max(scaleX, scaleY);
+      const dw = this.sourceW * scale;
+      const dh = this.sourceH * scale;
+      const dx = (this.targetW - dw) / 2;
+      const dy = viewH + (stripH - dh) / 2;
+      offCtx.drawImage(this.video, 0, 0, this.sourceW, this.sourceH, dx, dy, dw, dh);
+      offCtx.restore();
+      ctx.drawImage(this._offscreenCanvas, 0, viewH, this.targetW, stripH,
+                    0, viewH, this.targetW, stripH);
+    } else {
+      const n = hudRects.length;
+      let baseW = Math.floor(this.targetW / n);
+      baseW = baseW - (baseW % 2);
+      let lastW = this.targetW - baseW * (n - 1);
+      lastW = lastW - (lastW % 2);
+      let xCursor = 0;
+      for (let i = 0; i < n; i++) {
+        const slotW = (i === n - 1) ? lastW : baseW;
+        const src = rectToPixels(hudRects[i], this.sourceW, this.sourceH);
+        ctx.drawImage(this.video, src.x, src.y, src.w, src.h,
+                      xCursor, viewH, slotW, stripH);
+        xCursor += slotW;
+      }
+    }
+
+    this._drawSeparator(ctx, viewH, op);
+  }
+
+  /**
+   * Phase 5: when transitioning FROM a multi-region op TO a single-crop
+   * op AND the prior op carries `transition_fade_out_ms`, animate the
+   * region heights so the secondary region + separator fade out smoothly
+   * (alpha ramp) over that window. Returns true when the caller should
+   * skip its own draw — `_drawOp` calls this from the transition path.
+   */
+  _multiToSingleFadeOut(ctx, prevOp, currOp, currentTimeSec) {
+    const fadeMs = (prevOp && prevOp.transition_fade_out_ms) || 0;
+    if (fadeMs <= 0) return false;
+    if (!RenderPlanRenderer._isMultiRegion(prevOp)) return false;
+    if (!RenderPlanRenderer._isSingleCrop(currOp)) return false;
+
+    const fadeSec = fadeMs / 1000;
+    const boundary = currOp.start_sec;
+    const fadeStart = boundary - fadeSec / 2;
+    const fadeEnd = boundary + fadeSec / 2;
+    if (currentTimeSec < fadeStart || currentTimeSec > fadeEnd) return false;
+
+    const progress = Math.max(0, Math.min(1,
+      (currentTimeSec - fadeStart) / fadeSec));
+
+    // Draw multi-region (prevOp) into transition canvas.
+    this._drawOp(this._transitionCtx, prevOp, currentTimeSec);
+    // Draw single-crop (currOp) into main canvas.
+    this._drawOp(ctx, currOp, currentTimeSec);
+    // Blend: prev fades out, curr fades in.
+    ctx.save();
+    ctx.globalAlpha = 1 - progress;
+    ctx.drawImage(this._transitionCanvas, 0, 0);
+    ctx.restore();
+    return true;
+  }
+
+  static _isMultiRegion(op) {
+    if (!op) return false;
+    return ['split_screen', 'stacked_gameplay', 'hud_composite', 'grid_2x2']
+      .indexOf(op.kind) >= 0;
+  }
+
+  static _isSingleCrop(op) {
+    if (!op) return false;
+    return [
+      'crop', 'tracking_crop', 'contextual_pan',
+      'motivated_push_in', 'motivated_pull_out',
+      'wide_master', 'blur_fill',
+    ].indexOf(op.kind) >= 0;
   }
 
   /**

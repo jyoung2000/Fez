@@ -34,6 +34,12 @@ _STRATEGY_TO_KIND = {
     # those into a 2-keypoint motion_path. Falls back to L→R full pan
     # when no pan_start/pan_end exists.
     "contextual_pan": RenderOpKind.CONTEXTUAL_PAN,
+    # Phase 5 (reframing overhaul): HUD-aware gaming composite. The
+    # segmenter sets strategy ``hud_composite`` and writes
+    # ``hud_strip_rects_norm`` (list of (x, y, w, h) in 0-1) and
+    # optional ``hud_strip_fraction`` onto the segment. The builder
+    # reads those into the new RenderOp.
+    "hud_composite": RenderOpKind.HUD_COMPOSITE,
 }
 
 # Phase 4: pan-speed limits for CONTEXTUAL_PAN, in fractions of source
@@ -206,6 +212,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             "wide_master": RenderOpKind.WIDE_MASTER,
             "blur_fill": RenderOpKind.BLUR_FILL,
             "stacked_gameplay": RenderOpKind.STACKED_GAMEPLAY,
+            "hud_composite": RenderOpKind.HUD_COMPOSITE,
         }
         kind = _layout_to_kind.get(layout, RenderOpKind.CROP)
 
@@ -351,6 +358,49 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             ease_in_ms=ease_in_ms,
             strategy_label=f"stacked_gameplay_{reason}",
             content_type=content_type,
+            speaker_slot=speaker_slot,
+        )
+
+    elif kind == RenderOpKind.HUD_COMPOSITE:
+        # Phase 5: gameplay viewport on top + HUD strip on bottom.
+        # The segmenter is expected to write:
+        #   - ``viewport_rect_norm``: (x, y, w, h) of the gameplay viewport
+        #     in normalized 0-1 source coords. Falls back to a center
+        #     crop computed from subject_x/subject_y when missing.
+        #   - ``hud_strip_rects_norm``: list of (x, y, w, h) in 0-1
+        #   - ``hud_strip_fraction``: float in (0, 0.5]
+        viewport_rect_norm = getattr(seg, "viewport_rect_norm", None)
+        if viewport_rect_norm is not None and len(viewport_rect_norm) >= 4:
+            primary_rect = Rect(
+                x=float(viewport_rect_norm[0]),
+                y=float(viewport_rect_norm[1]),
+                w=float(viewport_rect_norm[2]),
+                h=float(viewport_rect_norm[3]),
+            )
+        else:
+            primary_rect = _compute_crop_rect(
+                subject_x, subject_y, source_w, source_h, aspect_ratio,
+            )
+        hud_strip_rects_norm = getattr(seg, "hud_strip_rects_norm", None) or []
+        hud_strip_rects = [
+            Rect(x=float(r[0]), y=float(r[1]), w=float(r[2]), h=float(r[3]))
+            for r in hud_strip_rects_norm
+            if len(r) >= 4
+        ]
+        hud_strip_fraction = float(
+            getattr(seg, "hud_strip_fraction", 0.25) or 0.25
+        )
+        return RenderOp(
+            kind=kind,
+            start_sec=seg.start,
+            end_sec=seg.end,
+            primary_rect=primary_rect,
+            hud_strip_rects=hud_strip_rects,
+            hud_strip_fraction=hud_strip_fraction,
+            ease_in_ms=ease_in_ms,
+            strategy_label=f"hud_composite_{reason}",
+            content_type=content_type,
+            gaming_layout_mode=gaming_layout_mode,
             speaker_slot=speaker_slot,
         )
 

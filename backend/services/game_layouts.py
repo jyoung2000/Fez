@@ -1,4 +1,4 @@
-"""HUD layout database for known FPS / hero shooter / MOBA / TPS / racing games.
+"""HUD layout database for known FPS / hero shooter / MOBA / TPS / racing games and HUD-aware crop helpers (Phase 5).
 
 Each layout defines the source-frame positions (as percentages) of critical
 HUD elements that should be preserved when compositing a 9:16 vertical
@@ -27,6 +27,8 @@ conservative starting points — designed to err on the side of preserving
 critical UI rather than maximizing crop area. Phase 7 will refine them
 with telemetry from real footage.
 """
+
+from typing import Optional
 
 GAME_HUD_LAYOUTS = {
     # ─── FPS / hero shooters ───────────────────────────────────────────
@@ -238,6 +240,193 @@ def get_action_center(game_key: str) -> tuple[float, float]:
         return (50.0, 50.0)
     cx, cy = layout.get("action_center_pct", (50, 50))
     return (float(cx), float(cy))
+
+
+# ──────────────────── Phase 5: HUD-aware gaming crops ────────────────────
+
+
+def _bbox_pct_to_norm(bbox_pct: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Convert a (x, y, w, h) percent tuple to normalized 0-1."""
+    x, y, w, h = bbox_pct
+    return (x / 100.0, y / 100.0, w / 100.0, h / 100.0)
+
+
+def compute_hud_aware_crop_window(
+    *,
+    action_center_pct: tuple[float, float],
+    hud_bboxes_norm: list[tuple[float, float, float, float]],
+    target_aspect: float,
+    source_w: int,
+    source_h: int,
+) -> tuple[tuple[float, float, float, float], bool]:
+    """Compute the minimal 9:16 crop including action center + HUD.
+
+    ``action_center_pct`` is ``(x_pct, y_pct)`` in [0, 100].
+    ``hud_bboxes_norm`` is a list of (x, y, w, h) in normalized [0, 1].
+    ``target_aspect`` is e.g. 9/16 for a vertical output.
+
+    Returns ``((x, y, w, h), fits)`` where:
+      - the rect is normalized [0, 1] in source coordinates
+      - ``fits=True`` means BOTH action and all HUD bboxes fit inside
+      - ``fits=False`` means the caller should fall back to HUD_COMPOSITE
+        (stacked viewport + horizontal HUD strip)
+
+    The window is the smallest 9:16 (or other ``target_aspect``) crop
+    centered on a point that minimizes distance to the action center
+    while still covering the HUD bboxes' horizontal span. The result
+    is clamped to the source bounds.
+    """
+    src_aspect = source_w / source_h if source_h > 0 else 1.0
+    if target_aspect < src_aspect:
+        crop_w_norm = (target_aspect * source_h) / source_w
+        crop_h_norm = 1.0
+    else:
+        crop_w_norm = 1.0
+        crop_h_norm = (source_w / target_aspect) / source_h
+        crop_h_norm = min(1.0, crop_h_norm)
+
+    action_cx = action_center_pct[0] / 100.0
+
+    # Compute the horizontal span of all HUD bboxes (left edge, right edge).
+    if hud_bboxes_norm:
+        hud_left = min(b[0] for b in hud_bboxes_norm)
+        hud_right = max(b[0] + b[2] for b in hud_bboxes_norm)
+    else:
+        hud_left = action_cx
+        hud_right = action_cx
+
+    # Span we need to cover: union of action point and HUD horizontal span.
+    span_left = min(hud_left, action_cx)
+    span_right = max(hud_right, action_cx)
+    span_w = span_right - span_left
+
+    fits = span_w <= crop_w_norm + 1e-6
+    if fits:
+        # Center the crop on the action center, then nudge to cover HUD.
+        cx = action_cx
+        x = cx - crop_w_norm / 2.0
+        # Ensure HUD left/right are inside [x, x + crop_w_norm].
+        if hud_left < x:
+            x = hud_left
+        if hud_right > x + crop_w_norm:
+            x = hud_right - crop_w_norm
+        # Clamp to source bounds.
+        x = max(0.0, min(x, 1.0 - crop_w_norm))
+    else:
+        # HUD + action don't both fit horizontally → caller should
+        # use HUD_COMPOSITE. Return a center-on-action crop anyway so
+        # the viewport is well-defined.
+        cx = action_cx
+        x = cx - crop_w_norm / 2.0
+        x = max(0.0, min(x, 1.0 - crop_w_norm))
+
+    return ((float(x), 0.0, float(crop_w_norm), float(crop_h_norm)), bool(fits))
+
+
+def select_hud_strip_rects(
+    hud_bboxes_norm: list[tuple[float, float, float, float]],
+    update_frequencies: Optional[list[float]] = None,
+    *,
+    max_count: int = 4,
+) -> list[tuple[float, float, float, float]]:
+    """Pick the HUD bboxes most worth displaying in the strip.
+
+    "Most important" = highest update frequency (changing HUD = relevant
+    HUD). When ``update_frequencies`` is None, returns ``hud_bboxes_norm``
+    in input order, capped at ``max_count``.
+    """
+    if not hud_bboxes_norm:
+        return []
+    if update_frequencies is None or len(update_frequencies) != len(hud_bboxes_norm):
+        return list(hud_bboxes_norm)[:max_count]
+    paired = list(zip(hud_bboxes_norm, update_frequencies))
+    paired.sort(key=lambda p: float(p[1]), reverse=True)
+    return [p[0] for p in paired[:max_count]]
+
+
+def arrange_hud_strip_horizontally(
+    hud_bboxes_norm: list[tuple[float, float, float, float]],
+    *,
+    target_strip_height_px: int,
+    target_strip_width_px: int,
+    min_element_height_px: int = 30,
+) -> dict:
+    """Compute the per-element layout in the HUD strip.
+
+    Returns a dict with:
+      - ``slot_widths``: per-element output pixel widths summing to
+        ``target_strip_width_px``.
+      - ``element_height_px``: the actual rendered height; equals
+        ``target_strip_height_px`` clamped to be >= ``min_element_height_px``
+        (caller is responsible for upscaling small bboxes to maintain
+        readability on 1080×1920).
+      - ``needs_scale_up``: True when any element would render below
+        ``min_element_height_px`` without scaling.
+
+    The arrangement is purely horizontal (1 row, equal-share slots).
+    """
+    n = len(hud_bboxes_norm)
+    if n == 0:
+        return {
+            "slot_widths": [],
+            "element_height_px": int(target_strip_height_px),
+            "needs_scale_up": False,
+        }
+    base_w = target_strip_width_px // n
+    base_w = base_w - (base_w % 2)
+    last_w = target_strip_width_px - base_w * (n - 1)
+    last_w = last_w - (last_w % 2)
+    widths = [base_w] * (n - 1) + [last_w]
+
+    needs_scale_up = int(target_strip_height_px) < int(min_element_height_px)
+    rendered_h = max(int(target_strip_height_px), int(min_element_height_px))
+    return {
+        "slot_widths": widths,
+        "element_height_px": rendered_h,
+        "needs_scale_up": needs_scale_up,
+    }
+
+
+def choose_hud_layout(
+    *,
+    action_center_pct: tuple[float, float],
+    hud_bboxes_norm: list[tuple[float, float, float, float]],
+    target_aspect: float,
+    source_w: int,
+    source_h: int,
+) -> dict:
+    """Top-level decision: single CROP or HUD_COMPOSITE.
+
+    Returns a dict:
+        {
+          "kind": "crop" | "hud_composite",
+          "viewport_rect": (x, y, w, h) normalized,
+          "hud_strip_rects": list of (x, y, w, h) normalized (only for
+              hud_composite).
+        }
+    """
+    rect, fits = compute_hud_aware_crop_window(
+        action_center_pct=action_center_pct,
+        hud_bboxes_norm=hud_bboxes_norm,
+        target_aspect=target_aspect,
+        source_w=source_w,
+        source_h=source_h,
+    )
+    if fits:
+        return {
+            "kind": "crop",
+            "viewport_rect": rect,
+            "hud_strip_rects": [],
+        }
+    # Doesn't fit → HUD_COMPOSITE. Viewport is the action-centered
+    # crop above; HUD strip carries the original (un-cropped) HUD
+    # source rects so the strip filter can extract them at full
+    # resolution.
+    return {
+        "kind": "hud_composite",
+        "viewport_rect": rect,
+        "hud_strip_rects": list(hud_bboxes_norm),
+    }
 
 
 def games_for_genre(genre: str) -> list[tuple[str, str]]:

@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 BLUR_SIGMA = 50
 BLUR_BRIGHTNESS = -0.1  # eq filter brightness offset
 
+# Phase 5: dark separator color for multi-region composites. Locked to
+# match the frontend Canvas value.
+SEPARATOR_COLOR = "0x333333"
+
 
 def build_ffmpeg_command(
     plan: RenderPlan,
@@ -152,6 +156,8 @@ def _build_op_filter(
         return _filter_stacked_gameplay(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
     elif op.kind == RenderOpKind.GRID_2X2:
         return _filter_grid_2x2(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
+    elif op.kind == RenderOpKind.HUD_COMPOSITE:
+        return _filter_hud_composite(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
     elif op.kind in (RenderOpKind.MOTIVATED_PUSH_IN, RenderOpKind.MOTIVATED_PULL_OUT):
         return _filter_motivated_zoom(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
     elif op.kind == RenderOpKind.CONTEXTUAL_PAN:
@@ -463,43 +469,201 @@ def _filter_blur_fill(op, label, tgt_w, tgt_h, start, end) -> str:
     )
 
 
-def _filter_split_screen(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> str:
-    """SPLIT_SCREEN: two crops stacked vertically, 50/50."""
-    half_h = tgt_h // 2
-    half_h = half_h - (half_h % 2)
+def _separator_drawbox(label_in: str, label_out: str, tgt_w: int, top_h: int,
+                       sep_px: int) -> str:
+    """Drawbox filter that paints a 2px dark line at the split boundary.
 
-    px, py, pw, ph = op.primary_rect.to_pixels(src_w, src_h)
-    sx, sy, sw, sh = op.secondary_rect.to_pixels(src_w, src_h)
-
+    The line is drawn AT y=top_h (the boundary), straddling the seam by
+    ``sep_px`` pixels (default 2). Color is locked to ``#333333``
+    (matches the Canvas separator). When ``sep_px <= 0`` the caller
+    should skip this entirely.
+    """
+    # Draw the box on top of the composited stream. Even-pixel snap so
+    # ffmpeg never complains about odd coords on yuv420p.
+    y = max(0, top_h - sep_px // 2)
     return (
-        f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
-        f"split=2[top_src{label}][bot_src{label}];\n"
-        f"[top_src{label}]crop={pw}:{ph}:{px}:{py},"
-        f"scale={tgt_w}:{half_h}:flags=lanczos[top{label}];\n"
-        f"[bot_src{label}]crop={sw}:{sh}:{sx}:{sy},"
-        f"scale={tgt_w}:{half_h}:flags=lanczos[bot{label}];\n"
-        f"[top{label}][bot{label}]vstack[{label}]"
+        f"[{label_in}]drawbox=x=0:y={y}:w={tgt_w}:h={sep_px}:"
+        f"color={SEPARATOR_COLOR}@1.0:t=fill[{label_out}]"
     )
 
 
-def _filter_stacked_gameplay(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> str:
-    """STACKED_GAMEPLAY: gameplay top 60%, facecam bottom 40%."""
-    top_h = int(tgt_h * 0.6)
+def _resolve_primary_fraction(op, default: float) -> float:
+    """Return the dynamic primary fraction or the default."""
+    pf = getattr(op, "primary_fraction", None)
+    if pf is None:
+        return float(default)
+    f = float(pf)
+    # Clamp to [0.05, 0.95] so the renderer never emits a degenerate
+    # 0-height region.
+    return max(0.05, min(0.95, f))
+
+
+def _filter_split_screen(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> str:
+    """SPLIT_SCREEN: two crops stacked vertically.
+
+    Default split is 50/50; ``op.primary_fraction`` overrides for
+    Phase-5 dynamic-region behavior. ``op.separator_px`` (or the
+    config default) draws a 2px dark line at the boundary when > 0.
+    """
+    primary_frac = _resolve_primary_fraction(op, 0.5)
+    top_h = int(tgt_h * primary_frac)
     top_h = top_h - (top_h % 2)
+    top_h = max(2, min(top_h, tgt_h - 2))
     bot_h = tgt_h - top_h
 
     px, py, pw, ph = op.primary_rect.to_pixels(src_w, src_h)
     sx, sy, sw, sh = op.secondary_rect.to_pixels(src_w, src_h)
 
-    return (
+    sep_px = int(getattr(op, "separator_px", 0) or 0)
+    out_label = label if sep_px <= 0 else f"raw_{label}"
+
+    body = (
+        f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
+        f"split=2[top_src{label}][bot_src{label}];\n"
+        f"[top_src{label}]crop={pw}:{ph}:{px}:{py},"
+        f"scale={tgt_w}:{top_h}:flags=lanczos[top{label}];\n"
+        f"[bot_src{label}]crop={sw}:{sh}:{sx}:{sy},"
+        f"scale={tgt_w}:{bot_h}:flags=lanczos[bot{label}];\n"
+        f"[top{label}][bot{label}]vstack[{out_label}]"
+    )
+    if sep_px > 0:
+        body += ";\n" + _separator_drawbox(out_label, label, tgt_w, top_h, sep_px)
+    return body
+
+
+def _filter_stacked_gameplay(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> str:
+    """STACKED_GAMEPLAY: gameplay on top, facecam on bottom.
+
+    Default split is 60/40 (gameplay/facecam); ``op.primary_fraction``
+    overrides for Phase-5 dynamic-region behavior so the facecam can
+    grow to ~40% when the speaker is talking and shrink to ~25% when
+    silent. ``op.separator_px`` draws a 2px dark line at the boundary
+    when > 0.
+    """
+    primary_frac = _resolve_primary_fraction(op, 0.6)
+    top_h = int(tgt_h * primary_frac)
+    top_h = top_h - (top_h % 2)
+    top_h = max(2, min(top_h, tgt_h - 2))
+    bot_h = tgt_h - top_h
+
+    px, py, pw, ph = op.primary_rect.to_pixels(src_w, src_h)
+    sx, sy, sw, sh = op.secondary_rect.to_pixels(src_w, src_h)
+
+    sep_px = int(getattr(op, "separator_px", 0) or 0)
+    out_label = label if sep_px <= 0 else f"raw_{label}"
+
+    body = (
         f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
         f"split=2[game_src{label}][cam_src{label}];\n"
         f"[game_src{label}]crop={pw}:{ph}:{px}:{py},"
         f"scale={tgt_w}:{top_h}:flags=lanczos[game{label}];\n"
         f"[cam_src{label}]crop={sw}:{sh}:{sx}:{sy},"
         f"scale={tgt_w}:{bot_h}:flags=lanczos[cam{label}];\n"
-        f"[game{label}][cam{label}]vstack[{label}]"
+        f"[game{label}][cam{label}]vstack[{out_label}]"
     )
+    if sep_px > 0:
+        body += ";\n" + _separator_drawbox(out_label, label, tgt_w, top_h, sep_px)
+    return body
+
+
+def _filter_hud_composite(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> str:
+    """HUD_COMPOSITE: gameplay viewport on top + horizontal HUD strip on bottom.
+
+    The viewport occupies ``1 - hud_strip_fraction`` of the output
+    height (default 75%) and the HUD strip the remaining
+    ``hud_strip_fraction`` (default 25%). Inside the strip, each
+    ``hud_strip_rects[i]`` source rect is cropped and scaled to a
+    horizontal slot.
+
+    No black bars: when the HUD strip has no detected rects, it falls
+    back to a blurred-cover strip of the source so the seam never
+    shows raw black.
+    """
+    strip_frac = float(getattr(op, "hud_strip_fraction", 0.25) or 0.25)
+    strip_frac = max(0.10, min(0.50, strip_frac))
+    strip_h = int(tgt_h * strip_frac)
+    strip_h = strip_h - (strip_h % 2)
+    strip_h = max(2, min(strip_h, tgt_h - 2))
+    view_h = tgt_h - strip_h
+
+    px, py, pw, ph = op.primary_rect.to_pixels(src_w, src_h)
+    hud_rects = list(getattr(op, "hud_strip_rects", []) or [])
+    n_hud = len(hud_rects)
+
+    sep_px = int(getattr(op, "separator_px", 0) or 0)
+
+    lines = []
+    # Trim the source then split: 1 stream for viewport + N for HUD elements
+    # + 1 fallback (blurred cover) when n_hud==0.
+    n_split = 1 + max(1, n_hud)
+    split_targets = [f"view_src{label}"] + [f"hud_src{label}_{i}" for i in range(max(1, n_hud))]
+    lines.append(
+        f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
+        f"split={n_split}" + "".join(f"[{t}]" for t in split_targets)
+    )
+
+    # Viewport: crop + scale to (tgt_w, view_h)
+    lines.append(
+        f"[view_src{label}]crop={pw}:{ph}:{px}:{py},"
+        f"scale={tgt_w}:{view_h}:flags=lanczos[view{label}]"
+    )
+
+    if n_hud == 0:
+        # Blurred-cover strip fallback (NEVER black bars per Phase 4).
+        lines.append(
+            f"[hud_src{label}_0]scale={tgt_w}:{strip_h}:"
+            f"force_original_aspect_ratio=increase,crop={tgt_w}:{strip_h},"
+            f"gblur=sigma={BLUR_SIGMA},eq=brightness={BLUR_BRIGHTNESS}"
+            f"[hud_strip{label}]"
+        )
+    else:
+        # Each HUD rect occupies an equal horizontal slot. Slot height
+        # is the full strip; slot width is tgt_w / n_hud (even-snapped).
+        slot_w = tgt_w // n_hud
+        slot_w = slot_w - (slot_w % 2)
+        # The leftover gap from rounding is filled by stretching the last
+        # slot — simpler than a separate fill stream.
+        last_slot_w = tgt_w - slot_w * (n_hud - 1)
+        last_slot_w = last_slot_w - (last_slot_w % 2)
+        slot_widths = [slot_w] * (n_hud - 1) + [last_slot_w]
+
+        scaled_labels = []
+        for i, rect in enumerate(hud_rects):
+            hpx, hpy, hpw, hph = rect.to_pixels(src_w, src_h)
+            sw_i = slot_widths[i]
+            scaled = f"hud{label}_{i}"
+            lines.append(
+                f"[hud_src{label}_{i}]crop={hpw}:{hph}:{hpx}:{hpy},"
+                f"scale={sw_i}:{strip_h}:flags=lanczos[{scaled}]"
+            )
+            scaled_labels.append(scaled)
+
+        if n_hud == 1:
+            lines.append(f"[{scaled_labels[0]}]copy[hud_strip{label}]")
+        else:
+            # Build hstack layout argument (xstack with x=0+w0, y=0)
+            inputs = "".join(f"[{lbl}]" for lbl in scaled_labels)
+            # Build layout: 0_0|w0_0|(w0+w1)_0|...
+            layout_parts = []
+            x_acc = 0
+            for i in range(n_hud):
+                layout_parts.append(f"{x_acc}_0")
+                x_acc += slot_widths[i]
+            layout = "|".join(layout_parts)
+            lines.append(
+                f"{inputs}xstack=inputs={n_hud}:layout={layout}"
+                f"[hud_strip{label}]"
+            )
+
+    # Stack viewport on top + HUD strip on bottom
+    out_label = label if sep_px <= 0 else f"raw_{label}"
+    lines.append(
+        f"[view{label}][hud_strip{label}]vstack[{out_label}]"
+    )
+    if sep_px > 0:
+        lines.append(_separator_drawbox(out_label, label, tgt_w, view_h, sep_px))
+
+    return ";\n".join(lines)
 
 
 def _filter_grid_2x2(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> str:
@@ -531,10 +695,39 @@ def _filter_grid_2x2(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> str:
     return ";\n".join(lines)
 
 
+_MULTI_REGION_KINDS = {
+    RenderOpKind.SPLIT_SCREEN,
+    RenderOpKind.STACKED_GAMEPLAY,
+    RenderOpKind.HUD_COMPOSITE,
+    RenderOpKind.GRID_2X2,
+}
+
+
+def _is_multi_region(op) -> bool:
+    return op.kind in _MULTI_REGION_KINDS
+
+
+def _is_single_crop(op) -> bool:
+    return op.kind in (
+        RenderOpKind.CROP,
+        RenderOpKind.TRACKING_CROP,
+        RenderOpKind.CONTEXTUAL_PAN,
+        RenderOpKind.MOTIVATED_PUSH_IN,
+        RenderOpKind.MOTIVATED_PULL_OUT,
+        RenderOpKind.WIDE_MASTER,
+        RenderOpKind.BLUR_FILL,
+    )
+
+
 def _apply_transitions(ops, op_labels, lines) -> List[str]:
     """Apply xfade transitions between ops where ease_in_ms > 0.
 
-    Returns the final list of stream labels to concat.
+    Phase 5 addition: when transitioning FROM a multi-region op TO a
+    single-crop op AND the prior op carries ``transition_fade_out_ms``,
+    insert an xfade so the secondary region + separator fade out
+    smoothly over that window. Falls back to the existing ease_in_ms
+    behavior for everything else. Returns the final list of stream
+    labels to concat.
     """
     if len(ops) <= 1:
         return list(op_labels)
@@ -542,11 +735,24 @@ def _apply_transitions(ops, op_labels, lines) -> List[str]:
     final_labels = [op_labels[0]]
 
     for i in range(1, len(ops)):
-        ease_ms = ops[i].ease_in_ms
+        prev_op = ops[i - 1]
+        curr_op = ops[i]
+        ease_ms = curr_op.ease_in_ms
+
+        # Phase 5 multi-region → single-crop fade-out override.
+        fade_out_ms = int(getattr(prev_op, "transition_fade_out_ms", 0) or 0)
+        if (
+            fade_out_ms > 0
+            and _is_multi_region(prev_op)
+            and _is_single_crop(curr_op)
+            and ease_ms <= 0
+        ):
+            ease_ms = fade_out_ms
+
         if ease_ms > 0:
             # Insert xfade transition
             dur = ease_ms / 1000.0
-            offset = ops[i].start_sec - dur / 2.0
+            offset = curr_op.start_sec - dur / 2.0
             offset = max(0, offset)
 
             prev_label = final_labels[-1]

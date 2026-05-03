@@ -156,6 +156,22 @@ class ReframeConfig:
     pan_speed_max_frac_per_sec: float = 0.4
     min_hold_sec: float = 1.5
 
+    # ── Multi-region compositor (Phase 5 reframing overhaul) ──────
+    # Width in pixels of the dark separator drawn between regions in
+    # SPLIT_SCREEN / STACKED_GAMEPLAY / HUD_COMPOSITE outputs. Set to
+    # 0 to disable. Color is locked to ``#333333`` to match both
+    # the FFmpeg drawbox and the Canvas separator.
+    multi_region_separator_px: int = 2
+    # Default minimum region fraction for ``compute_region_split``.
+    multi_region_min_fraction: float = 0.25
+    # Duration in seconds for the fade-out used when the pipeline
+    # transitions FROM multi-region TO single-crop layouts (e.g. when
+    # gameplay yields to a cutscene).
+    multi_region_transition_fade_sec: float = 0.3
+    # Minimum HUD strip element height in output pixels — HUD elements
+    # smaller than this are scaled up to remain readable on 1080×1920.
+    hud_strip_min_element_height_px: int = 30
+
     # ── A/B cut scheduler ─────────────────────────────────────────
     ab_min_turn_sec: float = 0.8
     ab_max_cuts_per_sec: float = 2.0
