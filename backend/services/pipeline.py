@@ -2742,6 +2742,8 @@ async def _run_analysis_inner(job_id: str):
                 except Exception:
                     vad_intervals = []
 
+                import threading as _threading
+                _ladder_cancel_event = _threading.Event()
                 ctx = EscalationContext(
                     audio_path=audio_path,
                     audio_duration_ms=int(audio_duration * 1000),
@@ -2761,10 +2763,19 @@ async def _run_analysis_inner(job_id: str):
                     per_interval_timeout_sec=float(getattr(
                         settings, "TACT_LADDER_PER_INTERVAL_TIMEOUT_SEC", 30.0,
                     )),
+                    cancel_event=_ladder_cancel_event,
                 )
 
+                # The ladder runs in a thread pool; asyncio cancellation
+                # cannot kill the thread directly, so we set a
+                # cancellation event the ladder polls between intervals.
+                # The wall-clock cap also protects against pathological
+                # inputs (dozens of uncovered intervals on CPU).
+                _ladder_wall_clock_timeout_sec = float(getattr(
+                    settings, "TACT_LADDER_WALL_CLOCK_TIMEOUT_SEC", 360.0,
+                ))
                 _loop = asyncio.get_event_loop()
-                stats = await _loop.run_in_executor(
+                _ladder_future = _loop.run_in_executor(
                     None,
                     functools.partial(
                         escalate_uncovered_intervals_sync, ledger, ctx,
@@ -2773,6 +2784,43 @@ async def _run_analysis_inner(job_id: str):
                         )),
                     ),
                 )
+                try:
+                    stats = await asyncio.wait_for(
+                        asyncio.shield(_ladder_future),
+                        timeout=_ladder_wall_clock_timeout_sec,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError) as _e:
+                    logger.warning(
+                        "[%s] escalation ladder cancelled (%s) — "
+                        "signalling worker to drain remaining intervals "
+                        "via Rung 6",
+                        job_id, type(_e).__name__,
+                    )
+                    _ladder_cancel_event.set()
+                    # Give the worker a brief grace window to finish the
+                    # in-flight interval and unwind through Rung 6.
+                    try:
+                        stats = await asyncio.wait_for(
+                            asyncio.shield(_ladder_future),
+                            timeout=float(ctx.per_interval_timeout_sec) + 5.0,
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logger.error(
+                            "[%s] escalation ladder did not drain in time; "
+                            "abandoning thread (orphaned subprocess will "
+                            "exit on its own per-interval timeout)",
+                            job_id,
+                        )
+                        if isinstance(_e, asyncio.CancelledError):
+                            raise
+                        # On wall-clock timeout, fall through with an
+                        # empty stats record so the rest of the pipeline
+                        # can continue with whatever the ledger has.
+                        from backend.services.escalation_ladder import (
+                            EscalationStats as _EscStats,
+                        )
+                        stats = _EscStats()
+                        stats.skipped_reason = "wall_clock_timeout"
 
                 # Coverage invariant. Rung 6 should make this impossible
                 # to fire; explicit check makes a regression loud, not

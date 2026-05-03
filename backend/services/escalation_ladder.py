@@ -30,6 +30,7 @@ shift across phases.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol
@@ -84,6 +85,10 @@ class EscalationContext:
     # Per-interval timeout guard. Each rung must respect this when it
     # spawns subprocesses or other long-running work.
     per_interval_timeout_sec: float = 30.0
+    # Optional cancellation token. The ladder checks this between
+    # intervals and bails out early when set; in-flight subprocess
+    # rungs are bounded by their own per-interval timeout.
+    cancel_event: Optional[threading.Event] = None
 
 
 @dataclass
@@ -342,14 +347,22 @@ def _select_alt_checkpoint(primary_model: str) -> Optional[str]:
     if pm == "large-v3-turbo":
         return "large-v3"
     if pm == "medium":
-        # Prefer turbo when free VRAM allows; otherwise fall back to
-        # large-v3 (slower but still meaningful change in priors).
+        # Prefer turbo when free VRAM allows; otherwise step down to
+        # something the device can actually load and run within the
+        # per-interval timeout. On CPU (or very low free VRAM)
+        # large-v3 spends most of the 30s budget loading weights and
+        # never produces output, so use ``small`` instead — different
+        # priors, still cheap enough to finish in time.
         try:
             from backend.services.transcription import _get_gpu_free_mb
             free_mb = _get_gpu_free_mb() or 0
         except Exception:
             free_mb = 0
-        return "large-v3-turbo" if free_mb >= 3000 else "large-v3"
+        if free_mb >= 3000:
+            return "large-v3-turbo"
+        if free_mb >= 1500:
+            return "large-v3"
+        return "small"
     if pm == "small":
         return "medium"
     if pm.startswith("medium.en"):
@@ -901,7 +914,32 @@ def escalate_uncovered_intervals_sync(
 
     from dataclasses import replace
 
+    # Wall-clock safety valve. Even if the per-interval budget logic
+    # is correct, a pathological video (dozens of uncovered intervals,
+    # CPU-only Whisper) can still exceed the pipeline's outer
+    # asyncio.wait_for window. This hard cap keeps the ladder from
+    # ever monopolising a job past a fixed wall-clock budget.
+    wall_clock_cap_sec = float(ctx.per_interval_timeout_sec) * 10.0
+    wall_clock_cap_sec = max(60.0, min(wall_clock_cap_sec, 300.0))
+
     for start_ms, end_ms in intervals:
+        # Honour an external cancellation request (e.g. the pipeline's
+        # asyncio.wait_for fired). The thread can't be killed mid-
+        # subprocess but it can refuse to start the next interval.
+        if ctx.cancel_event is not None and ctx.cancel_event.is_set():
+            logger.info("escalation_ladder: cancelled by caller")
+            stats.skipped_reason = "cancelled"
+            break
+
+        if (time.monotonic() - started) > wall_clock_cap_sec:
+            logger.warning(
+                "escalation_ladder: wall-clock cap reached (%.0fs); "
+                "remaining intervals fall through to Rung 6",
+                time.monotonic() - started,
+            )
+            stats.skipped_reason = "wall_clock_cap"
+            stats.budget_exhausted = True
+
         # Build a fresh per-interval EscalationContext via
         # dataclasses.replace so the caller's original ctx is not
         # mutated. Rung 4 (forced alignment) reads neighbor text;
@@ -941,6 +979,7 @@ def escalate_uncovered_intervals_sync(
             effective_rungs = rungs
 
         interval_resolved = False
+        interval_elapsed_ms = 0
         for rung_name, rung_fn in effective_rungs:
             try:
                 result = rung_fn(
@@ -953,6 +992,7 @@ def escalate_uncovered_intervals_sync(
                 )
                 continue
 
+            interval_elapsed_ms += int(result.elapsed_ms)
             stats.rung_elapsed_ms[rung_name] = (
                 stats.rung_elapsed_ms.get(rung_name, 0)
                 + int(result.elapsed_ms)
@@ -980,10 +1020,7 @@ def escalate_uncovered_intervals_sync(
         # Whatever happened above, the budget shrinks by the wall-clock
         # cost (mostly Rungs 1 + 2 + 3 + 4 — the network-of-subprocess
         # rungs). Use the rung's elapsed_ms as the proxy.
-        budget_ms -= sum(
-            r.elapsed_ms if hasattr(r, "elapsed_ms") else 0
-            for r in []
-        )
+        budget_ms -= interval_elapsed_ms
         if not interval_resolved:
             # Rung 6 should have caught this; only reachable when the
             # budget exhausted and a custom rung list omitted it.
