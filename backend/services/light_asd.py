@@ -41,6 +41,10 @@ class ASDResult:
 
 
 _ASD_SESSION = None
+# Once we've tried (and failed) to load the model, cache that fact so
+# subsequent calls don't re-attempt the (~50 MB) download or re-log the
+# same warning. The heuristic v2 fallback handles all callers cleanly.
+_ASD_LOAD_FAILED = False
 
 
 def _get_session():
@@ -48,27 +52,43 @@ def _get_session():
 
     Returns None when onnxruntime isn't installed or the model can't
     be downloaded / loaded so callers can fall back to the v2 heuristic.
-    Cached as a module-level singleton.
+    Cached as a module-level singleton; failures are cached too so we
+    don't retry the download on every call.
     """
-    global _ASD_SESSION
+    global _ASD_SESSION, _ASD_LOAD_FAILED
     if _ASD_SESSION is not None:
         return _ASD_SESSION
+    if _ASD_LOAD_FAILED:
+        return None
     try:
         import onnxruntime as ort
     except ImportError:
         logger.warning("onnxruntime not installed — Light-ASD unavailable")
+        _ASD_LOAD_FAILED = True
         return None
 
     model_dir = os.path.join(os.path.dirname(__file__), "..", "models")
     os.makedirs(model_dir, exist_ok=True)
     model_path = os.path.join(model_dir, "light_asd.onnx")
+    # Allow operators / Docker images to pre-bundle the weights at a
+    # custom path (e.g. baked into the image build). When set, this
+    # path is preferred over the model_dir lookup so air-gapped
+    # deployments don't have to hit the upstream release URL.
+    bundled_path = os.environ.get("CLIPAI_LIGHT_ASD_MODEL_PATH", "").strip()
+    if bundled_path and os.path.exists(bundled_path):
+        model_path = bundled_path
     if not os.path.exists(model_path):
         try:
             import urllib.request
             logger.info("Downloading Light-ASD ONNX model...")
             urllib.request.urlretrieve(LIGHT_ASD_URL, model_path)
         except Exception as e:
-            logger.warning("Failed to download Light-ASD: %s", e)
+            logger.warning(
+                "Failed to download Light-ASD (%s) — falling back to "
+                "heuristic v2 ASD for the rest of this run",
+                e,
+            )
+            _ASD_LOAD_FAILED = True
             return None
 
     try:
@@ -79,7 +99,12 @@ def _get_session():
         logger.info("Loaded Light-ASD ONNX session (CPU)")
         return _ASD_SESSION
     except Exception as e:
-        logger.warning("Light-ASD session init failed: %s", e)
+        logger.warning(
+            "Light-ASD session init failed (%s) — falling back to "
+            "heuristic v2 ASD for the rest of this run",
+            e,
+        )
+        _ASD_LOAD_FAILED = True
         return None
 
 

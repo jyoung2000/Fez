@@ -42,7 +42,7 @@ USE_REFRAME_SEGMENTER = os.environ.get("USE_REFRAME_SEGMENTER", "true").lower() 
 # clip ran as content_type=unknown. Parity bench (Phase 10) passed with these
 # branches enabled; there is no reason to keep them behind a flag.
 USE_CONTENT_AWARE_REFRAME = os.environ.get("USE_CONTENT_AWARE_REFRAME", "true").lower() in ("true", "1", "yes")
-USE_INTENT_TRACKING = os.environ.get("USE_INTENT_TRACKING", "false").lower() in ("true", "1", "yes")
+USE_INTENT_TRACKING = os.environ.get("USE_INTENT_TRACKING", "true").lower() in ("true", "1", "yes")
 
 # ── Default tunables (used when no content profile is provided) ──
 MIN_HOLD_SECONDS = 0.12  # 3 frames @ 24fps, 4 @ 30fps — absolute floor
@@ -1975,6 +1975,101 @@ def build_reframe_segments(
         logger.warning(
             "[%s] composition guardrails failed (non-fatal): %s",
             job_id, _gr_exc,
+        )
+
+    # ── Stage 10b-bis: Post-solver face-in-crop clamp ──
+    #
+    # The L1 camera path solver minimizes total variation for smoothness,
+    # which can pull the crop center far enough from the target speaker's
+    # face that the face ends up outside the final 9:16 crop. The
+    # composition guardrails only enforce geometric rules (headroom,
+    # edges, pan speed) and don't verify that ``seg.active_slot``'s face
+    # is inside the crop rect. This pass walks every stationary /
+    # tracking segment with an active slot, looks up the slot's actual
+    # face position at the segment midpoint from ``dense_faces``, and
+    # re-centers ``seg.subject_x`` onto that face when the proposed
+    # crop wouldn't contain it. For tracking segments with a motion
+    # path, the same offset is applied uniformly to every entry so the
+    # path stays smooth. Layouts that don't need single-face validation
+    # (wide_master, blur_fill, split, grid, stacked_gameplay) are
+    # skipped.
+    try:
+        from backend.services.subject_confidence import (
+            face_in_proposed_crop as _post_fipc,
+        )
+        _crop_aspect_post = 9.0 / 16.0
+        _crop_w_post = float(source_height) * _crop_aspect_post
+        if _crop_w_post > source_width:
+            _crop_w_post = float(source_width)
+        _half_post = _crop_w_post / 2.0
+        _post_corrected = 0
+        _post_eligible = 0
+        _SKIP_LAYOUTS_POST = (
+            "wide_master", "blur_fill", "split", "grid", "stacked_gameplay",
+        )
+        for _seg_post in raw_segments:
+            if _seg_post.active_slot is None:
+                continue
+            if _seg_post.strategy not in ("stationary", "tracking"):
+                continue
+            if _seg_post.layout in _SKIP_LAYOUTS_POST:
+                continue
+            _post_eligible += 1
+            if _post_fipc(
+                _seg_post, face_registry, dense_faces,
+                source_width=source_width, source_height=source_height,
+            ):
+                continue
+            # Look up the slot's actual face position at the segment
+            # midpoint. Mirror the search window used by the diagnostic
+            # logging block (±0.5s around mid).
+            _seg_mid_post = (_seg_post.start + _seg_post.end) / 2.0
+            _slot_face_x_pct = None
+            _best_dt = 0.5
+            for _df_post in dense_faces or []:
+                _dt = abs(_df_post.timestamp - _seg_mid_post)
+                if _dt > _best_dt:
+                    continue
+                for _f_post in _df_post.faces:
+                    _sid_post = getattr(_f_post, "identity_id", -1)
+                    if _sid_post != _seg_post.active_slot:
+                        continue
+                    _slot_face_x_pct = float(
+                        getattr(_f_post, "nose_x", getattr(_f_post, "x", 50))
+                    )
+                    _best_dt = _dt
+                    break
+            if _slot_face_x_pct is None:
+                # No dense-face hit for this slot at midpoint; can't
+                # correct without a target. Leave subject_x alone.
+                continue
+            _new_subject_x = _slot_face_x_pct / 100.0 * source_width
+            # Clamp to source bounds so the crop stays inside the frame.
+            _new_subject_x = max(_half_post, min(source_width - _half_post, _new_subject_x))
+            _delta_post = _new_subject_x - _seg_post.subject_x
+            if abs(_delta_post) < 0.5:
+                continue
+            _seg_post.subject_x = _new_subject_x
+            _seg_post.subject_source = "post_solver_face_clamp"
+            if _seg_post.motion_path:
+                _shifted_path = []
+                for _entry in _seg_post.motion_path:
+                    _t = _entry[0]
+                    _x = float(_entry[1]) + _delta_post
+                    _x = max(_half_post, min(source_width - _half_post, _x))
+                    _shifted_path.append((_t, _x) + tuple(_entry[2:]))
+                _seg_post.motion_path = _shifted_path
+            _post_corrected += 1
+        if _post_eligible > 0:
+            logger.info(
+                "[%s] [reframe] post-solver clamp: corrected %d/%d segments "
+                "where face was outside crop",
+                job_id, _post_corrected, _post_eligible,
+            )
+    except Exception as _post_exc:
+        logger.warning(
+            "[%s] post-solver face-in-crop clamp failed (non-fatal): %s",
+            job_id, _post_exc,
         )
 
     # ── Stage 10c: Phase 4 V2 lead-room + thirds-bias post-process ──

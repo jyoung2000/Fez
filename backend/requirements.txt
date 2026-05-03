@@ -40,6 +40,12 @@ torch>=2.0.0
 insightface==0.7.3
 onnxruntime>=1.17.0
 
+# Music-video beat detection. Imported lazily inside
+# beat_detector.py; gating is via CLIPAI_MUSIC_BEAT_SNAP (default
+# ON). Without librosa the detector returns an empty BeatGrid and
+# music-video pulse cuts / boundary snaps become no-ops.
+librosa>=0.10.0
+
 # pytest is needed at runtime by the 1-click "2026 SOTA Reframing
 # Validate" button in Settings -> Advanced. The button spawns
 # `python -m pytest tests/qa/test_phase_*.py` to exercise the
@@ -69,7 +75,11 @@ pytest>=8.0.0
 #
 # TACT Phase 2 Rung 5 — PANNs CNN14 event classifier (~80 MB).
 # Pure-torch, no CUDA conflict. Safe to enable on existing image.
-# panns_inference>=0.1.1
+# Imported lazily inside non_speech_events.py; if the install
+# fails or the package is incompatible with the installed torch,
+# rung 5 returns label="other" and the ladder falls through to
+# rung 6 cleanly.
+panns_inference>=0.1.1
 #
 # TACT Phase 4 — Parakeet TDT consensus via NeMo (~1.5 GB transitive).
 # Pulls torch>=2.11 + nvidia-*-cu13 wheels. Need a separate Dockerfile

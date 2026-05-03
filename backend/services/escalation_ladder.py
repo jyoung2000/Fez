@@ -629,6 +629,38 @@ def _rung_consensus_model(
             pass
 
 
+# Module-level cache for the torchaudio import probe. ``None`` means
+# we haven't checked yet; ``True`` / ``False`` are the cached verdicts.
+# When False, every subsequent rung-4 call short-circuits without
+# touching ``align_text_to_audio`` so we don't spam the logs once per
+# uncovered interval (a single video can produce 30+ identical errors
+# when torchaudio is unavailable).
+_FORCED_ALIGNMENT_AVAILABLE: Optional[bool] = None
+
+
+def _forced_alignment_available() -> bool:
+    """Probe ``torchaudio`` once and cache the result.
+
+    Logs a single warning on the first failure so the operator knows
+    Rung 4 is being skipped without 30+ duplicate error lines.
+    """
+    global _FORCED_ALIGNMENT_AVAILABLE
+    if _FORCED_ALIGNMENT_AVAILABLE is not None:
+        return _FORCED_ALIGNMENT_AVAILABLE
+    try:
+        import torchaudio  # noqa: F401
+    except Exception as e:
+        logger.warning(
+            "Forced alignment unavailable (torchaudio import failed: %s) "
+            "— skipping rung 4 for all intervals",
+            type(e).__name__,
+        )
+        _FORCED_ALIGNMENT_AVAILABLE = False
+        return False
+    _FORCED_ALIGNMENT_AVAILABLE = True
+    return True
+
+
 def _rung_forced_alignment(
     audio_path: str, start_ms: int, end_ms: int, ctx: EscalationContext,
 ) -> RungResult:
@@ -651,6 +683,12 @@ def _rung_forced_alignment(
         )
     if end_ms <= start_ms:
         return RungResult(rung_name="rung_4_forced_alignment")
+    if not _forced_alignment_available():
+        return RungResult(
+            rung_name="rung_4_forced_alignment",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            notes="deps_unavailable_cached",
+        )
 
     # Neighbor text comes from the orchestrator (per-interval).
     neighbor = (

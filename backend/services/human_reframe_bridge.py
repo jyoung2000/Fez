@@ -120,6 +120,25 @@ def maybe_override_render_plan(
 
     config = config or get_default_config()
 
+    # Scale the critic repair budget with clip duration so long-form
+    # content (full episodes, multi-hour streams) gets enough fixes to
+    # cover the back half of the video. The 5-per-minute slope keeps a
+    # 60 s clip at the 50-fix floor and lets a 60-minute movie reach
+    # 300 fixes. Operators can still pin a fixed budget via
+    # ``CLIPAI_CRITIC_BUDGET`` (the env var is honored at config-build
+    # time; we only scale up when the explicit budget is at the
+    # default-or-lower).
+    try:
+        _scaled_budget = max(
+            int(config.critic_budget_per_clip),
+            int(float(duration_sec) / 60.0 * 5.0),
+        )
+        if _scaled_budget != int(config.critic_budget_per_clip):
+            config = config.override(critic_budget_per_clip=_scaled_budget)
+    except Exception:
+        # Never let budget scaling fail the pipeline.
+        pass
+
     try:
         inputs = HumanReframeInputs(
             duration_sec=float(duration_sec),

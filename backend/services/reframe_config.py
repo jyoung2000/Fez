@@ -205,7 +205,12 @@ class ReframeConfig:
     critic_vlm_backend: str = "auto"
     critic_sample_interval_sec: float = 1.0
     critic_threshold: float = 6.0
-    critic_budget_per_clip: int = 20
+    # Higher default than the legacy 20 because long-form content (a
+    # 60-minute movie or 10-minute podcast) can blow through 20 fixes
+    # before reaching the second half. The pipeline overrides this to
+    # ``max(20, int(duration_sec / 60 * 5))`` at runtime so a 10-minute
+    # video gets 50 repairs and a 60-minute movie gets 300.
+    critic_budget_per_clip: int = 50
     critic_cache_dir: str = "/tmp/clipai_critic_cache"
 
     # ── Saliency fusion weights (Fix 3.10) ────────────────────────
@@ -431,7 +436,7 @@ def load_default_config() -> ReframeConfig:
         critic_vlm_backend=os.environ.get("CLIPAI_CRITIC_VLM_BACKEND", "auto"),
         critic_sample_interval_sec=_env_float("CLIPAI_CRITIC_DT", 1.0),
         critic_threshold=_env_float("CLIPAI_CRITIC_THRESHOLD", 6.0),
-        critic_budget_per_clip=_env_int("CLIPAI_CRITIC_BUDGET", 20),
+        critic_budget_per_clip=_env_int("CLIPAI_CRITIC_BUDGET", 50),
         critic_cache_dir=os.environ.get("CLIPAI_CRITIC_CACHE",
                                         "/tmp/clipai_critic_cache"),
 
