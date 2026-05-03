@@ -1061,12 +1061,58 @@ class AIOrchestrator:
                 return verified_clips
             vp = self.vision_provider
             pre_scores = {id(c): int(c.viral_score) for c in verified_clips}
-            verified_clips = await apply_visual_verification(
-                verified_clips,
-                frames or [],
-                vp,
-                cancel_check=cancel_check or self._cancel_check,
-            )
+            try:
+                verified_clips = await asyncio.wait_for(
+                    apply_visual_verification(
+                        verified_clips,
+                        frames or [],
+                        vp,
+                        cancel_check=cancel_check or self._cancel_check,
+                    ),
+                    timeout=120,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Visual verification timed out after 120s (%s) — "
+                    "keeping %d clips with unverified scores",
+                    label, len(verified_clips),
+                )
+                for clip in verified_clips:
+                    diag = dict(getattr(clip, "score_diagnostics", None) or {})
+                    diag["visual_verification"] = {
+                        "pre_score": int(clip.viral_score),
+                        "post_score": int(clip.viral_score),
+                        "delta": 0,
+                        "note": "timeout",
+                    }
+                    clip.score_diagnostics = diag
+                if progress_callback:
+                    progress_callback(
+                        f"Visual verification timed out ({label}: "
+                        f"keeping {len(verified_clips)} clips unverified)"
+                    )
+                return verified_clips
+            except Exception as e:
+                logger.warning(
+                    "Visual verification failed (%s) — keeping %d clips "
+                    "with unverified scores: %s",
+                    label, len(verified_clips), e,
+                )
+                for clip in verified_clips:
+                    diag = dict(getattr(clip, "score_diagnostics", None) or {})
+                    diag["visual_verification"] = {
+                        "pre_score": int(clip.viral_score),
+                        "post_score": int(clip.viral_score),
+                        "delta": 0,
+                        "note": "error",
+                    }
+                    clip.score_diagnostics = diag
+                if progress_callback:
+                    progress_callback(
+                        f"Visual verification failed ({label}: "
+                        f"keeping {len(verified_clips)} clips unverified)"
+                    )
+                return verified_clips
             n_changed = 0
             for clip in verified_clips:
                 pre = pre_scores.get(id(clip))
