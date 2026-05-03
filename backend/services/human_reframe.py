@@ -307,6 +307,83 @@ def run_human_reframe(
     else:
         notes.append(f"A/B disabled: {ab.fallback_reason}")
 
+    # ── Phase 2 composition guardrails (post-critic, pre-RenderPlan) ──
+    # Apply hard compositional rules (headroom, edge margins, lead room,
+    # text protection, pan speed, min hold) to the solved 2-D camera
+    # path. Best-effort: any failure logs and leaves the path untouched.
+    # Gated on the CLIPAI_COMPOSITION_GUARDRAILS env flag (default on).
+    try:
+        from backend.services.composition_guardrails import (
+            CropFrame,
+            FrameAnalysis,
+            enforce_guardrails,
+            guardrails_enabled,
+        )
+        if guardrails_enabled() and getattr(path, "x", None) is not None:
+            xs = getattr(path, "x", None) or []
+            ys = getattr(path, "y", None) or []
+            ts = list(timestamps)
+            crop_w_pred = float(inputs.source_h) * 9.0 / 16.0
+            if crop_w_pred > inputs.source_w:
+                crop_w_pred = float(inputs.source_w)
+            crop_h_pred = float(inputs.source_h)
+            crops = []
+            analyses = []
+            n_path = min(len(xs), len(ts))
+            for i in range(n_path):
+                cx = float(xs[i])
+                cy = float(ys[i]) if i < len(ys) else crop_h_pred / 2.0
+                crops.append(CropFrame(
+                    t=float(ts[i]),
+                    x=max(0.0, min(float(inputs.source_w) - crop_w_pred,
+                                   cx - crop_w_pred / 2.0)),
+                    y=max(0.0, min(float(inputs.source_h) - crop_h_pred,
+                                   cy - crop_h_pred / 2.0)),
+                    w=crop_w_pred,
+                    h=crop_h_pred,
+                ))
+                analyses.append(FrameAnalysis(timestamp=float(ts[i])))
+            if crops:
+                fps_est = 30.0
+                if len(ts) >= 2:
+                    dts = [ts[i + 1] - ts[i] for i in range(len(ts) - 1)
+                           if ts[i + 1] > ts[i]]
+                    if dts:
+                        fps_est = 1.0 / (sum(dts) / len(dts))
+                adjusted, report = enforce_guardrails(
+                    crops, analyses,
+                    inputs.source_w, inputs.source_h,
+                    fps=fps_est, config=config,
+                )
+                # Write adjusted cx/cy back into the camera path.
+                for i, cf in enumerate(adjusted):
+                    if i < len(xs):
+                        xs[i] = cf.cx
+                    if i < len(ys):
+                        ys[i] = cf.cy
+                if hasattr(path, "x"):
+                    try:
+                        path.x = xs
+                    except Exception:
+                        pass
+                if hasattr(path, "y"):
+                    try:
+                        path.y = ys
+                    except Exception:
+                        pass
+                if report.violations_found > 0:
+                    notes.append(
+                        f"guardrails: {report.violations_found} found, "
+                        f"{report.violations_fixed} fixed, "
+                        f"{report.violations_unfixable} unfixable"
+                    )
+                if report.needs_human_review:
+                    notes.append("guardrails: needs human review")
+    except Exception as gr_exc:
+        logger.warning(
+            "composition guardrails failed (non-fatal): %s", gr_exc,
+        )
+
     return HumanReframePlan(
         path=path,
         events=events,

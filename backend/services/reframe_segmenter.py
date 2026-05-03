@@ -1695,6 +1695,55 @@ def build_reframe_segments(
     if l1_count > 0:
         _log("L1 camera path solved for %d segments", l1_count)
 
+    # ── Stage 10b: Phase 2 composition guardrails ──
+    # Post-solver pass that enforces hard compositional rules (no
+    # black space, headroom band, edge margins, joint-aware body
+    # cropping, gaze lead-room, text protection, pan-speed limit,
+    # min-hold time). Best-effort; any failure logs and continues.
+    # Gated on CLIPAI_COMPOSITION_GUARDRAILS (default true).
+    try:
+        from backend.services.composition_guardrails import (
+            adapt_segments_to_crop_path,
+            enforce_guardrails,
+            guardrails_enabled,
+            write_crop_path_back_to_segments,
+        )
+        if guardrails_enabled():
+            _cfg_for_gr = _reframe_config_for(content_profile) if "_reframe_config_for" in dir() else None
+            if _cfg_for_gr is None:
+                from backend.services.reframe_config import get_default_config
+                _cfg_for_gr = get_default_config()
+                if content_profile is not None:
+                    _ct_for_gr = getattr(content_profile, "content_type", None)
+                    if _ct_for_gr is not None:
+                        _cfg_for_gr = _cfg_for_gr.for_content(_ct_for_gr)
+            _crops_for_gr, _analyses_for_gr = adapt_segments_to_crop_path(
+                raw_segments, source_width, source_height, fps=30.0,
+            )
+            if _crops_for_gr:
+                _adjusted, _gr_report = enforce_guardrails(
+                    _crops_for_gr, _analyses_for_gr,
+                    source_width, source_height, fps=30.0,
+                    config=_cfg_for_gr,
+                )
+                touched = write_crop_path_back_to_segments(
+                    _adjusted, raw_segments, source_width,
+                )
+                if _gr_report.violations_found > 0 or touched > 0:
+                    _log(
+                        "composition guardrails: %d violations found, "
+                        "%d fixed, %d unfixable; %d segments touched",
+                        _gr_report.violations_found,
+                        _gr_report.violations_fixed,
+                        _gr_report.violations_unfixable,
+                        touched,
+                    )
+    except Exception as _gr_exc:
+        logger.warning(
+            "[%s] composition guardrails failed (non-fatal): %s",
+            job_id, _gr_exc,
+        )
+
     # ── Stage 10c: Phase 4 V2 lead-room + thirds-bias post-process ──
     #
     # Stage 8 applies Phase 4 offsets to ``seg.subject_x`` BEFORE the

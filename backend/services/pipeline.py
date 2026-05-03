@@ -5499,6 +5499,64 @@ async def _run_analysis_inner(job_id: str):
                         job_id, _bs_e,
                     )
 
+                # Phase 1 (reframing overhaul): per-shot strategy advisor.
+                # Runs deterministically from already-computed signals
+                # (dense_face_results, active_speaker_events, saliency
+                # peaks) BEFORE build_reframe_segments and the human-
+                # reframe bridge so both downstream paths see the same
+                # advice list. The advisor never raises; on any
+                # exception we drop ``shot_advice_list`` to ``[]`` and
+                # the segmenter falls back to its existing logic.
+                shot_advice_list: list = []
+                try:
+                    from backend.services.shot_reframe_advisor import (
+                        advise_all_shots as _advise_all_shots,
+                    )
+
+                    class _AdvisorShot:
+                        __slots__ = ("shot_idx", "start", "end", "shot_type")
+
+                        def __init__(self, idx, start, end):
+                            self.shot_idx = idx
+                            self.start = start
+                            self.end = end
+                            # No framing-tier classifier in pipeline yet
+                            # (Phase 2). Empty string makes the advisor
+                            # skip the ECU/CU/EWS gates — base logic
+                            # falls through to face/saliency branches.
+                            self.shot_type = ""
+
+                    _vd = float(metadata.get("duration", 0) or 0.0)
+                    _starts = [0.0] + sorted(_shot_cuts or [])
+                    _ends = sorted(_shot_cuts or []) + [_vd]
+                    _advisor_shots = [
+                        _AdvisorShot(i, s, e)
+                        for i, (s, e) in enumerate(zip(_starts, _ends))
+                        if e - s >= 0.05
+                    ]
+                    shot_advice_list = _advise_all_shots(
+                        shots=_advisor_shots,
+                        content_profile=_content_profile,
+                        face_tracks=dense_face_results or [],
+                        speaker_events=active_speaker_events or [],
+                        saliency_data=(
+                            _saliency_regions if "_saliency_regions" in dir() else []
+                        ) or [],
+                        text_regions=[],
+                        source_w=int(metadata.get("width", 1920) or 1920),
+                        source_h=int(metadata.get("height", 1080) or 1080),
+                    )
+                    logger.info(
+                        "[%s] ShotReframeAdvisor: %d shot advices",
+                        job_id, len(shot_advice_list),
+                    )
+                except Exception as _adv_e:
+                    logger.warning(
+                        "[%s] Shot advisor failed (non-fatal): %s",
+                        job_id, _adv_e,
+                    )
+                    shot_advice_list = []
+
                 # Phase 10: give build_reframe_segments a sidecar
                 # dict so the Stage 9b editorial state-machine
                 # report is surfaced back to the caller without

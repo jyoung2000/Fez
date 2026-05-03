@@ -143,6 +143,19 @@ class ReframeConfig:
     zoom_max_duration_sec: float = 4.0
     zoom_min_gap_sec: float = 4.0
 
+    # ── Composition guardrails (Phase 2 reframing overhaul) ───────
+    # Hard limits enforced by ``composition_guardrails.enforce_guardrails``
+    # AFTER the L1/LP solver produces a camera path and BEFORE that
+    # path is written into a RenderPlan. See module docstring there for
+    # the full spec.
+    #
+    # ``pan_speed_max_frac_per_sec`` — max horizontal velocity of the
+    # crop CENTER, in fractions of OUTPUT frame width per second.
+    # ``min_hold_sec`` — minimum stability time between repositions:
+    # two repositions inside this window are merged at the midpoint.
+    pan_speed_max_frac_per_sec: float = 0.4
+    min_hold_sec: float = 1.5
+
     # ── A/B cut scheduler ─────────────────────────────────────────
     ab_min_turn_sec: float = 0.8
     ab_max_cuts_per_sec: float = 2.0
@@ -384,6 +397,11 @@ def load_default_config() -> ReframeConfig:
         zoom_min_duration_sec=_env_float("CLIPAI_ZOOM_MIN_DUR", 1.5),
         zoom_max_duration_sec=_env_float("CLIPAI_ZOOM_MAX_DUR", 4.0),
         zoom_min_gap_sec=_env_float("CLIPAI_ZOOM_MIN_GAP", 4.0),
+
+        pan_speed_max_frac_per_sec=_env_float(
+            "CLIPAI_PAN_SPEED_MAX", 0.4,
+        ),
+        min_hold_sec=_env_float("CLIPAI_MIN_HOLD_SEC", 1.5),
 
         ab_min_turn_sec=_env_float("CLIPAI_AB_MIN_TURN", 0.8),
         ab_max_cuts_per_sec=_env_float("CLIPAI_AB_MAX_CUTS", 2.0),
