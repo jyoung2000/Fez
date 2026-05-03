@@ -5517,21 +5517,52 @@ async def _run_analysis_inner(job_id: str):
                     class _AdvisorShot:
                         __slots__ = ("shot_idx", "start", "end", "shot_type")
 
-                        def __init__(self, idx, start, end):
+                        def __init__(self, idx, start, end, shot_type=""):
                             self.shot_idx = idx
                             self.start = start
                             self.end = end
-                            # No framing-tier classifier in pipeline yet
-                            # (Phase 2). Empty string makes the advisor
-                            # skip the ECU/CU/EWS gates — base logic
-                            # falls through to face/saliency branches.
-                            self.shot_type = ""
+                            self.shot_type = shot_type
+
+                    def _infer_shot_type(start: float, end: float) -> str:
+                        """Lightweight framing-tier inference from face area.
+
+                        Uses the median primary-face width across the shot
+                        (0-100 pct of frame) to classify into ECU/CU/MCU/
+                        MS/WS. When no faces are detected we return an
+                        empty string so the advisor skips the framing
+                        gates — face/saliency branches stay in charge.
+                        """
+                        if not dense_face_results:
+                            return ""
+                        widths = []
+                        for df in dense_face_results:
+                            if df.timestamp < start or df.timestamp > end:
+                                continue
+                            if not df.faces:
+                                continue
+                            primary = df.faces[0]
+                            w = float(getattr(primary, "width", 0.0) or 0.0)
+                            if w > 0.0:
+                                widths.append(w)
+                        if not widths:
+                            return ""
+                        widths.sort()
+                        median_w = widths[len(widths) // 2]
+                        if median_w >= 50.0:
+                            return "ECU"
+                        if median_w >= 30.0:
+                            return "CU"
+                        if median_w >= 20.0:
+                            return "MCU"
+                        if median_w >= 10.0:
+                            return "MS"
+                        return "WS"
 
                     _vd = float(metadata.get("duration", 0) or 0.0)
                     _starts = [0.0] + sorted(_shot_cuts or [])
                     _ends = sorted(_shot_cuts or []) + [_vd]
                     _advisor_shots = [
-                        _AdvisorShot(i, s, e)
+                        _AdvisorShot(i, s, e, _infer_shot_type(s, e))
                         for i, (s, e) in enumerate(zip(_starts, _ends))
                         if e - s >= 0.05
                     ]

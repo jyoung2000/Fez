@@ -507,23 +507,35 @@ def _build_motion_path(
 ) -> List[MotionKeypoint]:
     """Build motion_path keypoints from segment motion data.
 
-    motion_data is expected to be [(t, x, y), ...] from the segmenter,
-    where t is absolute time, x/y are 0-100 subject positions.
+    motion_data may be either:
+      - ``[(t, x, y), ...]`` from the optical_flow tracking path, where
+        ``t`` is absolute time and ``x``/``y`` are 0-100 subject positions.
+      - ``[(t, x_pixel), ...]`` from the L1 camera-path solver, where
+        ``t`` is absolute time and ``x_pixel`` is in source-pixel space.
+        The y coordinate defaults to the vertical center of the source.
+
+    Both forms are accepted; coordinates stay as ``float`` so that
+    ``_compute_crop_rect`` can route them through the correct
+    pixel-vs-normalized branch.
     """
     if not motion_data:
         return []
 
     keypoints = []
     for point in motion_data:
-        if len(point) < 3:
+        if len(point) >= 3:
+            t_abs, mx, my = float(point[0]), float(point[1]), float(point[2])
+        elif len(point) >= 2:
+            t_abs, mx = float(point[0]), float(point[1])
+            my = float(source_h) / 2.0
+        else:
             continue
-        t_abs, mx, my = point[0], point[1], point[2]
         # Convert to segment-relative time
         t_rel = t_abs - seg_start
         if t_rel < -0.01 or t_rel > (seg_end - seg_start) + 0.01:
             continue
         t_rel = max(0.0, min(t_rel, seg_end - seg_start))
-        rect = _compute_crop_rect(int(mx), int(my), source_w, source_h, aspect_ratio)
+        rect = _compute_crop_rect(mx, my, source_w, source_h, aspect_ratio)
         keypoints.append(MotionKeypoint(t=t_rel, rect=rect))
 
     # Decimate if too many keypoints

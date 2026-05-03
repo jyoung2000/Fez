@@ -565,6 +565,25 @@ def build_reframe_segments(
                     seg.confidence = 0.8
                     split_count += 1
             elif active_slot_count >= 3 and _is_multi_speaker_crowd(seg.start, seg.end, dense_faces, face_registry):
+                # Bug fix: for panel/podcast/debate content, do NOT drop to
+                # wide_master when there is a confident active speaker —
+                # snap to that speaker's seat instead. Wide_master should
+                # only fire when no speaker is identified (last resort).
+                _panel_like = ct in ("multi_speaker_panel", "podcast", "debate")
+                if (
+                    _panel_like
+                    and seg.active_slot is not None
+                    and face_registry is not None
+                ):
+                    slot = face_registry.slot_by_id(seg.active_slot)
+                    if slot is not None:
+                        seg.subject_x = float(slot.x_center) / 100.0 * source_width
+                        seg.layout = "single"
+                        seg.strategy = "stationary"
+                        seg.reason = "multi_speaker_active_slot"
+                        seg.subject_source = "active_speaker_slot"
+                        seg.confidence = max(seg.confidence, 0.7)
+                        continue
                 seg.layout = "wide_master"
                 seg.strategy = "wide_master"
                 seg.active_slot = None
