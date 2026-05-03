@@ -73,6 +73,19 @@ export default function useVideoLoadRetry(videoRef, src, options = {}) {
   const stallTimerRef = useRef(null);
   const firstDelayOverrideRef = useRef(null);
   const abortRef = useRef(null);
+  // Flag set by the periodic HEAD probe when the backend keeps
+  // returning 503. If the transcode is genuinely still in flight we
+  // refuse to give up — the 5-minute attempt budget is calibrated for
+  // a typical encode, not a 4K libx264 ultrafast on a tiny CPU box,
+  // which can legitimately run longer. See ``_scheduleRetry``.
+  const backendStillWorkingRef = useRef(false);
+  // Cap the number of budget resets so a backend that crashes mid-
+  // transcode (last 503 was minutes ago, now nothing responds) still
+  // surfaces an error eventually instead of spinning forever. Three
+  // full budgets ≈ 15 minutes — long enough for any sane encode, short
+  // enough that a hung backend doesn't strand the user.
+  const budgetResetsRef = useRef(0);
+  const MAX_BUDGET_RESETS = 3;
 
   useEffect(() => {
     const video = videoRef.current;
@@ -98,7 +111,13 @@ export default function useVideoLoadRetry(videoRef, src, options = {}) {
     if (abortRef.current) abortRef.current.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
-    (async () => {
+    backendStillWorkingRef.current = false;
+    budgetResetsRef.current = 0;
+    // ``ready2xx`` flag — true when HEAD said the file is finally
+    // playable. Used by the budget-exhausted re-probe to ``video.load()``
+    // and pick the new content up immediately, instead of leaving the
+    // already-errored element idle.
+    const probe = async ({ kickLoadOn2xx = false } = {}) => {
       try {
         const resp = await fetch(src, { method: 'HEAD', signal: ctrl.signal });
         if (ctrl.signal.aborted) return;
@@ -107,6 +126,7 @@ export default function useVideoLoadRetry(videoRef, src, options = {}) {
           // immediately, use Retry-After for the first delay if
           // present.
           setPreparing(true);
+          backendStillWorkingRef.current = true;
           const retryAfter = parseInt(resp.headers.get('Retry-After') || '', 10);
           if (Number.isFinite(retryAfter) && retryAfter > 0) {
             firstDelayOverrideRef.current = retryAfter * 1000;
@@ -115,18 +135,43 @@ export default function useVideoLoadRetry(videoRef, src, options = {}) {
         } else if (resp.status === 401) {
           setAuthError(true);
           setPreparing(false);
+        } else if (resp.status >= 200 && resp.status < 400) {
+          backendStillWorkingRef.current = false;
+          if (kickLoadOn2xx && videoRef.current) {
+            try { videoRef.current.load(); } catch { /* element gone */ }
+          }
+        } else {
+          // 4xx/5xx other than 401/503 — fall into retry; the next
+          // HEAD will tell us whether it's transient or permanent.
+          backendStillWorkingRef.current = false;
+          _scheduleRetry();
         }
-        // 200/206 → do nothing, let the <video> element load normally.
       } catch (e) {
         if (ctrl.signal.aborted) return;
         // Network error on the probe — fall into the retry loop.
         _scheduleRetry();
       }
-    })();
+    };
+    probe();
 
     function _scheduleRetry() {
       const attempt = attemptRef.current;
       if (attempt >= maxAttempts) {
+        // Don't surface a hard failure while the backend is still
+        // actively transcoding — that's the "preview never loads"
+        // bug we exist to prevent. Re-probe the server: if it still
+        // says 503, reset the budget and keep going. Only flip to
+        // ``error`` when the backend has stopped reporting progress.
+        if (
+          backendStillWorkingRef.current
+          && budgetResetsRef.current < MAX_BUDGET_RESETS
+        ) {
+          attemptRef.current = 0;
+          backendStillWorkingRef.current = false;
+          budgetResetsRef.current += 1;
+          probe({ kickLoadOn2xx: true });
+          return;
+        }
         setError(true);
         setPreparing(false);
         return;
@@ -215,6 +260,8 @@ export default function useVideoLoadRetry(videoRef, src, options = {}) {
 
   const reset = () => {
     attemptRef.current = 0;
+    budgetResetsRef.current = 0;
+    backendStillWorkingRef.current = false;
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
     if (stallTimerRef.current) { clearTimeout(stallTimerRef.current); stallTimerRef.current = null; }
     firstDelayOverrideRef.current = null;

@@ -378,6 +378,14 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
         ref={videoRef}
         src={src}
         preload="auto"
+        playsInline
+        // ``webkit-playsinline`` is required for iOS Safari < 10 to keep
+        // playback inline instead of forcing fullscreen — without it the
+        // preview is unreachable inside embedded WebViews (PWAs, in-app
+        // browsers like the Twitter / LinkedIn shells the share link
+        // is regularly opened in).
+        webkit-playsinline=""
+        x-webkit-airplay="allow"
         style={{
           display: 'block',
           ...(isFullscreen ? {

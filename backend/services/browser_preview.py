@@ -805,6 +805,32 @@ def ensure_browser_preview_status(
         )
         t0 = time.time()
         ok = _run_ffmpeg(cmd, target_path)
+        if not ok and _should_retry_with_software(cmd):
+            # HW encoder failed on this specific input (driver hiccup,
+            # GPU OOM, exotic pixel format the encoder rejects). Burn
+            # the cached HW spec so subsequent previews use libx264
+            # immediately, then re-run *this* encode in software so the
+            # user gets a playable preview instead of the silent-audio
+            # source fallback. This is the difference between "the
+            # preview always loads" and "the preview loads except when
+            # NVENC has a bad day".
+            logger.warning(
+                "browser_preview: HW encoder failed on %s, retrying with libx264",
+                source_path,
+            )
+            global _preview_encoder_cache
+            _preview_encoder_cache = {
+                "encoder": "libx264",
+                "preset": "ultrafast",
+                "rate_args": [
+                    "-crf", "26",
+                    "-maxrate", f"{_PREVIEW_MAX_BITRATE_KBPS}k",
+                    "-bufsize", f"{_PREVIEW_MAX_BITRATE_KBPS * 2}k",
+                    "-threads", "0",
+                ],
+            }
+            cmd = _build_ffmpeg_cmd(source_path, target_path, probe)
+            ok = _run_ffmpeg(cmd, target_path)
         if not ok:
             return source_path, False
         logger.info(
@@ -813,6 +839,22 @@ def ensure_browser_preview_status(
         return target_path, True
     finally:
         _release_lock(lock_path)
+
+
+def _should_retry_with_software(cmd: list[str]) -> bool:
+    """Return True if ``cmd`` used a hardware encoder we can fall back from.
+
+    The fallback only fires when the original encode actually used a HW
+    encoder — re-running an already-libx264 encode would hit the same
+    failure twice. Inspecting the command (rather than threading a flag
+    through the call stack) keeps the retry branch a one-line check.
+    """
+    try:
+        idx = cmd.index("-c:v")
+    except ValueError:
+        return False
+    encoder = cmd[idx + 1] if idx + 1 < len(cmd) else ""
+    return encoder in {"h264_nvenc", "h264_qsv", "h264_videotoolbox", "h264_vaapi"}
 
 
 def ensure_browser_preview(source_path: str, *, wait_for_peer: bool = True) -> str:
