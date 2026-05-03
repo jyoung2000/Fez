@@ -376,6 +376,22 @@ export default function Analysis() {
     return () => { if (saveSettingsTimerRef.current) clearTimeout(saveSettingsTimerRef.current); };
   }, [clipSettings, jobId]);
 
+  // Auto-promote aspectRatio to 9:16 once per job when the backend has dense
+  // reframe data and the user hasn't picked an AR. The persisted '9:16' wins
+  // on next load via the existing settings save, so this won't keep firing.
+  // Within a session the one-shot guard lets the user clear AR back to null.
+  const arAutoPromotedJobRef = useRef(null);
+  useEffect(() => {
+    if (!job?.id) return;
+    if (arAutoPromotedJobRef.current === job.id) return;
+    if (clipSettings?.aspectRatio != null) return;
+    const hasDense = !!job.dense_tracking_summary ||
+      (Array.isArray(job.subject_track) && job.subject_track.length > 0);
+    if (!hasDense) return;
+    arAutoPromotedJobRef.current = job.id;
+    setClipSettings((prev) => ({ ...prev, aspectRatio: '9:16' }));
+  }, [job?.id, job?.dense_tracking_summary, job?.subject_track, clipSettings?.aspectRatio]);
+
   // VideoEditor state for export params
   const [editorTrim, setEditorTrim] = useState({ trimStart: 0, trimEnd: 0 });
   const [editorSubjectKeyframes, setEditorSubjectKeyframes] = useState(null);
