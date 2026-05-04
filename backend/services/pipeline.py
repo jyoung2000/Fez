@@ -6030,8 +6030,23 @@ async def _run_analysis_inner(job_id: str):
                     clips_provider = "none"
         except asyncio.TimeoutError:
             logger.error("[%s] Clip detection timed out", job_id)
-            clips = []
-            clips_provider = "none"
+            # If the detection task itself finished but verification was
+            # still running when the outer timeout fired, recover its
+            # result rather than discarding the work.
+            if clip_detection_task and clip_detection_task.done():
+                try:
+                    clips, clips_provider = clip_detection_task.result()
+                    logger.info(
+                        "[%s] Recovered %d clips from completed detection "
+                        "task despite outer timeout",
+                        job_id, len(clips),
+                    )
+                except Exception:
+                    clips = []
+                    clips_provider = "none (timeout)"
+            else:
+                clips = []
+                clips_provider = "none (timeout)"
         except CancelledError:
             raise
         except Exception as e:
@@ -6044,6 +6059,29 @@ async def _run_analysis_inner(job_id: str):
                 await heartbeat_task
             except (asyncio.CancelledError, CancelledError):
                 pass
+
+    # Persist clips to the database immediately after detection, before
+    # snapping/polishing/emphasis. Ensures clips survive if later steps
+    # timeout, crash, or the container restarts. The final save below
+    # overwrites with the polished version (snapped boundaries, emphasis
+    # keywords, hot zones, etc.).
+    if clips:
+        try:
+            _early_clips = list(clips)
+            for idx, _clip in enumerate(_early_clips, start=1):
+                _clip.id = idx
+            await database.update_job_status(
+                job_id,
+                clips=_early_clips,
+            )
+            logger.info(
+                "[%s] Early-saved %d clips to database (pre-snapping)",
+                job_id, len(_early_clips),
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] Early clip save failed (non-fatal): %s", job_id, e,
+            )
 
     await _update_progress(
         job_id, JobStatus.DETECTING_CLIPS, 95,
