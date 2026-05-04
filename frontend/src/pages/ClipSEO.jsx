@@ -13,6 +13,7 @@ import useEncodingManager from '../hooks/useEncodingManager';
 import sanitizeJob from '../utils/sanitizeJob';
 import useTimelineStore from '../stores/timelineStore';
 import { buildOverlayPayload, buildVideoEffectsPayload, mapSubtitleSettings } from '../utils/buildExportPayload';
+import { useSignedMediaUrl } from '../utils/signedMediaUrl';
 
 function formatDuration(seconds) {
   if (!seconds && seconds !== 0) return '0:00';
@@ -117,6 +118,11 @@ export default function ClipSEO() {
   const timelineItems = useTimelineStore((s) => s.items);
   const timelineMediaLibrary = useTimelineStore((s) => s.mediaLibrary);
   const [job, setJob] = useState(null);
+  // Signed preview URL — see Analysis.jsx for the same pattern.
+  const _videoPathForHook = job?.file_path
+    ? `video.${job.file_path.split('.').pop() || 'mp4'}`
+    : null;
+  const { url: videoSrc } = useSignedMediaUrl(jobId, _videoPathForHook);
   const [clip, setClip] = useState(null);
   const [seo, setSeo] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -955,7 +961,6 @@ export default function ClipSEO() {
   }
 
   const videoExt = job.file_path?.split('.').pop() || 'mp4';
-  const videoSrc = `/api/files/${jobId}/video.${videoExt}`;
   const clipDur = (endTime ?? clip.end_time) - (startTime ?? clip.start_time);
   const elapsed = Math.max(0, Math.min(clipDur, currentTime - (startTime ?? clip.start_time)));
   const progress = clipDur > 0 ? (elapsed / clipDur) * 100 : 0;

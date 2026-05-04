@@ -4,6 +4,7 @@ import logging.handlers
 import subprocess
 import threading
 import time
+from typing import Optional
 
 # ── Prevent PyTorch from eagerly initializing CUDA in the main process ──
 # PyTorch's torch.cuda.is_available() triggers full CUDA initialization which
@@ -14,6 +15,7 @@ os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
@@ -627,16 +629,51 @@ async def serve_file(
     job_id: str,
     path: str,
     request: Request,
-    user: User = Depends(get_current_user),
 ):
     """Serve video files and exported clips with range request support.
 
-    Every request is authenticated and checked against job ownership so
-    one user (admin or otherwise) can't read another's source video or
-    exported clips by guessing job IDs. The per-user media library
-    directories (``_library_{user_id}``) match by ownership name too
-    when ``job_id`` starts with the library sentinel.
+    Two auth paths are supported:
+
+      1. ``?exp=<epoch>&sig=<hex>`` — short-lived signed URL produced
+         by ``POST /api/media/sign``. The signature binds to a
+         specific ``(user_id, job_id, path)`` triple until ``exp``,
+         so the HTML5 ``<video>`` element can fetch range chunks
+         without sending the session cookie. This is the path taken
+         by every preview / thumbnail that runs through the signed
+         URL helper.
+      2. Session cookie — normal dashboard flows, downloads, etc.
+
+    Either path still runs the full per-user job-ownership check
+    (``require_job_access``) before serving bytes, so a forged or
+    misused signed URL can't reach another user's job.
     """
+    # Auth path discrimination.
+    exp_raw = request.query_params.get("exp")
+    sig = request.query_params.get("sig")
+    user: Optional[User] = None
+    if exp_raw and sig:
+        try:
+            exp_int = int(exp_raw)
+        except (TypeError, ValueError):
+            return Response(status_code=401, content="invalid signature")
+        # We bind the signature to ``user_id`` so the caller must
+        # identify themselves via the ``u`` query parameter. Any
+        # mismatched user_id fails the HMAC check deterministically.
+        claimed_uid = request.query_params.get("u") or ""
+        from backend.app.auth.security import verify_media_signature
+        from backend.app.auth.store import get_user as _get_user
+        if not verify_media_signature(claimed_uid, job_id, path, exp_int, sig):
+            return Response(status_code=401, content="invalid signature")
+        user = await _get_user(claimed_uid)
+        if user is None or not user.active:
+            return Response(status_code=401, content="invalid signature")
+    else:
+        # Cookie path — the AuthMiddleware already attached the user.
+        user = getattr(request.state, "user", None)
+        if user is None:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=401, detail="not authenticated")
+
     # Per-user media library: ``_library_{user_id}`` directories are
     # owned by the user in their name; any other user is rejected.
     if job_id.startswith("_library_"):
@@ -693,7 +730,13 @@ async def serve_file(
                 return Response(
                     status_code=503,
                     content="preview still being prepared",
-                    headers={"Retry-After": "5"},
+                    # 2 s — the new (HW / ultrafast) encoder finishes
+                    # most preview transcodes in under 30 s, so a
+                    # short retry window keeps total time-to-play
+                    # close to the encode time. The frontend's
+                    # exponential backoff still escalates for slow
+                    # CPU encodes that genuinely need more time.
+                    headers={"Retry-After": "2"},
                     media_type="text/plain",
                 )
         except Exception as e:  # pragma: no cover — fallback path
@@ -765,6 +808,42 @@ async def serve_file(
     if _is_source_video:
         response.headers["Cache-Control"] = "public, max-age=3600"
     return response
+
+
+class _SignMediaRequest(BaseModel):
+    job_id: str
+    path: str
+
+
+@app.post("/api/media/sign")
+async def sign_media(
+    payload: _SignMediaRequest,
+    user: User = Depends(get_current_user),
+):
+    """Mint a short-lived signed URL for ``GET /api/files/<job>/<path>``.
+
+    Requires a valid session cookie. Returns a URL that can be used
+    by a ``<video>`` / ``<img>`` element without the cookie — useful
+    when the media fetch would otherwise race the session cookie
+    (e.g. long-running Range requests during a browser-preview
+    transcode).
+
+    The signature binds to this caller's ``user_id``; a user can't
+    mint a URL to another user's job (the ownership check still
+    runs at fetch time anyway).
+    """
+    from backend.app.auth.security import sign_media_url
+    job_id = (payload.job_id or "").strip()
+    rel_path = (payload.path or "").lstrip("/")
+    if not job_id or not rel_path:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="job_id + path required")
+    expiry, sig = sign_media_url(user.id, job_id, rel_path)
+    # URL-encode nothing special here: job_id is a UUID and rel_path
+    # is an already-safe filename. Keep it minimal so the frontend
+    # can string-match against the path.
+    url = f"/api/files/{job_id}/{rel_path}?exp={expiry}&sig={sig}&u={user.id}"
+    return {"url": url, "expires_at": expiry}
 
 
 # ── Cloud storage setup docs ─────────────────────────────────────────
