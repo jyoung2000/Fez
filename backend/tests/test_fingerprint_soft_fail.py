@@ -167,3 +167,62 @@ def test_ip_change_alone_is_accepted(client):
     )
     assert r2.status_code == 200
 
+
+def test_legacy_session_migrates_to_current_version(client):
+    """Pre-fix sessions on disk stored an older fingerprint (V1: IP+UA,
+    V2: full UA). The middleware must accept such a session once under
+    the current scheme and rewrite the stored fingerprint to the V3
+    (browser-family + major-version) form.
+    """
+    async def _seed_legacy():
+        u = await auth_store.create_user("alice", "supersecret")
+        # Hand-craft a session with a V1-style fingerprint (IP+UA)
+        # and both version flags left False to mark it as legacy.
+        from backend.app.auth.models import Session
+        from datetime import datetime, timedelta, timezone
+        token = "legacy-token-abc"
+        v1_fp = hashlib.sha256(b"1.1.1.0|BrowserA/1.0").hexdigest()[:32]
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        expires = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        async with auth_store._sessions_lock:
+            data = await auth_store._read_json(
+                auth_store.SESSIONS_PATH, {"sessions": []},
+            )
+            data.setdefault("sessions", []).append(Session(
+                token=token, user_id=u.id,
+                fingerprint=v1_fp,
+                ip="1.1.1.1", user_agent="BrowserA/1.0",
+                created_at=now, last_seen=now, expires_at=expires,
+                remember=True, fp_v2=False, fp_v3=False,
+            ).to_storage())
+            await auth_store._atomic_write_json(auth_store.SESSIONS_PATH, data)
+        return token
+    token = asyncio.run(_seed_legacy())
+
+    # Hit /me with the legacy cookie — migration lets it through.
+    r = client.get(
+        "/api/auth/me",
+        headers={"user-agent": "BrowserA/1.0"},
+        cookies={"clipai_session": token},
+    )
+    assert r.status_code == 200, r.text
+
+    # The stored fingerprint was rewritten to V3.
+    async def _reload():
+        return await auth_store.get_session(token)
+    got = asyncio.run(_reload())
+    assert got is not None
+    assert got.fp_v3 is True
+    assert got.fingerprint == security.compute_fingerprint(
+        "ignored", "BrowserA/1.0",
+    )
+
+    # A second request with a DIFFERENT browser family now fails the
+    # mismatch check (no more migration path left).
+    r2 = client.get(
+        "/api/auth/me",
+        headers={"user-agent": "AttackerBrowser/0.0"},
+        cookies={"clipai_session": token},
+    )
+    assert r2.status_code == 401
+    assert r2.json()["detail"] == "fingerprint_mismatch"
