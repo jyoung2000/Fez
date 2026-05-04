@@ -36,3 +36,36 @@ torch>=2.0.0
 # Enabled via CLIPAI_FACE_EMBEDDING=arcface (default: sface).
 insightface==0.7.3
 onnxruntime>=1.17.0
+
+# ── TACT optional dependencies ──
+# All three are CAPABILITY deps. They are COMMENTED OUT BY DEFAULT
+# because their transitive closure (especially NeMo) pulls in ~1.5 GB
+# of CUDA-13 NVIDIA wheels that conflict with this image's pinned
+# CUDA 12 stack and exhaust /tmp during the Docker build.
+#
+# Production code imports each of these LAZILY inside the rung that
+# uses it, and degrades gracefully when the package isn't installed:
+#   * Rung 5 (non_speech_events.py) returns label="other" → falls
+#     through to Rung 6.
+#   * Consensus pass (parakeet_transcriber.py) declines the
+#     gate with reason="vram_probe_unavailable".
+#   * Translation track (translation_track.py) skips semantic
+#     reconciliation and picks the highest-confidence candidate.
+#
+# To enable any of them, uncomment the corresponding line and rebuild.
+# Vendor model checkpoints into the image build step rather than
+# downloading at first run.
+#
+# TACT Phase 2 Rung 5 — PANNs CNN14 event classifier (~80 MB).
+# Pure-torch, no CUDA conflict. Safe to enable on existing image.
+# panns_inference>=0.1.1
+#
+# TACT Phase 4 — Parakeet TDT consensus via NeMo (~1.5 GB transitive).
+# Pulls torch>=2.11 + nvidia-*-cu13 wheels. Need a separate Dockerfile
+# variant or a larger build context to install. DO NOT enable without
+# rebuilding the GPU image with cu13 base.
+# nemo_toolkit[asr]>=2.0.0
+#
+# TACT Phase 5 consensus — LaBSE multilingual embeddings (~500 MB).
+# CPU-only. Pulls transformers but compatible with current image.
+# sentence-transformers>=3.0.0
