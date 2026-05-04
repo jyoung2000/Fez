@@ -88,6 +88,94 @@ class Settings(BaseSettings):
     # on ≥6 GB cards; this flag extends the ladder so mid-tier GPUs
     # get ``small → medium`` on ≥2.5 GB as well.
     WHISPER_AUTO_UPGRADE: bool = True
+    # ── TACT Phase 1: Temporal Coverage Ledger ──
+    # First-class coverage record. Defaults ON because Phase 1 is pure
+    # observability — it bootstraps a CoverageLedger from the existing
+    # post-gap-fill segment list, persists a coverage_report dict on
+    # the job, and logs a one-line summary. No transcript text changes.
+    # Set to False to disable ledger emission (e.g. for byte-identical
+    # regression comparisons against pre-TACT runs).
+    TACT_LEDGER_ENABLED: bool = True
+    # Bin width used purely for reporting denominators (the stored
+    # spans are full-ms precision regardless). 20 ms matches the TACT
+    # design doc default; 10 ms is finer-grained for archival research,
+    # 40 ms is coarser for very long files.
+    TACT_LEDGER_BIN_MS: int = 20
+    # ── TACT Phase 2: Escalation ladder + hallucination quarantine ──
+    # Master switch for the ladder. When False, the legacy gap-filler
+    # remains in place and behavior is unchanged.
+    TACT_LADDER_ENABLED: bool = True
+    # Total audio (in seconds) the ladder may re-transcribe across all
+    # gap intervals in a single job. Once exceeded, remaining intervals
+    # are routed straight to the cheap Rungs 5 and 6.
+    TACT_LADDER_MAX_AUDIO_SEC: float = 600.0
+    # Hard ceiling (in seconds) that any single Rung 1-4 invocation may
+    # spend on one interval. Prevents a 300-s gap from starving the
+    # rest of the ladder.
+    TACT_LADDER_PER_INTERVAL_TIMEOUT_SEC: float = 30.0
+    # Per-rung kill switches. Useful for A/B comparison and as
+    # emergency rollback if a rung is producing bad output. Rung 1 and
+    # Rung 6 cannot be disabled (Rung 6 is the coverage-invariant
+    # terminator).
+    TACT_LADDER_RUNG_2_ENABLED: bool = True   # alt Whisper checkpoint
+    TACT_LADDER_RUNG_3_ENABLED: bool = False  # consensus — Phase 4
+    TACT_LADDER_RUNG_4_ENABLED: bool = True   # forced alignment
+    TACT_LADDER_RUNG_5_ENABLED: bool = True   # event classifier
+    # Quarantine vs drop. When False, _filter_hallucinations still
+    # returns the tuple (signature change is permanent), but the
+    # pipeline ignores the quarantined list — equivalent to legacy
+    # silent-drop behavior.
+    TACT_QUARANTINE_HALLUCINATIONS: bool = True
+    # Non-speech event classifier. Only "panns" is supported in
+    # Phase 2; "yamnet" reserved for future use.
+    TACT_EVENT_BACKEND: str = "panns"
+    TACT_EVENT_MIN_CONFIDENCE: float = 0.6
+    # Forced alignment device. "auto" uses CUDA when available, CPU
+    # otherwise. The aligner is small (~360 MB) so CPU is acceptable
+    # and avoids contending with the Whisper model for VRAM.
+    TACT_FORCED_ALIGN_DEVICE: str = "auto"
+    TACT_FORCED_ALIGN_MIN_WORD_CONFIDENCE: float = 0.6
+    # ── TACT Phase 3: Disjoint-offset multi-pass ──
+    # When True, run Whisper a second time with a phase-shifted chunk
+    # grid (offset_sec into the audio) and reconcile the two passes
+    # at word level. Catches words that were truncated or hallucinated
+    # at chunk boundaries in the primary pass.
+    TACT_DISJOINT_OFFSET_ENABLED: bool = True
+    # Half of Whisper's 30 s chunk window puts every primary chunk
+    # boundary in the middle of an offset chunk (and vice versa).
+    TACT_DISJOINT_OFFSET_SEC: float = 15.0
+    # Optional third pass at a finer offset (typically 7.5 s). 0
+    # disables. Worth ~0.3 percentage points of WER on 1+ hour
+    # content but doubles serial transcription cost.
+    TACT_DISJOINT_OFFSET_THIRD_PASS_SEC: float = 0.0
+    # Word alignment tolerance for the reconciler — primary and
+    # offset words within this many seconds are paired and ROVER-
+    # voted. 0.2 s is robust to Whisper's typical timestamp jitter.
+    TACT_RECONCILE_ALIGN_TOLERANCE_SEC: float = 0.2
+    TACT_RECONCILE_BOUNDARY_WINDOW_SEC: float = 2.0
+    # ── TACT Phase 4: Independent-architecture consensus ──
+    # Heavyweight, opt-in. NeMo Toolkit dependency is loaded only
+    # when this flag is True AND VRAM probe passes the threshold.
+    TACT_CONSENSUS_ENABLED: bool = False
+    TACT_CONSENSUS_MODEL: str = "nvidia/parakeet-tdt-0.6b-v3"
+    # Minimum free VRAM after Whisper unload before Parakeet may run.
+    # Parakeet-tdt-0.6b int8 needs ~1.8 GB; 2.2 GB gives headroom.
+    TACT_CONSENSUS_MIN_FREE_VRAM_MB: int = 2200
+    TACT_OVERLAP_SEPARATION_ENABLED: bool = True
+    # ── TACT Phase 5: Translation track ──
+    # When True (and either task=="translate" or an explicit target
+    # language is set), build a paired source/target ledger so the
+    # 100% coverage invariant applies in both languages.
+    TACT_TRANSLATION_TRACK_ENABLED: bool = True
+    # Translation backend. "whisper" uses Whisper's task=translate
+    # (English target only); "nllb" / "seamless" enable arbitrary
+    # target languages but require their respective weights.
+    TACT_TRANSLATION_BACKEND: str = "whisper"
+    # When True and ≥2 backends are available, run both and reconcile
+    # via semantic similarity (LaBSE embeddings).
+    TACT_TRANSLATION_CONSENSUS_ENABLED: bool = False
+    TACT_TRANSLATION_SIMILARITY_AGREE: float = 0.85
+    TACT_TRANSLATION_SIMILARITY_CONTEST: float = 0.70
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
     # Adaptive frame extraction
@@ -130,6 +218,28 @@ class Settings(BaseSettings):
 
     # Camera solver (per-shot AutoFlip-style crop planning)
     CLIPAI_CAMERA_SOLVER: str = "on"  # "on" | "off" — env CLIPAI_CAMERA_SOLVER
+
+    # ── 2026 SOTA reframing pipeline flags (Phases A–E) ──────────────
+    # All flags are ON by default after Phase E. Set CLIPAI_LEGACY_REFRAME=1
+    # for one-release emergency rollback to the pre-SOTA pipeline.
+    #
+    # Phase A — SAMURAI subject tracking. Values: ``samurai`` |
+    # ``opencv`` | ``auto``. ``auto`` picks SAMURAI when CUDA is
+    # visible, OpenCV otherwise.
+    CLIPAI_TRACKER_BACKEND: str = "auto"
+    # Phase B — CoTracker3 dense point trajectories. ON.
+    CLIPAI_DENSE_POINT_TRACKING: bool = True
+    # Phase C — TASED-Net AV saliency + PaddleOCR text-region
+    # exclusions. ON.
+    CLIPAI_SALIENCY_ENABLED: bool = True
+    # Phase D — CLIP-based composition head. Values: ``clip`` |
+    # ``legacy`` | ``none``. Defaults to ``clip``.
+    CLIPAI_COMPOSITION_HEAD: str = "clip"
+    # Phase E — global editorial planner (single LLM call per clip). ON.
+    CLIPAI_EDITORIAL_PLANNER: bool = True
+    # Emergency rollback — forces the legacy ``reframe_segmenter`` path
+    # for one release after Phase E flipped the defaults. Default OFF.
+    CLIPAI_LEGACY_REFRAME: bool = False
 
     # Content-type routing for solver tuning (off by default until tested)
     CLIPAI_CONTENT_ROUTING: str = "off"  # "on" | "off" — env CLIPAI_CONTENT_ROUTING
