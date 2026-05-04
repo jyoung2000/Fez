@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { processKeyframes, interpolateSubjectX, isDynamic, subjectXToCenterPct, safeSubjectX } from '../utils/subjectTracking';
 import useResponsive from '../hooks/useResponsive';
+import useVideoLoadRetry from '../hooks/useVideoLoadRetry';
 import { usePlayer } from '../contexts/PlayerContext';
 
 const ASPECT_RATIO_VALUES = {
@@ -120,13 +121,10 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     const onEnded = () => stopRaf();
     const onSeeked = () => report(video.currentTime);
     const onDur = () => setDuration(video.duration);
-    const onError = () => {
-      // Retry once on load error (handles transient partial content failures)
-      if (!video._retried) {
-        video._retried = true;
-        video.load();
-      }
-    };
+    // NOTE: the ``error`` event is handled centrally by
+    // ``useVideoLoadRetry`` (below) so we don't attach a one-shot
+    // retry here — that collides with the 503 + Retry-After transcode
+    // window, which wants many retries with exponential backoff.
 
     video.addEventListener('timeupdate', onTime);
     video.addEventListener('play', onPlay);
@@ -134,7 +132,6 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     video.addEventListener('ended', onEnded);
     video.addEventListener('seeked', onSeeked);
     video.addEventListener('loadedmetadata', onDur);
-    video.addEventListener('error', onError);
 
     // Initial push so the overlay / transcript highlight has a value on
     // mount (otherwise they stay at the default ``currentTime=0`` until
@@ -153,9 +150,18 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
       video.removeEventListener('ended', onEnded);
       video.removeEventListener('seeked', onSeeked);
       video.removeEventListener('loadedmetadata', onDur);
-      video.removeEventListener('error', onError);
     };
   }, [clipEnd]);
+
+  // Retry loader for the 503 + Retry-After window while the backend
+  // browser-preview transcode is in flight (see
+  // backend/services/browser_preview.py). Without this, a user who
+  // opens the page before transcode finishes sees a dead <video>.
+  const {
+    preparing: videoPreparing,
+    error: videoLoadError,
+    reset: retryVideoLoad,
+  } = useVideoLoadRetry(videoRef, src);
 
   // Track fullscreen changes
   useEffect(() => {
@@ -372,6 +378,14 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
         ref={videoRef}
         src={src}
         preload="auto"
+        playsInline
+        // ``webkit-playsinline`` is required for iOS Safari < 10 to keep
+        // playback inline instead of forcing fullscreen — without it the
+        // preview is unreachable inside embedded WebViews (PWAs, in-app
+        // browsers like the Twitter / LinkedIn shells the share link
+        // is regularly opened in).
+        webkit-playsinline=""
+        x-webkit-airplay="allow"
         style={{
           display: 'block',
           ...(isFullscreen ? {
@@ -389,6 +403,72 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
         }}
         onClick={togglePlay}
       />
+
+      {/* Preview-transcode overlay — backend returns 503 while the
+          browser-friendly preview is still being built (common on
+          large 4K / VP9 / MKV uploads). useVideoLoadRetry keeps the
+          <video> element mounted and re-load()-ing in the background
+          so this overlay can show progress instead of a dead player.
+          Matches the analogous UI in VideoEditor.jsx so both preview
+          surfaces behave identically. */}
+      {videoPreparing && !videoLoadError && (
+        <div style={{
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexDirection: 'column',
+          gap: 8,
+          background: 'rgba(0,0,0,0.55)',
+          color: '#fff',
+          fontSize: 13,
+          fontFamily: 'var(--font-mono, monospace)',
+          pointerEvents: 'none',
+          zIndex: 2,
+        }}>
+          <div style={{
+            width: 18, height: 18,
+            border: '2px solid rgba(255,255,255,0.3)',
+            borderTopColor: '#fff',
+            borderRadius: '50%',
+            animation: 'vp-spin 0.9s linear infinite',
+          }} />
+          <div>Preparing preview…</div>
+          <style>{`@keyframes vp-spin { to { transform: rotate(360deg); } }`}</style>
+        </div>
+      )}
+      {videoLoadError && (
+        <div style={{
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexDirection: 'column',
+          gap: 10,
+          background: 'rgba(0,0,0,0.7)',
+          color: '#fff',
+          fontSize: 13,
+          zIndex: 2,
+        }}>
+          <div>Failed to load video</div>
+          <button
+            onClick={retryVideoLoad}
+            style={{
+              padding: '4px 12px',
+              background: 'var(--accent-amber, #FF9F0A)',
+              color: '#000',
+              border: 0,
+              borderRadius: 4,
+              cursor: 'pointer',
+              fontSize: 12,
+            }}
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       {/* Aspect ratio badge */}
       {aspectRatio && (
