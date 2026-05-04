@@ -141,32 +141,32 @@ def _diarize_pyannote(
 ) -> list:
     """Run pyannote speaker-diarization-3.1 against ``audio_path``.
 
+    Uses the shared singleton in ``backend.services._pyannote_loader``
+    so this path and the transcription post-processing path always
+    see the same ``Pipeline`` instance.
+
     Returns ``[]`` on any failure — caller falls through to the MFCC
-    tier. ``num_speakers`` is passed as a hint when known (we always
-    know it from the ClipAI face registry slot count).
+    tier. ``num_speakers`` here is a NOISY LOWER BOUND from the face
+    registry, not ground truth: face detection misses off-screen
+    speakers, profile-only shots, dark scenes, and anime
+    side-characters. We therefore convert it into a ``min_speakers``
+    / ``max_speakers`` bracket instead of pinning pyannote to the
+    exact count — the old ``num_speakers=`` kwarg forced pyannote
+    into exactly that many clusters and was the dominant cause of
+    the "every speaker is Speaker 1" bug when the registry only
+    saw one face.
     """
     try:
-        from pyannote.audio import Pipeline
-        import torch
-
-        token = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1", use_auth_token=token,
-        )
-        device = _resolve_device()
-        if device == "cuda":
-            pipeline.to(torch.device("cuda"))
+        from backend.services._pyannote_loader import get_pipeline
+        pipeline, reason = get_pipeline()
+        if pipeline is None:
             logger.info(
-                "[Diarization] pyannote loaded on CUDA (%.0f MB free)",
-                _cuda_free_mb() or 0,
+                "[Diarization] pyannote unavailable (reason=%s) — falling back",
+                reason,
             )
-        else:
-            logger.info("[Diarization] pyannote loaded on CPU")
+            return []
 
-        kwargs = {}
-        if num_speakers is not None and num_speakers > 0:
-            kwargs["num_speakers"] = num_speakers
-
+        kwargs = _pyannote_bound_kwargs(num_speakers)
         diarization = pipeline(audio_path, **kwargs)
         segments = []
         speaker_to_cluster: dict = {}
@@ -180,13 +180,37 @@ def _diarize_pyannote(
                 confidence=0.85,
             ))
         logger.info(
-            "[Diarization] pyannote produced %d segments, %d clusters",
-            len(segments), len(speaker_to_cluster),
+            "[Diarization] pyannote produced %d segments, %d clusters (bounds=%s)",
+            len(segments), len(speaker_to_cluster), kwargs,
         )
         return segments
     except Exception as e:
         logger.warning("[Diarization] pyannote failed (%s) — falling back", e)
         return []
+
+
+def _pyannote_bound_kwargs(num_speakers: Optional[int]) -> dict:
+    """Translate a noisy ``num_speakers`` hint into a bracket.
+
+    * ``num_speakers >= 2`` → ``min_speakers = max(1, N - 1)``,
+      ``max_speakers = N + 2``. Wide enough that a missed face
+      slot doesn't clamp the output.
+    * ``num_speakers == 1`` → ``min_speakers = 1``,
+      ``max_speakers = 3`` so a single detected face never forces
+      pyannote into a monologue.
+    * ``None`` / ``<= 0`` → return ``{}`` and let pyannote
+      auto-detect.
+    * Never return a ``num_speakers=`` key — that's the clamp we're
+      trying to remove.
+    """
+    if num_speakers is None or num_speakers < 1:
+        return {}
+    if num_speakers == 1:
+        return {"min_speakers": 1, "max_speakers": 3}
+    return {
+        "min_speakers": max(1, num_speakers - 1),
+        "max_speakers": num_speakers + 2,
+    }
 
 
 # ──────────────────── MFCC + k-means fallback tier ────────────────────
@@ -308,14 +332,16 @@ def _kmeans_assign(features, num_clusters: int):
 def _diarize_mfcc(
     audio_path: str, num_speakers: Optional[int] = None,
 ) -> list:
-    """MFCC + k-means fallback tier. Requires numpy + librosa and a
-    ``num_speakers`` hint (we always know the face-slot count in the
-    ClipAI pipeline). Returns ``[]`` when any dep is missing or the
-    VAD probe can't find voiced intervals.
+    """MFCC + k-means fallback tier.
+
+    Requires numpy + librosa. When ``num_speakers`` is absent we
+    sweep k=2..6 and keep the k with the highest silhouette score.
+    If the VAD probe shows a single continuous voiced region
+    covering > 90% of the clip we treat it as a monologue and keep
+    k=1; otherwise the floor is k=2 so a two-speaker clip whose
+    face detection missed one speaker still ends up with two
+    clusters.
     """
-    if num_speakers is None or num_speakers < 1:
-        logger.info("[Diarization] MFCC tier requires num_speakers hint; skipping")
-        return []
     try:
         from backend.services.active_speaker import build_vad_presence
     except Exception:
@@ -328,7 +354,52 @@ def _diarize_mfcc(
     features, kept = _extract_mfcc_for_intervals(audio_path, intervals)
     if features is None or not kept:
         return []
-    labels, sil = _kmeans_assign(features, num_speakers)
+
+    # Monologue probe: one continuous voiced region covering most of
+    # the clip → leave it at k=1. Otherwise floor at 2 so a missed
+    # face slot doesn't produce a single-cluster diarization.
+    clip_start = kept[0][0]
+    clip_end = kept[-1][1]
+    voiced_total = sum(e - s for s, e in kept)
+    clip_span = max(clip_end - clip_start, 1e-6)
+    is_monologue = (
+        len(kept) == 1
+        or (len(kept) <= 2 and voiced_total / clip_span > 0.9)
+    )
+
+    # Derive the k to try. Respect a caller-provided bound of 2+ as
+    # a LOWER bound (face registry saw N faces so there are at
+    # least N-1 speakers). Never use it as the EXACT cluster count.
+    if num_speakers is not None and num_speakers >= 2:
+        lower = max(2, num_speakers - 1)
+        upper = num_speakers + 2
+    elif is_monologue:
+        lower, upper = 1, 1
+    else:
+        lower, upper = 2, 6
+
+    # Need at least ``upper`` voiced intervals to run ``upper``
+    # clusters meaningfully.
+    upper = min(upper, len(kept))
+    lower = min(lower, upper)
+
+    if lower == upper:
+        labels, sil = _kmeans_assign(features, lower)
+        chosen_k = lower
+    else:
+        best = (None, -2.0, lower)  # (labels, sil, k)
+        for k in range(lower, upper + 1):
+            labels_k, sil_k = _kmeans_assign(features, k)
+            if labels_k is None:
+                continue
+            if sil_k > best[1]:
+                best = (labels_k, sil_k, k)
+        labels, sil, chosen_k = best
+        if labels is None:
+            # Fell off the sweep — default to k=lower as a safe
+            # floor so we still return something useful.
+            labels, sil = _kmeans_assign(features, lower)
+            chosen_k = lower
     if labels is None:
         return []
 
@@ -340,8 +411,8 @@ def _diarize_mfcc(
         for i, (s, e) in enumerate(kept)
     ]
     logger.info(
-        "[Diarization] MFCC produced %d segments, %d clusters, sil=%.2f",
-        len(segments), num_speakers, sil,
+        "[Diarization] MFCC produced %d segments, %d clusters (swept %d..%d), sil=%.2f",
+        len(segments), chosen_k, lower, upper, sil,
     )
     return segments
 

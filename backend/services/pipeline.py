@@ -4096,9 +4096,18 @@ async def _run_analysis_inner(job_id: str):
             USE_DIARIZATION, diarize_audio, fuse_lip_and_diarization,
         )
         _num_slots = len(face_registry.slots) if face_registry else 0
-        if USE_DIARIZATION and _num_slots >= 2 and audio_path and active_speaker_events:
+        # Face-slot count is a NOISY LOWER BOUND on speaker count —
+        # not an exact number. Always attempt diarization when we
+        # have audio + a lip timeline; the slot count becomes a
+        # hint that the bounded kwargs in ``_diarize_pyannote``
+        # translate into ``min_speakers`` / ``max_speakers``. Passing
+        # ``_num_slots == 1`` here still produces a 1..3 speaker
+        # bracket which catches the profile-only / off-screen /
+        # dark-scene cases where face detection missed a speaker.
+        if USE_DIARIZATION and audio_path and active_speaker_events:
             _diar_start = _time.time()
-            _diar_segments = diarize_audio(audio_path, num_speakers=_num_slots)
+            _diar_hint = max(_num_slots, 2) if _num_slots > 0 else None
+            _diar_segments = diarize_audio(audio_path, num_speakers=_diar_hint)
             if _diar_segments:
                 _fusion = fuse_lip_and_diarization(
                     active_speaker_events, _diar_segments,
