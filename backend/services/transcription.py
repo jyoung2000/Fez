@@ -22,6 +22,41 @@ _last_detected_language = {}
 # Stores which diarization method was used ("neural" or "heuristic")
 _last_diarization_method = {"method": "heuristic"}
 
+# TACT Phase 2: hallucination quarantine. Stores the most recent
+# _filter_hallucinations quarantined-segment list so the pipeline can
+# claim it into the CoverageLedger as ``status="quarantined"`` after
+# transcription returns. Mirrors the _last_detected_language /
+# _last_diarization_method accessor pattern. Reset at the start of
+# every transcribe_audio* entrypoint so a re-used worker doesn't
+# carry stale entries across jobs. Each entry is a dict with the
+# segment fields plus a ``quarantine_reason`` key.
+_last_quarantined_segments: list[dict] = []
+
+
+# TACT Phase 2: stable identifiers for quarantine reasons. The set
+# is closed — every drop in _filter_hallucinations gets exactly one
+# reason from this tuple.
+QUARANTINE_REASONS = (
+    "ghost_by_ratio",        # duration > N AND chars_per_sec < threshold
+    "near_duplicate",         # exact-text duplicate within sliding window
+    "fuzzy_duplicate",        # Jaccard / SequenceMatcher near-dup
+    "mega_ghost",             # very long duration, very short text
+    "boilerplate",            # matches _WHISPER_BOILERPLATE
+    "compression_anomaly",    # CJK looping / trigram looping
+    "logprob_floor",          # avg_logprob below threshold
+    "non_speech",             # high no_speech_prob + low confidence
+    "prompt_echo",            # initial_prompt echoed as transcription
+    "runaway",                # text > 1500 chars (single-segment runaway)
+    "backward_jump",          # temporal ordering violation
+)
+
+
+def get_last_quarantined_segments() -> list[dict]:
+    """Return (a copy of) the quarantined segments from the most recent
+    ``_filter_hallucinations`` call. Used by the pipeline to claim
+    quarantined regions into the CoverageLedger."""
+    return list(_last_quarantined_segments)
+
 # Exposed after model loads so the pipeline can report GPU info in status messages
 whisper_device_info = {"device": "cpu", "compute_type": "int8", "gpu_name": ""}
 
@@ -38,6 +73,87 @@ _MODEL_LOAD_TIMEOUT = 600  # 10 minutes
 # Per-segment stall timeout: if no new segment is produced within this
 # many seconds, assume the model is stuck and return partial results.
 _SEGMENT_STALL_TIMEOUT = 120  # 2 minutes
+
+
+# One-shot GPU passthrough probe. Cached for the process lifetime —
+# if /dev/nvidia* doesn't exist at process start it won't materialize
+# later, and nvidia-smi being missing is a deployment bug, not a
+# transient state. The previous behaviour was to re-run multi-method
+# CUDA detection on every Whisper load, which logged a flurry of
+# "CUDA library libcuda.so.1 is loadable — GPU may be available"
+# / "CUDA failed (CUDA failed with error unknown error) — falling
+# back to CPU" pairs every single time the gap-filler reloaded the
+# in-process singleton.
+_gpu_probe_cache: Optional[dict] = None
+
+
+def _probe_gpu_availability() -> dict:
+    """One-shot GPU passthrough probe. Cached for the process lifetime.
+
+    Returns a dict with:
+      - visible (bool): True iff CUDA is actually usable in this container.
+      - nvidia_devices (list[str]): /dev/nvidia* character devices found.
+      - nvidia_smi_available (bool): whether ``nvidia-smi`` is on PATH.
+      - ctranslate2_devices (int): CUDA devices reported by ctranslate2.
+      - reason (str): short human-readable reason when unavailable.
+
+    Keeps the cost low: ``glob`` + ``shutil.which`` + a single
+    ``ctranslate2.get_cuda_device_count`` call. Calling it many times
+    is free after the first invocation.
+    """
+    global _gpu_probe_cache
+    if _gpu_probe_cache is not None:
+        return _gpu_probe_cache
+
+    import glob as _glob
+    import shutil as _shutil
+
+    nvidia_devices = sorted(_glob.glob("/dev/nvidia[0-9]*"))
+    nvidia_smi = _shutil.which("nvidia-smi") is not None
+    try:
+        import ctranslate2  # type: ignore
+        ct2_devices = int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        ct2_devices = 0
+
+    visible = bool(nvidia_devices) and ct2_devices > 0
+    if not visible:
+        if not nvidia_devices:
+            reason = (
+                "no /dev/nvidia* devices in container "
+                "(GPU passthrough missing)"
+            )
+        elif ct2_devices == 0:
+            reason = (
+                "ctranslate2 reports 0 CUDA devices "
+                "(driver/library mismatch)"
+            )
+        else:
+            reason = "unknown"
+    else:
+        reason = "ok"
+
+    _gpu_probe_cache = {
+        "visible": visible,
+        "nvidia_devices": nvidia_devices,
+        "nvidia_smi_available": nvidia_smi,
+        "ctranslate2_devices": ct2_devices,
+        "reason": reason,
+    }
+    if visible:
+        logger.info(
+            "GPU probe: visible (%d ctranslate2 device(s), %d nvidia "
+            "char device(s))",
+            ct2_devices, len(nvidia_devices),
+        )
+    else:
+        logger.warning(
+            "GPU probe: unavailable in this container — Whisper will "
+            "run on CPU. Reason: %s. nvidia-smi=%s, /dev/nvidia*=%s, "
+            "ctranslate2_cuda_devices=%d.",
+            reason, nvidia_smi, nvidia_devices, ct2_devices,
+        )
+    return _gpu_probe_cache
 
 
 def _get_gpu_vram_mb() -> int:
@@ -135,6 +251,69 @@ def ensure_whisper_model_downloaded(model_name: str, timeout: float = 600) -> bo
     except Exception as e:
         logger.error("Failed to download Whisper model '%s': %s", model_name, e)
         return False
+
+
+def _evict_ollama_for_whisper_sync() -> None:
+    """Synchronous best-effort Ollama eviction before Whisper CUDA load.
+
+    The async ``_evict_ollama_for_whisper`` is the canonical version
+    used by the subprocess path. ``_get_whisper_model`` is a sync
+    function that may be called from an executor (e.g. the gap-filler)
+    where bouncing into an event loop is awkward and racy. This sync
+    twin runs the same /api/ps + keep_alive=0 dance with httpx's
+    blocking client so we can always evict before opening the CUDA
+    context, regardless of the caller's threading model.
+    """
+    try:
+        import httpx
+    except ImportError:
+        logger.debug("httpx not available — skipping Ollama eviction (sync)")
+        return
+
+    ollama_url = (
+        os.environ.get("OLLAMA_HOST")
+        or getattr(settings, "OLLAMA_HOST", None)
+        or "http://ollama:11434"
+    ).rstrip("/")
+
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            try:
+                resp = client.get(f"{ollama_url}/api/ps")
+            except Exception as e:
+                logger.debug("Ollama /api/ps unreachable (sync): %s", e)
+                return
+            if resp.status_code != 200:
+                return
+            try:
+                models = resp.json().get("models", [])
+            except Exception:
+                models = []
+            if not models:
+                return
+            evicted = 0
+            for m in models:
+                name = m.get("name") or m.get("model")
+                if not name:
+                    continue
+                try:
+                    client.post(
+                        f"{ollama_url}/api/generate",
+                        json={"model": name, "keep_alive": 0},
+                    )
+                    evicted += 1
+                except Exception:
+                    continue
+            if evicted:
+                logger.info(
+                    "Evicted %d Ollama model(s) from VRAM before Whisper "
+                    "(sync path)",
+                    evicted,
+                )
+                # Give the driver a moment to actually release VRAM
+                time.sleep(2.0)
+    except Exception as e:
+        logger.debug("Ollama eviction (sync) failed: %s", e)
 
 
 async def _evict_ollama_for_whisper() -> None:
@@ -309,8 +488,16 @@ async def transcribe_audio_subprocess(
     progress_callback=None,
     is_animated: bool = False,
     cancel_check=None,
+    offset_sec: float = 0.0,
 ) -> list[TranscriptSegment]:
     """Run Whisper in a subprocess to fully release CTranslate2's CUDA memory.
+
+    ``offset_sec`` (TACT Phase 3): when non-zero, the worker trims the
+    audio to ``[offset, end]`` before transcription and post-shifts
+    every segment / word timestamp by ``+offset`` so the returned
+    timestamps are in the original audio's frame of reference. Used
+    by the disjoint-offset multi-pass to phase-shift Whisper's
+    internal 30-s chunk grid.
 
     CTranslate2 (used by faster-whisper) holds ~1.6GB VRAM in its CUDA context
     even after the model is deleted. torch.cuda.empty_cache() is a no-op because
@@ -614,8 +801,14 @@ async def transcribe_audio_subprocess(
             cmd.extend(["--initial-prompt", initial_prompt])
         if audio_duration > 0:
             cmd.extend(["--audio-duration", str(audio_duration)])
+        # TACT Phase 3 disjoint-offset pass.
+        if offset_sec and offset_sec > 0.0:
+            cmd.extend(["--input-offset-sec", f"{float(offset_sec):.3f}"])
 
-        logger.info("Starting Whisper subprocess: model=%s device=%s", model_name, device)
+        logger.info(
+            "Starting Whisper subprocess: model=%s device=%s offset=%.2fs",
+            model_name, device, float(offset_sec or 0.0),
+        )
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -770,7 +963,13 @@ async def transcribe_audio_subprocess(
         # double-filtering that cumulatively removes ~19% of valid segments.
         raw_segments = raw.get("segments", [])
         if task != "translate":
-            raw_segments = _filter_hallucinations(raw_segments, task=task)
+            # _filter_hallucinations now returns (kept, quarantined). The
+            # quarantined list is parked on the module-level
+            # _last_quarantined_segments accessor for the pipeline to
+            # claim into the CoverageLedger as status="quarantined".
+            raw_segments, _q_segments = _filter_hallucinations(
+                raw_segments, task=task,
+            )
         raw_segments = _consolidate_segments(raw_segments, task=task, is_animated=is_animated)
         raw_segments = _split_segments_at_sentence_boundaries(raw_segments, task=task)
         raw_segments, _ = _dedupe_long_range(raw_segments)
@@ -809,12 +1008,142 @@ async def transcribe_audio_subprocess(
             pass
 
 
+def transcribe_audio_slice_subprocess(
+    slice_path: str,
+    *,
+    language: str = "",
+    task: str = "transcribe",
+    initial_prompt: str = "",
+    model_name: Optional[str] = None,
+    timeout: float = 120.0,
+    is_animated: bool = False,
+) -> list[dict]:
+    """Synchronous Whisper subprocess pass over a single audio slice.
+
+    Used by the gap-filler to get fresh CUDA-context isolation per
+    slice instead of inheriting (and re-attempting CUDA on) the
+    in-process singleton — that singleton is stale immediately after
+    the main transcription subprocess exits and was retrying CUDA on
+    every gap fill, adding ~3 minutes of CPU-Whisper time on a 10
+    minute job.
+
+    Returns the raw list of segment dicts from the worker (with
+    ``start``, ``end``, ``text``, ``words``, ``avg_logprob``,
+    ``no_speech_prob`` keys). The caller is responsible for shifting
+    timestamps and converting to ``TranscriptSegment`` — the
+    gap-filler already does both.
+    """
+    import json as _json
+    import subprocess as _sp
+    import sys as _sys
+    import tempfile as _tempfile
+
+    chosen_model = model_name or settings.WHISPER_MODEL
+    device = "cpu"
+    compute_type = "int8"
+    device_index = 0
+    if settings.GPU_ACCELERATION_ENABLED:
+        cuda_available, cuda_count, _, best_idx = _detect_cuda_available()
+        if cuda_available and cuda_count > 0:
+            device = "cuda"
+            compute_type = "float16"
+            device_index = best_idx
+            gpu_idx = (settings.GPU_DEVICE_INDEX or "").strip()
+            if gpu_idx and gpu_idx.isdigit():
+                idx = int(gpu_idx)
+                if idx < cuda_count:
+                    device_index = idx
+            try:
+                _evict_ollama_for_whisper_sync()
+            except Exception as _e:
+                logger.debug("slice eviction failed: %s", _e)
+
+    with _tempfile.NamedTemporaryFile(suffix=".json", delete=False, dir="/tmp") as tmp:
+        output_path = tmp.name
+    try:
+        cmd = [
+            _sys.executable, "-m", "backend.services.whisper_worker",
+            "--audio", slice_path,
+            "--output", output_path,
+            "--model", chosen_model,
+            "--device", device,
+            "--device-index", str(device_index),
+            "--compute-type", compute_type,
+            # Recall-first knobs: slices come from VAD-positive gaps,
+            # so we trust VAD over Whisper's own gates.
+            "--beam-size", "5",
+            "--best-of", "1",
+            "--task", task,
+            "--no-speech-threshold", "0.2",
+            "--log-prob-threshold", "-1.5",
+            "--compression-ratio-threshold", "3.0" if is_animated else "2.6",
+            "--repetition-penalty", "1.1",
+            "--no-repeat-ngram-size", "3",
+            "--no-condition-on-previous",
+            "--word-timestamps",
+        ]
+        if language:
+            cmd.extend(["--language", language])
+        if initial_prompt:
+            cmd.extend(["--initial-prompt", initial_prompt])
+
+        try:
+            proc = _sp.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={**os.environ},
+            )
+        except _sp.TimeoutExpired:
+            logger.warning(
+                "gap-filler slice subprocess timed out after %.0fs (model=%s, device=%s)",
+                timeout, chosen_model, device,
+            )
+            return []
+        if proc.returncode != 0:
+            tail = (proc.stderr or "")[-300:]
+            logger.info(
+                "gap-filler slice subprocess failed (exit %d): %s",
+                proc.returncode, tail.strip(),
+            )
+            return []
+
+        try:
+            with open(output_path, "r") as f:
+                raw = _json.load(f)
+        except Exception as e:
+            logger.info("gap-filler slice: failed to parse worker JSON: %s", e)
+            return []
+
+        if raw.get("status") == "error":
+            logger.info("gap-filler slice: worker reported error: %s", raw.get("error"))
+            return []
+        return raw.get("segments", []) or []
+    finally:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+
+
 def _detect_cuda_available() -> tuple[bool, int, str, int]:
     """Try multiple methods to detect CUDA GPU availability.
 
     Returns (cuda_available, device_count, gpu_name, best_device_index).
     The best_device_index is the index of the most capable GPU (highest VRAM).
     """
+    # Cached probe short-circuit: if /dev/nvidia* are missing OR
+    # ctranslate2 reports 0 CUDA devices we know CUDA can't work, no
+    # matter what later detection methods (libcuda.so loadability,
+    # /proc sysfs scrapes) say. The previous fall-through to method
+    # 4 was the source of the "libcuda.so.1 is loadable — GPU may be
+    # available" line followed by an immediate "CUDA failed" on every
+    # Whisper load.
+    probe = _probe_gpu_availability()
+    if not probe["visible"]:
+        return False, 0, "", 0
+
     best_name, best_idx = _get_best_gpu()
 
     # Method 0 (fast, no CUDA context): Check /dev/nvidia* device nodes
@@ -1007,9 +1336,8 @@ def reload_model():
 
 def reload_diarization():
     """Force-reload the pyannote pipeline when HF_AUTH_TOKEN changes."""
-    global _diarization_pipeline
-    with _diarization_lock:
-        _diarization_pipeline = None
+    from backend.services import _pyannote_loader as _pyann
+    _pyann.reset_for_tests()
     logger.info("pyannote diarization cache cleared — will reload on next use")
 
 
@@ -1091,6 +1419,21 @@ def _get_whisper_model():
             }
             if device == "cuda":
                 model_kwargs["device_index"] = device_index
+
+                # Best-effort Ollama eviction before opening our CUDA
+                # context, mirroring the subprocess path. Without it,
+                # Ollama's idle ~1.6 GB VRAM context evicts the
+                # in-process Whisper model on 4 GB GPUs and forces an
+                # int8 CPU fallback. The gap-filler reuses this
+                # singleton, so the eviction has to happen here too,
+                # not only in ``transcribe_audio_subprocess``.
+                try:
+                    _evict_ollama_for_whisper_sync()
+                except Exception as _e:
+                    logger.debug(
+                        "Ollama eviction in _get_whisper_model failed: %s",
+                        _e,
+                    )
 
             # Auto-upgrade model when GPU is available and user hasn't explicitly chosen.
             # VRAM-aware: large-v3-turbo needs ~3GB VRAM in float16. On 4GB GPUs,
@@ -1519,7 +1862,9 @@ async def transcribe_audio(
                     "Returning partial transcription.",
                     len(partial), str(e)[:200],
                 )
-                partial = _filter_hallucinations(partial, task=task)
+                # Partial-recovery path: discard quarantined explicitly
+                # — degraded output already, no pipeline path to re-feed.
+                partial, _ = _filter_hallucinations(partial, task=task)
                 partial = _consolidate_segments(partial, task=task)
                 partial = _split_segments_at_sentence_boundaries(partial, task=task)
                 partial, _ = _dedupe_long_range(partial)
@@ -2196,8 +2541,10 @@ def _transcribe_sync(
     if not raw_segments:
         return []
 
-    # Filter hallucinations and consolidate fragments before speaker assignment
-    raw_segments = _filter_hallucinations(raw_segments, task=task)
+    # Filter hallucinations and consolidate fragments before speaker assignment.
+    # Quarantined segments are parked on _last_quarantined_segments for the
+    # pipeline to claim into the CoverageLedger as status="quarantined".
+    raw_segments, _q_segments = _filter_hallucinations(raw_segments, task=task)
     raw_segments = _consolidate_segments(raw_segments, task=task, is_animated=is_animated)
     raw_segments = _split_segments_at_sentence_boundaries(raw_segments, task=task)
     raw_segments, _dedup_removed = _dedupe_long_range(raw_segments)
@@ -2290,6 +2637,71 @@ async def extract_word_timestamps(
     )
 
 
+def _split_segments_on_word_boundaries(
+    raw_segments: list[dict],
+    word_split_gap: float,
+    rate_change_threshold: float,
+) -> list[dict]:
+    """Split Whisper segments at strong intra-segment speaker boundaries.
+
+    A Whisper segment can cover multiple speakers when the pause
+    between them is short enough that VAD merged them into one
+    block. When ``seg.words`` is present we can look at word-to-word
+    gaps; a gap ≥ ``word_split_gap`` that also straddles a
+    word-rate change ≥ ``rate_change_threshold`` is treated as a
+    speaker boundary and the segment is split in two.
+
+    No-op when ``words`` is missing. Preserves all non-word fields;
+    copies them to both halves. The main pass (``_assign_speakers``)
+    then sees independent segments and can attribute each to a
+    different speaker.
+    """
+    def _wps(words):
+        if not words:
+            return 3.0
+        dur = (words[-1]["end"] - words[0]["start"]) or 0.0
+        if dur <= 0.5:
+            return 3.0
+        return len(words) / dur
+
+    out: list[dict] = []
+    for seg in raw_segments:
+        words = seg.get("words") or []
+        if len(words) < 4:
+            out.append(seg)
+            continue
+        # Find the first internal gap that qualifies as a boundary.
+        split_idx = -1
+        for i in range(1, len(words) - 1):
+            gap = float(words[i]["start"]) - float(words[i - 1]["end"])
+            if gap < word_split_gap:
+                continue
+            left_rate = _wps(words[:i])
+            right_rate = _wps(words[i:])
+            denom = max(left_rate, right_rate, 0.1)
+            if abs(left_rate - right_rate) / denom >= rate_change_threshold:
+                split_idx = i
+                break
+        if split_idx < 0:
+            out.append(seg)
+            continue
+        left_words = words[:split_idx]
+        right_words = words[split_idx:]
+        left_text = " ".join((w.get("word", "") or "").strip() for w in left_words).strip()
+        right_text = " ".join((w.get("word", "") or "").strip() for w in right_words).strip()
+        left_seg = dict(seg)
+        left_seg["end"] = float(left_words[-1]["end"])
+        left_seg["text"] = left_text or seg.get("text", "")
+        left_seg["words"] = left_words
+        right_seg = dict(seg)
+        right_seg["start"] = float(right_words[0]["start"])
+        right_seg["text"] = right_text or seg.get("text", "")
+        right_seg["words"] = right_words
+        out.append(left_seg)
+        out.append(right_seg)
+    return out
+
+
 def _assign_speakers(
     raw_segments: list[dict],
     removed_intervals: list[tuple[float, float]] | None = None,
@@ -2316,14 +2728,33 @@ def _assign_speakers(
         2,
         settings.DIARIZATION_MAX_SPEAKERS if settings.DIARIZATION_MAX_SPEAKERS > 0 else 20,
     )
-    TURN_GAP = 1.2
-    NEW_SPEAKER_GAP = 5.0
+    # Thresholds tightened for V2. Whisper large-v3 with VAD produces
+    # 0.4-1.0 s intra-speaker gaps and 2-4 s inter-speaker gaps on
+    # typical conversational content. The previous 1.2 s / 5.0 s
+    # cutoffs meant fast back-and-forth never crossed either
+    # threshold, which is the dominant path to the "every speaker is
+    # Speaker 1" bug in the heuristic-fallback tier.
+    TURN_GAP = 0.6
+    NEW_SPEAKER_GAP = 2.5
+    # Word-level split threshold: when seg.words is present, a gap >=
+    # WORD_SPLIT_GAP inside a single Whisper segment AND a word-rate
+    # change >= RATE_CHANGE_THRESHOLD produces an intra-segment
+    # speaker boundary. Biggest accuracy win for conversational clips
+    # where Whisper merges two speakers into one segment.
+    WORD_SPLIT_GAP = 0.5
     MONOLOGUE_DURATION = 15.0
     INTERJECTION_WORDS = 4
     RATE_CHANGE_THRESHOLD = 0.4
 
     if not raw_segments:
         return []
+
+    # Pre-pass: split any Whisper segment that has a large intra-gap
+    # AND a rate change between the halves. Operates on a flat list
+    # of virtual segments so the main loop stays unchanged.
+    raw_segments = _split_segments_on_word_boundaries(
+        raw_segments, WORD_SPLIT_GAP, RATE_CHANGE_THRESHOLD,
+    )
 
     # Pre-sort the removed-intervals list so we can compute "removed
     # duration inside (gap_start, gap_end)" in O(log n) per segment.
@@ -2351,7 +2782,20 @@ def _assign_speakers(
     current_speaker = 1
     speakers_seen = 1
     speaker_history: list[int] = [1]
+    # Seed Speaker 1's rate with the first segment so
+    # ``_most_likely_existing_speaker`` has a meaningful rate to
+    # compare against on segment 2. Previously the dict started
+    # empty → every rate-match call degenerated to ``current_speaker
+    # == 1`` and every subsequent segment inherited the label.
     speaker_rates: dict[int, list[float]] = {1: []}
+    if raw_segments:
+        _first_dur = raw_segments[0]["end"] - raw_segments[0]["start"]
+        _first_words = (
+            len(raw_segments[0]["text"].split())
+            if raw_segments[0].get("text") else 0
+        )
+        if _first_dur > 0.5 and _first_words > 0:
+            speaker_rates[1].append(_first_words / _first_dur)
 
     def _words_per_sec(seg: dict) -> float:
         duration = seg["end"] - seg["start"]
@@ -2396,9 +2840,20 @@ def _assign_speakers(
             prev_rate = _words_per_sec(raw_segments[i - 1])
 
             if gap >= NEW_SPEAKER_GAP:
+                # On a NEW_SPEAKER_GAP crossing, prefer to MINT a new
+                # speaker. Only route back to an existing speaker
+                # when there is a different one whose rate is a
+                # strong match — not the current one, which is the
+                # bug path: on segment 2 with only Speaker 1 in
+                # ``speaker_rates``, the old code always matched
+                # Speaker 1 and collapsed every subsequent segment.
                 rate_match = _most_likely_existing_speaker(seg_rate)
                 rate_diff = abs(seg_rate - _avg_rate(rate_match))
-                if rate_diff < RATE_CHANGE_THRESHOLD and rate_match != current_speaker:
+                strong_match = (
+                    rate_match != current_speaker
+                    and rate_diff < RATE_CHANGE_THRESHOLD
+                )
+                if strong_match:
                     current_speaker = rate_match
                 elif speakers_seen < MAX_HEURISTIC_SPEAKERS:
                     speakers_seen += 1
@@ -2624,8 +3079,22 @@ def _dedupe_long_range(
     return kept, removed_intervals
 
 
-def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -> list[dict]:
-    """Remove Whisper hallucination segments.
+def _filter_hallucinations(
+    raw_segments: list[dict], task: str = "transcribe",
+) -> tuple[list[dict], list[dict]]:
+    """Detect Whisper hallucination segments and split into kept + quarantined.
+
+    Returns ``(kept, quarantined)``. Each entry in ``quarantined`` is the
+    original segment dict with one extra key, ``quarantine_reason``,
+    drawn from ``QUARANTINE_REASONS``. Empty-text segments are silently
+    dropped (no recovery target for the escalation ladder).
+
+    The kept-list logic is byte-identical to the previous behavior; the
+    only change is that what was a ``continue`` (drop) now records a
+    quarantine_reason on the segment and appends it to ``quarantined``.
+    The module-level ``_last_quarantined_segments`` is also updated so
+    the pipeline can claim the quarantined regions into its
+    CoverageLedger as ``status="quarantined"``.
 
     Detects and filters:
     - Non-speech segments (high no_speech_prob + low confidence)
@@ -2633,17 +3102,36 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
     - Backward-jumping timestamps (temporal ordering violations)
     - Abnormally long single segments (>1500 chars = likely runaway)
     - Repeated n-grams (looping text like "Thank you. Thank you. Thank you.")
-    - Segments that are near-exact duplicates of the previous segment (sequence-based)
+    - Segments that are near-exact duplicates of the previous segment
 
-    When task='translate', applies looser thresholds because English translations
-    of non-English audio produce shorter text for the same audio duration.
+    When task='translate', applies looser thresholds because English
+    translations of non-English audio produce shorter text for the same
+    audio duration.
     """
+    global _last_quarantined_segments
+
     is_translate = (task == "translate")
     if not raw_segments:
-        return raw_segments
+        _last_quarantined_segments = []
+        return raw_segments, []
 
-    filtered = []
+    filtered: list[dict] = []
+    quarantined: list[dict] = []
     prev_text = ""
+
+    def _q(seg: dict, reason: str) -> None:
+        """Append ``seg`` to the quarantine list with a reason tag.
+
+        Uses a shallow copy so the caller's dict isn't mutated.
+        Validates the reason against ``QUARANTINE_REASONS`` so a typo
+        fails loud at test time rather than silently producing bad
+        ledger spans.
+        """
+        if reason not in QUARANTINE_REASONS:
+            raise ValueError(f"unknown quarantine reason: {reason!r}")
+        entry = dict(seg)
+        entry["quarantine_reason"] = reason
+        quarantined.append(entry)
 
     for seg in raw_segments:
         text = seg["text"].strip()
@@ -2660,6 +3148,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                 "Hallucination filter: removed non-speech segment at %.1fs (no_speech=%.2f, conf=%.2f): %s...",
                 seg["start"], no_speech, confidence, text[:60],
             )
+            _q(seg, "non_speech")
             continue
 
         # Check 0b: Whisper boilerplate phrases — only at transcript edges with low confidence
@@ -2673,6 +3162,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                     "Hallucination filter: removed boilerplate at %.1fs: %s",
                     seg["start"], text[:60],
                 )
+                _q(seg, "boilerplate")
                 continue
 
         # Check 0e: Prompt echo detection — catches initial_prompt being
@@ -2690,6 +3180,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                 "Hallucination filter: prompt echo at %.1fs: %s...",
                 seg["start"], text[:80],
             )
+            _q(seg, "prompt_echo")
             continue
 
         # Check 0d: Text-to-duration ratio — catches ghosts that have low no_speech_prob
@@ -2704,6 +3195,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                     "Hallucination filter: ghost (ratio) at %.1fs (%.0fs, %.2f c/s): %s...",
                     seg["start"], seg_duration, chars_per_sec, text[:60],
                 )
+                _q(seg, "ghost_by_ratio")
                 continue
             mega_threshold = 300 if is_translate else 120
             mega_min_chars = 10 if is_translate else 200
@@ -2712,6 +3204,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                     "Hallucination filter: mega-ghost at %.1fs (%.0fs, %d chars): %s...",
                     seg["start"], seg_duration, len(text), text[:60],
                 )
+                _q(seg, "mega_ghost")
                 continue
 
         # Check 0c: Temporal ordering — segment start must not jump backward
@@ -2720,6 +3213,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                 "Hallucination filter: removed backward-jumping segment at %.1fs (prev started %.1fs): %s...",
                 seg["start"], filtered[-1]["start"], text[:60],
             )
+            _q(seg, "backward_jump")
             continue
 
         # Check 1: Abnormally long segment (Whisper runaway)
@@ -2728,6 +3222,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                 "Hallucination filter: removed runaway segment at %.1fs (%d chars): %s...",
                 seg["start"], len(text), text[:80],
             )
+            _q(seg, "runaway")
             continue
 
         # Check 2: Repeated n-grams
@@ -2759,6 +3254,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                         "Hallucination filter: removed CJK looping segment at %.1fs: %s...",
                         seg["start"], text[:80],
                     )
+                    _q(seg, "compression_anomaly")
                     continue
         else:
             # Word-level trigram detection for space-delimited languages
@@ -2774,6 +3270,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                         "Hallucination filter: removed looping segment at %.1fs: %s...",
                         seg["start"], text[:80],
                     )
+                    _q(seg, "compression_anomaly")
                     continue
 
         # Check 3: Near-duplicate of previous segment (sequence-based)
@@ -2788,6 +3285,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                     "Hallucination filter: removed duplicate segment at %.1fs (%.0f%% similar): %s...",
                     seg["start"], ratio * 100, text[:60],
                 )
+                _q(seg, "near_duplicate")
                 continue
 
         # Check 3b: Exact duplicate of any segment in the last 10
@@ -2811,6 +3309,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                     "Hallucination filter: near-dup (window) at %.1fs: %s...",
                     seg["start"], text[:60],
                 )
+                _q(seg, "near_duplicate")
                 continue
 
         # Check 3c: Fuzzy near-duplicate within 30s (Jaccard word overlap)
@@ -2842,6 +3341,7 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
                         _is_fuzzy_dup = True
                         break
         if _is_fuzzy_dup:
+            _q(seg, "fuzzy_duplicate")
             continue
 
         filtered.append(seg)
@@ -2849,8 +3349,14 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
 
     removed = len(raw_segments) - len(filtered)
     if removed > 0:
-        logger.info("Hallucination filter: removed %d/%d segments", removed, len(raw_segments))
-    return filtered
+        logger.info(
+            "Hallucination filter: removed %d/%d segments (quarantined %d)",
+            removed, len(raw_segments), len(quarantined),
+        )
+
+    # Stash for the pipeline to consume after we return.
+    _last_quarantined_segments = list(quarantined)
+    return filtered, quarantined
 
 
 def _consolidate_segments(
@@ -3428,39 +3934,33 @@ def _merge_undersized_subsegments(
 
 # ── Speaker Diarization (pyannote) ─────────────────────────────────────
 
-_diarization_pipeline = None
-_diarization_lock = threading.Lock()
+# The pyannote pipeline singleton + status string used to live here
+# AND in ``speaker_diarization.py``. Centralized in
+# ``backend.services._pyannote_loader`` so both call sites see the
+# same pipeline instance, the same token probe, and the same status.
+from backend.services import _pyannote_loader as _pyann
+
+
+def get_diarization_status() -> dict:
+    """Report the current diarization tier + reason string.
+
+    Callers: the ``/jobs/{id}/diarize`` route surfaces this in the
+    response so the frontend can distinguish pyannote-backed results
+    from the heuristic fallback (accuracy degraded). Pure read
+    operation — does not touch the pipeline.
+    """
+    return _pyann.get_status()
 
 
 def _get_diarization_pipeline():
-    """Load pyannote speaker diarization pipeline (lazy init)."""
-    global _diarization_pipeline
-    with _diarization_lock:
-        if _diarization_pipeline is None:
-            try:
-                from pyannote.audio import Pipeline
-                token = settings.HF_AUTH_TOKEN
-                if not token:
-                    logger.warning(
-                        "HF_AUTH_TOKEN not set — pyannote diarization unavailable. "
-                        "Falling back to pause-based speaker detection."
-                    )
-                    return None
-                _diarization_pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    token=token,
-                )
-                # Move to GPU if available
-                import torch
-                if torch.cuda.is_available():
-                    _diarization_pipeline.to(torch.device("cuda"))
-                    logger.info("pyannote diarization loaded on CUDA")
-                else:
-                    logger.info("pyannote diarization loaded on CPU")
-            except Exception as e:
-                logger.warning("Failed to load pyannote diarization: %s", e)
-                return None
-    return _diarization_pipeline
+    """Load pyannote speaker diarization pipeline (lazy init).
+
+    Thin wrapper around the unified loader so older callers that
+    expect a raw ``Pipeline`` (or ``None``) keep working. The status
+    string is maintained inside ``_pyannote_loader``.
+    """
+    pipeline, _reason = _pyann.get_pipeline()
+    return pipeline
 
 
 def _diarize_audio(audio_path: str):
@@ -3562,16 +4062,27 @@ async def diarize_transcript_post(
                 if speaker_map:
                     result = _assign_speakers_from_diarization(raw_segments, speaker_map)
                     num_detected = len(set(s.speaker for s in result))
+                    status = get_diarization_status()
                     logger.info(
                         "Post-processing diarization (pyannote): %d speakers detected "
-                        "(requested: %s)",
+                        "(requested: %s, status=%s)",
                         num_detected, num_speakers if num_speakers > 0 else "auto",
+                        status.get("reason"),
                     )
                     return result
             except Exception as e:
                 logger.warning("Post-processing pyannote diarization failed: %s", e)
 
-    # Fallback: heuristic speaker assignment
+    # Fallback: heuristic speaker assignment. This is where every
+    # audit bug converges; leave a loud warning so the ops log shows
+    # exactly why the pyannote tier was skipped.
+    status = get_diarization_status()
+    logger.warning(
+        "Post-processing diarization falling back to heuristic "
+        "(reason=%s, token_present=%s). Speaker accuracy will be "
+        "degraded — set HF_AUTH_TOKEN in settings to enable pyannote.",
+        status.get("reason"), status.get("token_present"),
+    )
     result = _assign_speakers(raw_segments)
     num_detected = len(set(s.speaker for s in result))
     logger.info(
@@ -3589,6 +4100,24 @@ def _assign_speakers_from_diarization(
 
     Speakers are numbered by order of first appearance in the audio
     (not alphabetically by pyannote's internal SPEAKER_XX labels).
+
+    Three-tier fallback when a Whisper segment has no overlapping
+    pyannote turn (short segments, music/silence brackets,
+    sub-200 ms overlap bugs):
+
+      1. Primary — the turn with the maximum overlap.
+      2. Secondary — when ``best_overlap == 0`` but a turn's
+         midpoint is within 1.0 s of the segment's midpoint, use
+         that speaker. Catches segments that fall in a thin gap
+         between two turns.
+      3. Tertiary — inherit the previous segment's assigned
+         speaker. Only when the fixture is completely empty (no
+         turns at all) does this fall through to ``"Speaker 1"``.
+
+    Previously the code hard-coded every non-overlap segment to
+    ``"Speaker 1"``, which was a major contributor to the "every
+    speaker is Speaker 1" bug whenever pyannote returned a
+    fragmented timeline.
     """
     # Sort diarization turns by start time
     turns = sorted(speaker_map.items(), key=lambda x: x[0][0])
@@ -3601,10 +4130,12 @@ def _assign_speakers_from_diarization(
     speaker_names = {s: f"Speaker {i+1}" for i, s in enumerate(seen_order)}
 
     transcript_segments = []
+    tertiary_fallback_count = 0
+
     for seg in raw_segments:
         seg_start, seg_end = seg["start"], seg["end"]
 
-        # Find the turn with maximum overlap
+        # Tier 1: maximum overlap.
         best_speaker = None
         best_overlap = 0.0
         for (turn_start, turn_end), speaker in turns:
@@ -3615,7 +4146,44 @@ def _assign_speakers_from_diarization(
                 best_overlap = overlap
                 best_speaker = speaker
 
-        speaker_label = speaker_names.get(best_speaker, "Speaker 1") if best_speaker else "Speaker 1"
+        speaker_label: str
+        if best_speaker is not None and best_overlap > 0:
+            speaker_label = speaker_names.get(best_speaker, "Speaker 1")
+        else:
+            # Tier 2: nearest turn by midpoint, within 1.0 s.
+            seg_mid = 0.5 * (seg_start + seg_end)
+            nearest_speaker = None
+            nearest_gap = float("inf")
+            for (turn_start, turn_end), speaker in turns:
+                turn_mid = 0.5 * (turn_start + turn_end)
+                # Gap = 0 when the midpoint sits inside the turn,
+                # otherwise the raw distance from the turn edges.
+                if seg_mid < turn_start:
+                    gap = turn_start - seg_mid
+                elif seg_mid > turn_end:
+                    gap = seg_mid - turn_end
+                else:
+                    gap = 0.0
+                # Fall back to midpoint-to-midpoint for ranking so
+                # equidistant edge cases are deterministic.
+                if gap <= 1.0:
+                    mid_gap = abs(turn_mid - seg_mid)
+                    if mid_gap < nearest_gap:
+                        nearest_gap = mid_gap
+                        nearest_speaker = speaker
+            if nearest_speaker is not None:
+                speaker_label = speaker_names.get(nearest_speaker, "Speaker 1")
+            elif transcript_segments:
+                # Tier 3: inherit the previous segment's speaker.
+                speaker_label = transcript_segments[-1].speaker
+                tertiary_fallback_count += 1
+                logger.debug(
+                    "[Diarization] segment [%.2f, %.2f] inherited speaker "
+                    "%s from previous segment (no nearby turn)",
+                    seg_start, seg_end, speaker_label,
+                )
+            else:
+                speaker_label = "Speaker 1"
 
         words = None
         if seg.get("words"):
@@ -3631,6 +4199,18 @@ def _assign_speakers_from_diarization(
             avg_logprob=seg.get("avg_logprob"),
             no_speech_prob=seg.get("no_speech_prob"),
         ))
+
+    # Diagnostic: if > 20% of segments fell to the tertiary tier the
+    # audio is likely sparse / low-SNR / fragmented and the speaker
+    # labels should be considered lower-confidence. Not an error —
+    # the labels are still correct in the sense that they inherit
+    # from context rather than hard-coding "Speaker 1".
+    if raw_segments and (tertiary_fallback_count / len(raw_segments)) > 0.20:
+        logger.warning(
+            "[Diarization] %d/%d segments used the tertiary fallback "
+            "(inherit from previous) — audio may be sparse or low-SNR.",
+            tertiary_fallback_count, len(raw_segments),
+        )
 
     return transcript_segments
 

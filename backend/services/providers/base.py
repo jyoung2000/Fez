@@ -1913,13 +1913,34 @@ class ChunkedClipDetectionMixin:
         if progress_callback:
             await progress_callback("pass1_done", {"clips": len(pass1_clips)})
 
+        # ── Short-video Pass 2 gate ──
+        # On a video that's only marginally longer than a single Pass 1
+        # window, Pass 2 windows shrink to 50-70 s of audio and rarely
+        # contain enough material to justify the 60-150 s LLM call. The
+        # 606 s "Tank vs Tyrese" run burned ~5 wall-clock minutes on
+        # two such gap scans (147 s OpenRouter timeout each, plus the
+        # gemini fallback) for one net new clip. Skip Pass 2 entirely
+        # below ``window + 1.5 × overlap`` so we never pay that cost
+        # on short content.
+        pass2_min_duration = window_dur + (overlap_dur * 1.5)
+        skip_pass2 = False
+        if video_duration > 300 and video_duration < pass2_min_duration:
+            _mixin_logger.info(
+                "Multi-pass: skipping Pass 2 (%.0fs video < %.0fs threshold = "
+                "window+1.5×overlap) — Pass 2 windows too small to produce "
+                "reliable clips",
+                video_duration, pass2_min_duration,
+            )
+            skip_pass2 = True
+
         # ── Early exit: skip Pass 2 if Pass 1 found enough quality clips ──
         # Quality alone is not enough for long videos — if every pass-1
         # clip clusters in the first quarter of the timeline, the late
         # video has zero coverage and no gap-fill ever runs. Require
         # BOTH count AND spread before we trust pass 1 is sufficient.
         high_quality_clips = [c for c in all_clips if c.viral_score >= 60]
-        skip_pass2 = len(high_quality_clips) >= num_clips
+        if not skip_pass2:
+            skip_pass2 = len(high_quality_clips) >= num_clips
         if skip_pass2 and high_quality_clips and video_duration > 600:
             hq_starts = [c.start_time for c in high_quality_clips]
             hq_spread = max(hq_starts) - min(hq_starts)
@@ -2021,6 +2042,7 @@ class ChunkedClipDetectionMixin:
                                     min_duration=min_duration, max_duration=max_duration,
                                     video_summary=video_summary, existing_clips=existing_desc,
                                     hot_zones=hot_zones,
+                                    pass2_timeout=60,
                                 )
                         except Exception as e:
                             _mixin_logger.warning("Pass 2 gap scan failed: %s", e)

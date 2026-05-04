@@ -198,6 +198,12 @@ class JobResult(BaseModel):
     pipeline_warnings: list[str] = []
     language: str = ""  # ISO 639-1 code, empty = auto-detect
     subtitle_language: str = ""  # ISO 639-1 target language for subtitles, empty = same as audio
+    # TACT Phase 5 translation track. Optional — when None, the
+    # pipeline falls back to subtitle_language (legacy field) or
+    # "en" (Whisper's task=translate target). Lets future callers
+    # request a specific translation target without overloading the
+    # subtitle_language field.
+    target_language: Optional[str] = None
     duration: float = 0.0
     resolution: str = ""
     fps: float = 0.0

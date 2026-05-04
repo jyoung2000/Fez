@@ -91,6 +91,56 @@ def _build_provider(name: str) -> Optional[AIProvider]:
 
 _OPENROUTER_MODEL_CACHE: dict[str, bool] = {}
 
+# Per-job circuit breaker for OpenRouter "Key limit exceeded" 403s.
+# That 403 is global to the API key, not per-model — once it trips we
+# stop retrying every model in the OpenRouter chain for the rest of
+# the job. The previous behaviour burned ~120 useless API requests in
+# 30s when polish credits ran out mid-run.
+_openrouter_credit_exhausted: dict[str, bool] = {}
+
+
+def _is_openrouter_credit_exhausted(job_id: str | None) -> bool:
+    return bool(job_id and _openrouter_credit_exhausted.get(job_id))
+
+
+def _trip_openrouter_breaker(job_id: str | None, reason: str) -> None:
+    if not job_id:
+        return
+    if _openrouter_credit_exhausted.get(job_id):
+        return
+    _openrouter_credit_exhausted[job_id] = True
+    logger.warning(
+        "OpenRouter circuit-breaker tripped for job %s (%s) — "
+        "remaining requests will skip OpenRouter",
+        job_id, reason,
+    )
+
+
+def _reset_openrouter_breaker(job_id: str | None) -> None:
+    """Clear the per-job breaker. Used on job cleanup so the dict
+    doesn't grow unboundedly across long-running orchestrators."""
+    if job_id:
+        _openrouter_credit_exhausted.pop(job_id, None)
+
+
+def _looks_like_openrouter_credit_403(exc: Exception) -> bool:
+    """Detect the 'Key limit exceeded' / 403-credit-exhausted signal.
+
+    The OpenRouter provider raises a wrapped error whose string form
+    contains either ``Key limit exceeded`` or ``'code': 403``. Either
+    is treated as global credit exhaustion for this API key.
+    """
+    msg = str(exc).lower()
+    if "key limit exceeded" in msg:
+        return True
+    if "credit" in msg and "exhaust" in msg:
+        return True
+    if getattr(exc, "status_code", None) == 403:
+        return True
+    if "'code': 403" in msg or '"code": 403' in msg or "status 403" in msg:
+        return True
+    return False
+
 
 async def _openrouter_model_exists(model_id: str, timeout: float = 8.0) -> bool | None:
     """Return True / False if ``model_id`` is in OpenRouter's catalog,
@@ -166,6 +216,7 @@ class AIOrchestrator:
         self._providers: dict[str, AIProvider] = {}
         self._consecutive_ollama_failures: int = 0
         self._current_model_override: str | None = None
+        self._ollama_text_fallback_only: bool = False
         # Provider names that we know are unreachable for the lifetime
         # of this orchestrator (e.g. Ollama daemon not running, but
         # listed in AI_FALLBACK_CHAIN). Excluded from ``_get_active_chain``
@@ -176,10 +227,35 @@ class AIOrchestrator:
             p = _build_provider(name)
             if p:
                 self._providers[name] = p
-        # Best-effort sync reachability probe for Ollama.
+        # Always construct the Ollama provider when reachable, even if
+        # the user didn't add it to AI_FALLBACK_CHAIN. It's used as a
+        # last-resort *text-only* fallback (see ``text_completion``)
+        # so transcript polishing keeps making progress when every
+        # cloud provider in the chain has dropped — e.g. when the
+        # OpenRouter API key hits its global daily-credit limit
+        # mid-job. We do NOT add it to ``active_provider_chain``,
+        # which would also opt it into vision / scene analysis where
+        # local models are dramatically slower than cloud equivalents.
+        if "ollama" not in self._providers:
+            try:
+                if _probe_ollama_reachable():
+                    p = _build_provider("ollama")
+                    if p:
+                        self._providers["ollama"] = p
+                        self._ollama_text_fallback_only = True
+                        logger.info(
+                            "Ollama text-only fallback wired (%s) — "
+                            "used if every chain provider fails for "
+                            "text_completion",
+                            getattr(settings, "OLLAMA_HOST", ""),
+                        )
+            except Exception as e:
+                logger.debug("Ollama reachability probe failed: %s", e)
+        # Best-effort sync reachability probe for Ollama when it WAS
+        # in the user's configured chain.
         # We do NOT probe cloud providers here — their auth check costs
         # money and the orchestrator does proper fallback on first call.
-        if "ollama" in self._providers:
+        if "ollama" in self._providers and not getattr(self, "_ollama_text_fallback_only", False):
             try:
                 if not _probe_ollama_reachable():
                     self._unreachable.add("ollama")
@@ -435,6 +511,22 @@ class AIOrchestrator:
             "is_thinking": provider.is_thinking_model,
         }
 
+    @property
+    def vision_provider(self):
+        """Return the first active provider that supports vision.
+
+        Used by :func:`apply_visual_verification` (Task 6 wiring).
+        Returns ``None`` when no vision-capable provider is configured
+        — the verifier wrapper handles ``None`` cleanly by skipping.
+        Walks the active chain in priority order (degraded /
+        unreachable providers excluded) so verification follows the
+        same chain-of-trust as scene description.
+        """
+        for provider in self._get_active_chain():
+            if getattr(provider, "supports_vision", False):
+                return provider
+        return None
+
     def _get_active_chain(self) -> list[AIProvider]:
         chain = []
         skipped = []
@@ -455,6 +547,24 @@ class AIOrchestrator:
             )
         else:
             logger.debug("Active provider chain: %s", chain_names)
+        return chain
+
+    def _get_active_text_chain(self) -> list[AIProvider]:
+        """Active chain for text-only tasks. Identical to
+        ``_get_active_chain`` but appends the text-only Ollama
+        fallback (if wired) so transcript polishing can continue
+        when every cloud provider has failed.
+        """
+        chain = self._get_active_chain()
+        if getattr(self, "_ollama_text_fallback_only", False):
+            ollama = self._providers.get("ollama")
+            if (
+                ollama is not None
+                and ollama not in chain
+                and "ollama" not in self._unreachable
+                and not self._circuit_breaker.is_degraded("ollama")
+            ):
+                chain.append(ollama)
         return chain
 
     async def _notify_attempt(self, job_id: str, provider, task: str):
@@ -744,6 +854,8 @@ class AIOrchestrator:
         viral_score_min: int = 0,
         viral_score_max: int = 100,
         min_relevance: int = 0,
+        frames=None,
+        cancel_check=None,
     ) -> tuple[list[ClipCandidate], str]:
         """Returns (clips, provider_name_used).
 
@@ -764,7 +876,8 @@ class AIOrchestrator:
             DEFAULT_VIRAL_CLIP_PROMPT, get_genre_prompt,
         )
         from backend.services.clip_scoring import (
-            finalize_clip_scores, four_axis_scoring_enabled,
+            apply_visual_verification, finalize_clip_scores,
+            four_axis_scoring_enabled,
         )
         if custom_user_prompt and custom_user_prompt != DEFAULT_VIRAL_CLIP_PROMPT:
             clip_prompt = custom_user_prompt
@@ -935,6 +1048,108 @@ class AIOrchestrator:
         # so even if a timeout fires, we have whatever completed.
         _partial_clips: list = []
 
+        async def _run_visual_verification(verified_clips, label):
+            """Task 6 — fire the visual verifier after finalize_clip_scores.
+
+            Snapshots viral_score per clip, calls the wrapped verifier
+            (no-op when the flag is off / no provider / no frames),
+            then writes a ``visual_verification`` block into
+            ``score_diagnostics`` so the UI badge has the data it
+            needs without modifying ``verify_clips_visually`` itself.
+            """
+            if not verified_clips:
+                return verified_clips
+            vp = self.vision_provider
+            pre_scores = {id(c): int(c.viral_score) for c in verified_clips}
+            try:
+                verified_clips = await asyncio.wait_for(
+                    apply_visual_verification(
+                        verified_clips,
+                        frames or [],
+                        vp,
+                        cancel_check=cancel_check or self._cancel_check,
+                    ),
+                    timeout=120,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Visual verification timed out after 120s (%s) — "
+                    "keeping %d clips with unverified scores",
+                    label, len(verified_clips),
+                )
+                for clip in verified_clips:
+                    diag = dict(getattr(clip, "score_diagnostics", None) or {})
+                    diag["visual_verification"] = {
+                        "pre_score": int(clip.viral_score),
+                        "post_score": int(clip.viral_score),
+                        "delta": 0,
+                        "note": "timeout",
+                    }
+                    clip.score_diagnostics = diag
+                if progress_callback:
+                    progress_callback(
+                        f"Visual verification timed out ({label}: "
+                        f"keeping {len(verified_clips)} clips unverified)"
+                    )
+                return verified_clips
+            except Exception as e:
+                logger.warning(
+                    "Visual verification failed (%s) — keeping %d clips "
+                    "with unverified scores: %s",
+                    label, len(verified_clips), e,
+                )
+                for clip in verified_clips:
+                    diag = dict(getattr(clip, "score_diagnostics", None) or {})
+                    diag["visual_verification"] = {
+                        "pre_score": int(clip.viral_score),
+                        "post_score": int(clip.viral_score),
+                        "delta": 0,
+                        "note": "error",
+                    }
+                    clip.score_diagnostics = diag
+                if progress_callback:
+                    progress_callback(
+                        f"Visual verification failed ({label}: "
+                        f"keeping {len(verified_clips)} clips unverified)"
+                    )
+                return verified_clips
+            n_changed = 0
+            for clip in verified_clips:
+                pre = pre_scores.get(id(clip))
+                if pre is None:
+                    continue
+                post = int(clip.viral_score)
+                if vp is None or not frames:
+                    note = "skipped"
+                elif post == pre:
+                    note = "unchanged"
+                elif post > pre:
+                    note = "boosted"
+                    n_changed += 1
+                else:
+                    note = "lowered"
+                    n_changed += 1
+                diag = dict(getattr(clip, "score_diagnostics", None) or {})
+                diag["visual_verification"] = {
+                    "pre_score": pre,
+                    "post_score": post,
+                    "delta": post - pre,
+                    "note": note,
+                }
+                clip.score_diagnostics = diag
+            if progress_callback:
+                if vp is None or not frames:
+                    progress_callback(
+                        f"Visual verification skipped ({label}: "
+                        f"{'no vision provider' if vp is None else 'no frames'})"
+                    )
+                else:
+                    progress_callback(
+                        f"Visual verification adjusted {n_changed} of "
+                        f"{len(verified_clips)} clip scores ({label})"
+                    )
+            return verified_clips
+
         for provider in self._get_active_chain():
             pname = provider.provider_name
             # Compute Ollama timeout: sequential windows need much more time
@@ -970,6 +1185,7 @@ class AIOrchestrator:
                 # axes are all zero (legacy clip path).
                 if four_axis_scoring_enabled():
                     finalize_clip_scores(result, content_type, focus_mode=is_focus_mode)
+                result = await _run_visual_verification(result, label="primary")
                 return result, self._get_task_model(provider, "clips")
             except asyncio.TimeoutError:
                 elapsed = time.monotonic() - t0
@@ -985,6 +1201,7 @@ class AIOrchestrator:
                     )
                     if four_axis_scoring_enabled():
                         finalize_clip_scores(deduped, content_type, focus_mode=is_focus_mode)
+                    deduped = await _run_visual_verification(deduped, label="partial-timeout")
                     return deduped, f"{self._get_task_model(provider, 'clips')} (partial)"
                 logger.warning("Clip detection via %s timed out after %ds", pname, timeout)
                 self._circuit_breaker.record_failure(pname)
@@ -1002,6 +1219,9 @@ class AIOrchestrator:
             )
             if four_axis_scoring_enabled():
                 finalize_clip_scores(_partial_clips, content_type, focus_mode=is_focus_mode)
+            _partial_clips = await _run_visual_verification(
+                _partial_clips, label="all-providers-failed",
+            )
             return _partial_clips, "partial"
         raise AllProvidersFailedError("All providers failed for viral clip detection")
 
@@ -1050,8 +1270,21 @@ class AIOrchestrator:
                 (like transcript polishing) that should not degrade the provider
                 for subsequent critical operations (summary, clip detection).
         """
-        for provider in self._get_active_chain():
+        for provider in self._get_active_text_chain():
             pname = provider.provider_name
+            # Per-job credit-exhaustion short-circuit: once OpenRouter
+            # returns "Key limit exceeded" we know every subsequent
+            # model in their catalog will fail the same way for this
+            # API key. Skip the entire OpenRouter provider for the
+            # remainder of the job instead of retrying its full model
+            # chain on every batch.
+            if pname == "openrouter" and _is_openrouter_credit_exhausted(job_id):
+                logger.info(
+                    "text_completion skipping openrouter for job %s — "
+                    "credit-exhaustion breaker tripped earlier",
+                    job_id,
+                )
+                continue
             model_name = provider.text_model_name
             # Apply model override for Ollama if we've downgraded after failures
             if pname == "ollama" and self._current_model_override:
@@ -1088,6 +1321,8 @@ class AIOrchestrator:
                 await self._notify_fallback(job_id, pname, f"Text completion timed out after {timeout:.0f}s (model={model_name})")
                 continue
             except Exception as e:
+                if pname == "openrouter" and _looks_like_openrouter_credit_403(e):
+                    _trip_openrouter_breaker(job_id, "Key limit exceeded")
                 if not skip_circuit_breaker:
                     self._circuit_breaker.record_failure(pname)
                 logger.warning("text_completion via %s model=%s failed: %s — trying next provider", pname, model_name, e)

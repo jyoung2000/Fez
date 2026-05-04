@@ -921,6 +921,11 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         # Track consecutive non-retryable failures (403 auth/billing, 401 unauthorized).
         _consecutive_auth_failures = 0
         _AUTH_FAILURE_ABORT_THRESHOLD = 2
+        # ``key limit exceeded`` and ``invalid api key`` are deterministic for
+        # the rest of this job — a single hit is conclusive, no point waiting
+        # for a second consecutive failure to confirm. ``_definitive_auth_seen``
+        # short-circuits the breaker on the first such hit.
+        _definitive_auth_seen = False
         # Temporal continuity: track previous frame's subject_x for multi-face fallback
         _prev_sx = 50
         _prev_slot_id = -1
@@ -936,7 +941,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             return 50
 
         async def _analyze_batch(batch, batch_idx, _depth=0, _retry_round=0):
-            nonlocal _consecutive_auth_failures
+            nonlocal _consecutive_auth_failures, _definitive_auth_seen
             """Process a vision batch with auto-split on limit errors (max depth 2).
 
             ``_retry_round`` tracks transient-failure retries for this batch.
@@ -950,7 +955,12 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             """
             # Early abort: if all models are failing with auth/billing errors,
             # skip remaining batches to avoid hammering a dead API for minutes.
-            if _consecutive_auth_failures >= _AUTH_FAILURE_ABORT_THRESHOLD and _depth == 0:
+            # Definitive auth errors (key limit exceeded / invalid api key) trip
+            # the gate on the first hit — they do not un-fail mid-job.
+            if (
+                _definitive_auth_seen
+                or _consecutive_auth_failures >= _AUTH_FAILURE_ABORT_THRESHOLD
+            ) and _depth == 0:
                 for frame in batch:
                     batch_results[batch_idx].append(SceneDescription(
                         timestamp=frame.timestamp,
@@ -1020,20 +1030,32 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     or ("image" in err_str and ("limit" in err_str or "at most" in err_str))
                     or "too many" in err_str
                 )
-                # Detect non-retryable auth/billing errors (403 key limit, 401 unauthorized)
+                # Detect non-retryable auth/billing errors (403 key limit, 401 unauthorized).
                 is_auth_error = (
                     "key limit exceeded" in err_str
                     or "unauthorized" in err_str
                     or "invalid api key" in err_str
-                    or "all openrouter models failed" in err_str and "403" in err_str
+                    or ("all openrouter models failed" in err_str and "403" in err_str)
+                )
+                # ``key limit exceeded`` / ``invalid api key`` are deterministic for
+                # the rest of this job — no point waiting for a second consecutive
+                # failure. A budget-exhausted key will not un-exhaust itself mid-job.
+                is_definitive_auth_error = (
+                    "key limit exceeded" in err_str
+                    or "invalid api key" in err_str
                 )
                 if is_auth_error:
                     _consecutive_auth_failures += 1
-                    if _consecutive_auth_failures >= _AUTH_FAILURE_ABORT_THRESHOLD:
+                    if is_definitive_auth_error:
+                        _definitive_auth_seen = True
+                    threshold = 1 if is_definitive_auth_error else _AUTH_FAILURE_ABORT_THRESHOLD
+                    if _consecutive_auth_failures >= threshold:
                         logger.warning(
-                            "Batch %d/%d: %d consecutive auth/billing failures — "
-                            "aborting remaining batches (API key likely exhausted)",
-                            batch_idx + 1, num_batches, _consecutive_auth_failures,
+                            "Batch %d/%d: %s OpenRouter auth/billing failure — "
+                            "aborting remaining batches (API key exhausted or invalid)",
+                            batch_idx + 1, num_batches,
+                            "definitive" if is_definitive_auth_error else
+                            f"{_consecutive_auth_failures} consecutive",
                         )
                 # Auto-split: if limit error and batch has 2+ images, halve and retry
                 if is_limit_error and not is_auth_error and len(batch) > 1 and _depth < 2:
@@ -1399,7 +1421,10 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         # re-trying the same dead API would just waste time.
         center_count = sum(1 for s in scenes if s.subject_x == 50)
         center_pct = center_count / len(scenes) * 100 if scenes else 0
-        api_is_dead = _consecutive_auth_failures >= _AUTH_FAILURE_ABORT_THRESHOLD
+        api_is_dead = (
+            _definitive_auth_seen
+            or _consecutive_auth_failures >= _AUTH_FAILURE_ABORT_THRESHOLD
+        )
 
         # Hard caps for the re-analysis loop. Without them a 1400s anime
         # episode (~166 scenes) would generate 166 sequential OpenRouter
@@ -1833,6 +1858,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         video_summary: Optional[str] = None,
         existing_clips: Optional[str] = None,
         hot_zones=None,
+        pass2_timeout: Optional[int] = None,
         **_extra,
     ) -> list[ClipCandidate]:
         instruction = custom_prompt if custom_prompt else DEFAULT_VIRAL_CLIP_PROMPT
@@ -1985,10 +2011,19 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 {"role": "user", "content": user_prompt},
             ]
 
+            # Pass 2 gap scans use a tighter ceiling than Pass 1 — the
+            # prompt is smaller (single gap, no full-video context) and
+            # the previous 147-151s budget was almost entirely dead
+            # request time when the model was hung. 60s lets us fail
+            # fast and let the next provider in the chain take a swing.
+            if pass2_timeout is not None:
+                _clip_timeout = max(20, int(pass2_timeout))
+            else:
+                _clip_timeout = self._get_clip_timeout(len(transcript_text))
             raw = await self._call_with_fallback(
                 self._text_model, self._text_fallbacks, messages,
                 max_tokens=8192, cancel_check=cancel_check,
-                timeout=self._get_clip_timeout(len(transcript_text)),
+                timeout=_clip_timeout,
             )
             try:
                 # Use extract_json() which handles thinking tags (<think>...</think>),
