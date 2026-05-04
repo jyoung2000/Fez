@@ -32,7 +32,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from backend.app.auth.security import compute_fingerprint
-from backend.app.auth.store import get_session, get_user, touch_session
+from backend.app.auth.store import (
+    get_session_cached,
+    get_user_cached,
+    touch_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,26 +137,56 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if _is_public_path(path, request.method):
             return await call_next(request)
 
+        # Signed-URL fast path: GET /api/files/{job_id}/{path}?exp=&sig=
+        # lets HTML5 <video> / <img> elements load media without the
+        # session cookie. The signature itself is the credential; the
+        # handler re-verifies it before serving bytes. Any other
+        # method, or a request missing either query param, falls
+        # through to the normal cookie path.
+        if (
+            request.method == "GET"
+            and path.startswith("/api/files/")
+            and request.query_params.get("exp")
+            and request.query_params.get("sig")
+        ):
+            return await call_next(request)
+
         token = request.cookies.get(SESSION_COOKIE)
         if not token:
             return JSONResponse(
                 {"detail": "not authenticated"}, status_code=401,
             )
 
-        session = await get_session(token)
+        session = await get_session_cached(token)
         if session is None:
             return self._clear_and_reject("session not found")
 
-        # Fingerprint check: new IP or browser → force re-login.
+        # Fingerprint check (UA-only in V2). On mismatch we return
+        # 401 + clear the cookie on THIS response, but we do NOT
+        # delete the server-side session record — behind a reverse
+        # proxy the mismatch is often a transient header flake, and
+        # killing the session mid-upload / mid-playback is
+        # catastrophic. Re-login on the same browser restores access.
         ip = _client_ip(request)
         ua = request.headers.get("user-agent", "")
-        if compute_fingerprint(ip, ua) != session.fingerprint:
-            # Kill the session so re-use of the old cookie can't succeed.
-            from backend.app.auth.store import delete_session
-            await delete_session(token)
-            return self._clear_and_reject("session bound to a different browser/IP")
+        current_fp = compute_fingerprint(ip, ua)
+        if current_fp != session.fingerprint:
+            # One-time migration: sessions stored with an older
+            # fingerprint algorithm (V1: IP+UA, V2: full UA) are
+            # accepted once and rewritten to the current scheme so
+            # subsequent requests match cleanly. Guarded by the
+            # fp_v3 flag on the session record.
+            if not _session_is_current_fp_version(session):
+                try:
+                    await _migrate_session_fingerprint(token, current_fp)
+                except Exception as e:
+                    logger.warning("fingerprint migration failed: %s", e)
+                # Continue as if the fingerprint matched — the cookie
+                # itself is a valid credential from a prior scheme.
+            else:
+                return self._reject_fingerprint()
 
-        user = await get_user(session.user_id)
+        user = await get_user_cached(session.user_id)
         if user is None or not user.active:
             return self._clear_and_reject("user not found or deactivated")
 
@@ -196,6 +230,67 @@ class AuthMiddleware(BaseHTTPMiddleware):
         resp.delete_cookie(SESSION_COOKIE, path="/")
         return resp
 
+    def _reject_fingerprint(self) -> Response:
+        """Reject a fingerprint-mismatched request.
+
+        Returns 401 + clears the cookie on the response, but leaves
+        the server-side session record intact so the user can
+        re-login on the same browser without requiring a password
+        reset. The detail string is machine-checkable so the
+        frontend can display a targeted prompt.
+        """
+        return self._clear_and_reject("fingerprint_mismatch")
+
+
+_CURRENT_FP_VERSION = "fp_v3"
+
+
+def _session_is_current_fp_version(session) -> bool:
+    """True if this session's fingerprint was computed with the current
+    algorithm version. Sessions from older versions (V1: IP+UA, V2:
+    full UA) need a one-time migration.
+    """
+    if getattr(session, _CURRENT_FP_VERSION, False):
+        return True
+    return False
+
+
+async def _migrate_session_fingerprint(token: str, new_fingerprint: str) -> None:
+    """Rewrite a session's fingerprint to the current algorithm version
+    and set the version flag so the migration runs at most once.
+
+    Handles V1→V3 and V2→V3 in a single path.
+    """
+    from backend.app.auth.store import (
+        SESSIONS_PATH,
+        _atomic_write_json,
+        _read_json,
+        _sessions_lock,
+        invalidate_session_cache,
+    )
+    async with _sessions_lock:
+        data = await _read_json(SESSIONS_PATH, {"sessions": []})
+        updated = False
+        for s in data.get("sessions", []):
+            if s.get("token") == token:
+                s["fingerprint"] = new_fingerprint
+                s[_CURRENT_FP_VERSION] = True
+                updated = True
+                break
+        if updated:
+            await _atomic_write_json(SESSIONS_PATH, data)
+    invalidate_session_cache(token)
+
+
+# Minimum cookie lifetime after a successful sign-in. The cookie is
+# always written with at least this much ``Max-Age`` so a user who
+# signs in stays signed in for at least 25 hours regardless of the
+# ``remember`` choice. The middleware's rolling touch loop refreshes
+# the cookie on every API call (throttled to once per minute), so
+# active users effectively never have to sign in again — the floor
+# only kicks in for browsers that close mid-session and reopen later.
+_MIN_SESSION_LIFETIME_SEC = 25 * 3600
+
 
 def set_session_cookie(
     response: Response,
@@ -206,17 +301,32 @@ def set_session_cookie(
 ) -> None:
     """Attach the session cookie with safe defaults.
 
-    ``remember=True`` (default) writes a persistent cookie with
-    ``max_age``: the browser keeps it across restarts and the user
-    stays signed in for up to ``max_age_seconds``.
+    The cookie is ALWAYS written as persistent with a ``Max-Age``
+    floor of ``_MIN_SESSION_LIFETIME_SEC`` (25 h), regardless of the
+    ``remember`` flag. This guarantees that a user who successfully
+    signs in is not prompted to sign in again for at least 25 hours,
+    even if they close the browser between visits.
 
-    ``remember=False`` writes a SESSION cookie (no ``Max-Age`` /
-    ``Expires``): browsers drop it on quit, so the next time the
-    user opens ClipAI on that device they have to sign in again.
-    The server-side session record is unchanged either way; the
-    auto-extending touch loop on the middleware still rolls the
-    expiry forward, but no cookie persists past the browser tab.
+    ``remember=True`` (default): cookie persists for ``max_age_seconds``
+    (30 days by default). The middleware's rolling touch refreshes
+    this on every authenticated request, so an active user never
+    times out.
+
+    ``remember=False``: cookie persists for exactly 25 h. The user
+    has explicitly asked for a less-persistent session, but the
+    25 h floor is the minimum useful session length on this app —
+    we do not write session-scoped cookies that vanish on
+    browser quit, because those produced the most-reported "I just
+    signed in, why am I being asked to sign in again" bug.
+
+    The server-side session record itself lives 30 days regardless;
+    the cookie ``Max-Age`` and the server-side ``expires_at`` are
+    independent ceilings.
     """
+    if remember:
+        effective_max_age = max(int(max_age_seconds), _MIN_SESSION_LIFETIME_SEC)
+    else:
+        effective_max_age = _MIN_SESSION_LIFETIME_SEC
     cookie_kwargs = dict(
         key=SESSION_COOKIE,
         value=token,
@@ -224,9 +334,8 @@ def set_session_cookie(
         secure=False,  # localhost defaults; reverse proxy can override
         samesite="lax",
         path="/",
+        max_age=effective_max_age,
     )
-    if remember:
-        cookie_kwargs["max_age"] = max_age_seconds
     response.set_cookie(**cookie_kwargs)
 
 

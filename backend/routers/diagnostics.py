@@ -10,9 +10,11 @@ import time
 from typing import AsyncGenerator
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
+from backend.app.auth.deps import require_admin
+from backend.app.auth.models import User
 from backend.config import settings
 
 router = APIRouter(prefix="/api/diagnostics", tags=["diagnostics"])
@@ -1530,3 +1532,16 @@ async def test_subject_tracking():
 
 
 # NOTE: Whisper testing is now integrated into test-pipeline above.
+
+
+@router.get("/auth-cache")
+async def auth_cache_stats(_admin: User = Depends(require_admin)):
+    """Expose the in-process session + user cache counters.
+
+    Admin-only. Handy for diagnosing the upload-slowdown regression:
+    during a large multi-chunk upload, ``session_hits`` should
+    dominate over ``session_misses``. A low hit rate here points at
+    a bug invalidating the cache too aggressively (or not at all).
+    """
+    from backend.app.auth import store as auth_store
+    return auth_store.get_cache_stats()

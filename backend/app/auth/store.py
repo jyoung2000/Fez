@@ -70,6 +70,95 @@ _users_lock = asyncio.Lock()
 _sessions_lock = asyncio.Lock()
 
 
+# ── Cached lookups for the hot middleware path ─────────────────
+#
+# Every authenticated request passes through ``AuthMiddleware`` which
+# resolves ``get_session`` + ``get_user``. With 6-way concurrent chunk
+# uploads those two calls become the dominant latency — each one
+# grabs an ``asyncio.Lock`` and re-reads the full JSON file. During a
+# 2000-chunk upload that's thousands of serialized disk reads.
+#
+# These caches flatten both calls to ~one disk read per cache TTL:
+#
+#   * Positive entries live for ``_SESSION_CACHE_TTL`` /
+#     ``_USER_CACHE_TTL`` seconds. Long enough that a chunk storm
+#     shares a single read; short enough that session revocation /
+#     user deactivation takes effect within the window even without
+#     an explicit invalidation.
+#   * Negative entries (``None``) live for ``_NEGATIVE_CACHE_TTL``.
+#     This prevents a brute-force scan of random tokens from
+#     hammering the session file on every attempt.
+#   * Every mutating path in this module calls
+#     ``invalidate_*_cache`` so changes propagate instantly to
+#     in-flight requests.
+#
+# Cache stats live alongside the maps for the admin diagnostics
+# endpoint (``GET /api/diagnostics/auth-cache``) — that's how you
+# verify, during a real upload, that the hot path actually started
+# hitting the cache.
+
+_SESSION_CACHE_TTL = 30.0
+_USER_CACHE_TTL = 60.0
+_NEGATIVE_CACHE_TTL = 5.0
+
+_session_cache: dict[str, tuple[float, Optional["Session"]]] = {}
+_user_cache: dict[str, tuple[float, Optional["User"]]] = {}
+_cache_stats = {
+    "session_hits": 0, "session_misses": 0, "session_negative_hits": 0,
+    "user_hits": 0, "user_misses": 0, "user_negative_hits": 0,
+}
+
+
+def _cache_get(cache: dict, key: str) -> tuple[bool, object]:
+    entry = cache.get(key)
+    if entry is None:
+        return False, None
+    exp, value = entry
+    if exp <= time.monotonic():
+        cache.pop(key, None)
+        return False, None
+    return True, value
+
+
+def _cache_put(cache: dict, key: str, value, ttl: float) -> None:
+    cache[key] = (time.monotonic() + ttl, value)
+    # Opportunistic bound so a long uptime doesn't accumulate dead
+    # entries. 10k sessions/users is far beyond any self-host scale.
+    if len(cache) > 10_000:
+        for _k in list(cache.keys())[:1000]:
+            cache.pop(_k, None)
+
+
+def invalidate_session_cache(token: str) -> None:
+    _session_cache.pop(token, None)
+
+
+def invalidate_user_cache(user_id: str) -> None:
+    _user_cache.pop(user_id, None)
+
+
+def get_cache_stats() -> dict:
+    """Snapshot of cache counters + current sizes.
+
+    Read-only; safe to call from any thread / coroutine.
+    """
+    return {
+        **_cache_stats,
+        "session_cache_size": len(_session_cache),
+        "user_cache_size": len(_user_cache),
+        "session_ttl_seconds": _SESSION_CACHE_TTL,
+        "user_ttl_seconds": _USER_CACHE_TTL,
+        "negative_ttl_seconds": _NEGATIVE_CACHE_TTL,
+    }
+
+
+def _reset_cache_stats_for_tests() -> None:
+    for k in _cache_stats:
+        _cache_stats[k] = 0
+    _session_cache.clear()
+    _user_cache.clear()
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -118,6 +207,28 @@ async def get_user(user_id: str) -> Optional[User]:
         if u.id == user_id:
             return u
     return None
+
+
+async def get_user_cached(user_id: str) -> Optional[User]:
+    """TTL-cached ``get_user``. See the cache section at the top of
+    this module for rationale.
+
+    Returns the same value as :func:`get_user` (possibly ``None`` for
+    deleted users), but caches both positive and negative lookups so
+    the middleware's hot path doesn't serialize on ``_users_lock``.
+    """
+    hit, value = _cache_get(_user_cache, user_id)
+    if hit:
+        if value is None:
+            _cache_stats["user_negative_hits"] += 1
+        else:
+            _cache_stats["user_hits"] += 1
+        return value  # type: ignore[return-value]
+    _cache_stats["user_misses"] += 1
+    user = await get_user(user_id)
+    ttl = _USER_CACHE_TTL if user is not None else _NEGATIVE_CACHE_TTL
+    _cache_put(_user_cache, user_id, user, ttl)
+    return user
 
 
 async def get_user_by_username(username: str) -> Optional[User]:
@@ -182,6 +293,7 @@ async def update_user(user_id: str, *, role: Optional[Role] = None,
         if updated is None:
             raise KeyError(user_id)
         await _atomic_write_json(USERS_PATH, data)
+    invalidate_user_cache(user_id)
     return updated
 
 
@@ -194,6 +306,7 @@ async def change_password(user_id: str, new_password: str) -> None:
                 u["salt"] = salt
                 u["password_hash"] = hash_password(new_password, salt)
                 await _atomic_write_json(USERS_PATH, data)
+                invalidate_user_cache(user_id)
                 return
         raise KeyError(user_id)
 
@@ -210,6 +323,7 @@ async def delete_user(user_id: str) -> None:
             kept.append(u)
         data["users"] = kept
         await _atomic_write_json(USERS_PATH, data)
+    invalidate_user_cache(user_id)
     # Tear down any open sessions for this user.
     await delete_sessions_for_user(user_id)
 
@@ -228,6 +342,24 @@ async def get_session(token: str) -> Optional[Session]:
         if s.token == token:
             return s
     return None
+
+
+async def get_session_cached(token: str) -> Optional[Session]:
+    """TTL-cached ``get_session``. See the cache section at the top of
+    this module for rationale.
+    """
+    hit, value = _cache_get(_session_cache, token)
+    if hit:
+        if value is None:
+            _cache_stats["session_negative_hits"] += 1
+        else:
+            _cache_stats["session_hits"] += 1
+        return value  # type: ignore[return-value]
+    _cache_stats["session_misses"] += 1
+    session = await get_session(token)
+    ttl = _SESSION_CACHE_TTL if session is not None else _NEGATIVE_CACHE_TTL
+    _cache_put(_session_cache, token, session, ttl)
+    return session
 
 
 async def create_session(
@@ -249,6 +381,8 @@ async def create_session(
         ip=ip or "", user_agent=user_agent or "",
         created_at=now, last_seen=now, expires_at=expires,
         remember=remember,
+        fp_v2=True,
+        fp_v3=True,
     )
     async with _sessions_lock:
         data = await _read_json(SESSIONS_PATH, {"sessions": []})
@@ -283,6 +417,10 @@ async def touch_session(token: str) -> None:
                 break
         if touched:
             await _atomic_write_json(SESSIONS_PATH, data)
+    # The cached session carries stale ``last_seen`` / ``expires_at``
+    # values now. Drop it so the next request re-reads from disk.
+    if touched:
+        invalidate_session_cache(token)
 
 
 async def delete_session(token: str) -> None:
@@ -290,13 +428,23 @@ async def delete_session(token: str) -> None:
         data = await _read_json(SESSIONS_PATH, {"sessions": []})
         data["sessions"] = [s for s in data.get("sessions", []) if s["token"] != token]
         await _atomic_write_json(SESSIONS_PATH, data)
+    invalidate_session_cache(token)
 
 
 async def delete_sessions_for_user(user_id: str) -> None:
+    removed_tokens: list[str] = []
     async with _sessions_lock:
         data = await _read_json(SESSIONS_PATH, {"sessions": []})
-        data["sessions"] = [s for s in data.get("sessions", []) if s["user_id"] != user_id]
+        kept = []
+        for s in data.get("sessions", []):
+            if s["user_id"] == user_id:
+                removed_tokens.append(s["token"])
+            else:
+                kept.append(s)
+        data["sessions"] = kept
         await _atomic_write_json(SESSIONS_PATH, data)
+    for t in removed_tokens:
+        invalidate_session_cache(t)
 
 
 def _drop_expired(rows: list[dict]) -> list[dict]:
@@ -368,3 +516,4 @@ async def _reset_for_tests() -> None:
                 os.unlink(os.path.join(USER_SETTINGS_DIR, name))
             except Exception:
                 pass
+    _reset_cache_stats_for_tests()
